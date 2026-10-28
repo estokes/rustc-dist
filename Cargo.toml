@@ -1,0 +1,22 @@
+[package]
+name = "rustc-dist"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+arcstr = "1"
+bytes = "1"
+compact_str = "0.9"
+env_logger = "0.11"
+futures = "0.3"
+libc = "0.2"
+log = "0.4"
+memmap2 = "0.9"
+netidx = { path = "../netidx/netidx", default-features = false }
+netidx-core = { path = "../netidx/netidx-core", default-features = false }
+netidx-derive = { path = "../netidx/netidx-derive" }
+netidx-protocols = { path = "../netidx/netidx-protocols", default-features = false }
+parking_lot = "0.12"
+poolshark = "0.2"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
