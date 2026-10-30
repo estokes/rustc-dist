@@ -4,6 +4,7 @@ mod classes;
 mod client;
 mod config;
 mod daemon;
+mod graph;
 mod protocol;
 mod sched;
 mod stats;
@@ -147,20 +148,21 @@ fn status() -> Result<()> {
     if st.units.is_empty() {
         return Ok(());
     }
+    writeln!(out, "{} units in the build graph, by work waiting on them", st.graph_nodes)?;
     writeln!(
         out,
-        "\n{:>9}  {:>8}  {:>8}  {:>5}  {:>5}  unit",
-        "cost (cu)", "wall (s)", "mem (MB)", "runs", "class"
+        "\n{:>9}  {:>9}  {:>8}  {:>8}  {:>5}  unit",
+        "rank (cu)", "cost (cu)", "wall (s)", "mem (MB)", "runs"
     )?;
     for u in &st.units {
         writeln!(
             out,
-            "{:9.3}  {:8.1}  {:8}  {:5}  {:5}  {}",
+            "{:9.3}  {:9.3}  {:8.1}  {:8}  {:5}  {}",
+            u.rank_mcu as f64 / 1000.,
             u.cost_mcu as f64 / 1000.,
             u.wall_ms as f64 / 1000.,
             u.mem_kb / 1024,
             u.runs,
-            u.class,
             u.key
         )?;
     }

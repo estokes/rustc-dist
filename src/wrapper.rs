@@ -13,7 +13,7 @@ use std::{
     io,
     os::unix::{
         net::UnixStream,
-        process::{CommandExt, ExitStatusExt},
+        process::{CommandExt, ExitStatusExt, parent_id},
     },
     path::Path,
     process::{self, Command, ExitStatus},
@@ -27,9 +27,9 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     if env::var_os("RUSTC_DIST").is_some_and(|v| v == "off") {
         return Err(exec(&args));
     }
-    let ask = match argv::classify(&args) {
+    let ask = match argv::classify(&args, env::var_os("OUT_DIR").as_deref()) {
         Invocation::Probe => Ask::Probe,
-        Invocation::Compile(unit) => Ask::Compile(unit),
+        Invocation::Compile(unit) => Ask::Compile { unit, build: parent_id() },
     };
     let mut buf = BytesMut::new();
     let (mut sock, reply) = client::request(ask, true, &mut buf)?;

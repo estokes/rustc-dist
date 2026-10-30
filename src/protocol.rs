@@ -8,22 +8,27 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 const MAX_MSG: usize = 1 << 20;
 
-/// What the scheduler knows a compile by. `exact` is one cargo unit;
-/// `coarse` is shared by every unit of that crate at the same opt-level.
+/// What the scheduler knows a compile by. Job history is kept under
+/// `exact`, one cargo unit, and `coarse`, shared by every unit of that
+/// crate at the same opt-level. `id` names the job in the build graph and
+/// `deps` are the ids of the jobs whose outputs it reads.
 #[derive(Debug, Clone, PartialEq, Eq, Pack)]
 pub struct Unit {
     pub exact: ArcStr,
     pub coarse: ArcStr,
+    pub id: ArcStr,
+    pub deps: Vec<ArcStr>,
 }
 
 #[derive(Debug, Pack)]
 pub enum Ask {
     /// `rustc -vV`, `--print`, stdin input. Runs at once without a slot.
     Probe,
-    Compile(Unit),
+    /// `build` is the pid of the cargo that ran the wrapper.
+    Compile { unit: Unit, build: u32 },
     Status,
     Shutdown,
     /// The laptop switched power profile. The daemon calibrates a profile
@@ -61,6 +66,7 @@ pub struct Status {
     pub waiting: u32,
     pub mem_limit_kb: u64,
     pub mem_running_kb: u64,
+    pub graph_nodes: u32,
     pub units: Vec<UnitStatus>,
 }
 
@@ -88,7 +94,8 @@ pub struct UnitStatus {
     pub cost_mcu: u64,
     pub wall_ms: u64,
     pub mem_kb: u64,
-    pub class: u32,
+    /// Its cost plus the costliest chain of jobs that depend on it.
+    pub rank_mcu: u64,
 }
 
 pub fn frame<T: Pack>(buf: &mut BytesMut, v: &T) -> Result<()> {

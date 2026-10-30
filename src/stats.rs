@@ -1,4 +1,4 @@
-use crate::protocol::{Unit, UnitStatus};
+use crate::protocol::Unit;
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use compact_str::format_compact;
@@ -68,14 +68,20 @@ impl Hists {
 pub struct Prediction {
     pub cost_mcu: u64,
     pub mem_kb: u64,
-    /// Where `cost_mcu` falls among all recorded jobs, 0 to 100.
-    pub percentile: f64,
+}
+
+/// What `status` shows of a unit.
+pub struct UnitInfo {
+    pub runs: u64,
+    pub cost_mcu: u64,
+    pub wall_ms: u64,
+    pub mem_kb: u64,
 }
 
 pub struct Stats {
     exact: HashMap<ArcStr, Hists>,
     coarse: HashMap<ArcStr, Hists>,
-    /// Sum of the exact units, so a unit counts as often as it runs.
+    /// Sum of the exact units, the prior for a unit with no history.
     global: Hists,
     pub dirty: bool,
 }
@@ -85,14 +91,14 @@ impl Stats {
         Self { exact: HashMap::new(), coarse: HashMap::new(), global: Hists::new(), dirty: false }
     }
 
-    pub fn predict(&self, unit: &Unit) -> Prediction {
+    pub fn predict(&self, exact: &ArcStr, coarse: &ArcStr) -> Prediction {
         let known = |m: &HashMap<ArcStr, Hists>, k: &ArcStr| {
             m.get(k).filter(|h| !h.cost.is_empty()).map(|h| {
                 (h.cost.value_at_quantile(0.5), h.mem_kb.value_at_quantile(0.9))
             })
         };
-        let (cost_mcu, mem_kb) = known(&self.exact, &unit.exact)
-            .or_else(|| known(&self.coarse, &unit.coarse))
+        let (cost_mcu, mem_kb) = known(&self.exact, exact)
+            .or_else(|| known(&self.coarse, coarse))
             .unwrap_or_else(|| {
                 if self.global.cost.is_empty() {
                     (UNKNOWN_COST_MCU, 0)
@@ -100,11 +106,17 @@ impl Stats {
                     (self.global.cost.value_at_quantile(0.5), self.global.mem_kb.value_at_quantile(0.5))
                 }
             });
-        Prediction { cost_mcu, mem_kb, percentile: self.percentile(cost_mcu) }
+        Prediction { cost_mcu, mem_kb }
     }
 
-    fn percentile(&self, cost_mcu: u64) -> f64 {
-        if self.global.cost.is_empty() { 50. } else { self.global.cost.percentile_below(cost_mcu) }
+    pub fn info(&self, exact: &ArcStr) -> Option<UnitInfo> {
+        let h = self.exact.get(exact).filter(|h| !h.cost.is_empty())?;
+        Some(UnitInfo {
+            runs: h.cost.len(),
+            cost_mcu: h.cost.value_at_quantile(0.5),
+            wall_ms: h.wall_ms.value_at_quantile(0.5),
+            mem_kb: h.mem_kb.value_at_quantile(0.9),
+        })
     }
 
     pub fn record(&mut self, unit: &Unit, s: Sample) {
@@ -127,29 +139,6 @@ impl Stats {
             global.add(h);
         }
         self.global = global;
-    }
-
-    /// The `n` most expensive units, with the class `ideal` picks for each.
-    pub fn top(&self, n: usize, ideal: impl Fn(f64) -> usize) -> Vec<UnitStatus> {
-        let mut units: Vec<UnitStatus> = self
-            .exact
-            .iter()
-            .filter(|(_, h)| !h.cost.is_empty())
-            .map(|(key, h)| {
-                let cost_mcu = h.cost.value_at_quantile(0.5);
-                UnitStatus {
-                    key: key.clone(),
-                    runs: h.cost.len(),
-                    cost_mcu,
-                    wall_ms: h.wall_ms.value_at_quantile(0.5),
-                    mem_kb: h.mem_kb.value_at_quantile(0.9),
-                    class: ideal(self.percentile(cost_mcu)) as u32,
-                }
-            })
-            .collect();
-        units.sort_by_key(|u| std::cmp::Reverse(u.cost_mcu));
-        units.truncate(n);
-        units
     }
 
     /// A missing file is an empty table.
@@ -219,7 +208,11 @@ mod test {
     use super::*;
 
     fn unit(exact: &str, coarse: &str) -> Unit {
-        Unit { exact: ArcStr::from(exact), coarse: ArcStr::from(coarse) }
+        Unit { exact: ArcStr::from(exact), coarse: ArcStr::from(coarse), id: ArcStr::from(exact), deps: vec![] }
+    }
+
+    fn predict(s: &Stats, u: &Unit) -> Prediction {
+        s.predict(&u.exact, &u.coarse)
     }
 
     fn sample(cost_mcu: u64) -> Sample {
@@ -229,19 +222,16 @@ mod test {
     #[test]
     fn predicts_from_exact_then_coarse_then_global() {
         let mut s = Stats::new();
-        assert_eq!(s.predict(&unit("a:1", "a")).cost_mcu, UNKNOWN_COST_MCU);
+        assert_eq!(predict(&s, &unit("a:1", "a")).cost_mcu, UNKNOWN_COST_MCU);
         for _ in 0..10 {
             s.record(&unit("heavy:1", "heavy"), sample(50_000));
             s.record(&unit("light:1", "light"), sample(20));
         }
-        let heavy = s.predict(&unit("heavy:1", "heavy"));
-        let light = s.predict(&unit("light:1", "light"));
+        let heavy = predict(&s, &unit("heavy:1", "heavy"));
         assert!((49_000..=51_000).contains(&heavy.cost_mcu), "{}", heavy.cost_mcu);
-        assert!(heavy.percentile > 99., "{}", heavy.percentile);
-        assert!(light.percentile <= 50., "{}", light.percentile);
-        let other_profile = s.predict(&unit("heavy:2", "heavy"));
+        let other_profile = predict(&s, &unit("heavy:2", "heavy"));
         assert_eq!(other_profile.cost_mcu, heavy.cost_mcu);
-        assert!(s.predict(&unit("new:1", "new")).cost_mcu > 0);
+        assert!(predict(&s, &unit("new:1", "new")).cost_mcu > 0);
     }
 
     #[test]
@@ -254,7 +244,7 @@ mod test {
         for _ in 0..600 {
             s.record(&u, sample(3000));
         }
-        let p = s.predict(&u).cost_mcu;
+        let p = predict(&s, &u).cost_mcu;
         assert!((2950..=3050).contains(&p), "{p}");
         assert!(s.exact[&u.exact].cost.len() < HALVE_AT);
     }
@@ -269,7 +259,7 @@ mod test {
         s.save(&path)?;
         assert!(!s.dirty);
         let t = Stats::load(&path)?;
-        assert_eq!(t.predict(&unit("a:1", "a")).cost_mcu, s.predict(&unit("a:1", "a")).cost_mcu);
+        assert_eq!(predict(&t, &unit("a:1", "a")).cost_mcu, predict(&s, &unit("a:1", "a")).cost_mcu);
         assert_eq!(t.global.cost.len(), 2);
         fs::remove_dir_all(&dir)?;
         Ok(())

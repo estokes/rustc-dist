@@ -135,7 +135,7 @@ async fn serve(
     let mut buf = BytesMut::new();
     match protocol::recv_async::<Ask>(&mut sock, &mut buf).await? {
         Ask::Probe => protocol::send_async(&mut sock, &mut buf, &Reply::Trivial).await,
-        Ask::Compile(unit) => compile(sock, buf, tx, unit).await,
+        Ask::Compile { unit, build } => compile(sock, buf, tx, unit, build).await,
         Ask::Status => {
             let (reply, status) = oneshot::channel();
             tx.send(Msg::Status { reply }).map_err(|_| anyhow!("scheduler stopped"))?;
@@ -165,9 +165,10 @@ async fn compile(
     mut buf: BytesMut,
     tx: mpsc::UnboundedSender<Msg>,
     unit: Unit,
+    build: u32,
 ) -> Result<()> {
     let (reply, mut admitted) = oneshot::channel();
-    tx.send(Msg::Submit { unit, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
+    tx.send(Msg::Submit { unit, build, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
     let admission = loop {
         tokio::select! {
             admission = &mut admitted => break admission.context("scheduler stopped")?,

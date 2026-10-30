@@ -181,29 +181,74 @@ throttled box doesn't move. Admission uses the unit's p90 maxrss. A unit with
 no history falls back to crate name plus opt-level plus emit kinds, then to the
 median of all jobs.
 
-A global hdrhistogram, the sum of every unit's cost histogram, sets the
-percentile bands used in scheduling. It reflects the workload as it actually
-arrives, so a unit that runs a hundred times counts a hundred times. It is
-rebuilt from the units whenever the table is saved (every minute), so halving
-keeps it recent too.
+A global hdrhistogram, the sum of every unit's cost histogram, gives the
+median cost used for a unit with no history. It is rebuilt from the units
+whenever the table is saved (every minute), so halving keeps it recent too.
+
+## Build graph
+
+Builds replay nearly the same trace, so the daemon learns which jobs read
+which jobs' outputs and uses that to see what is coming.
+
+Each rustc command line names its dependencies:
+`--extern a=…/liba-8169c16474ca1297.rlib`. The file name is crate name plus
+cargo's per-unit `-C extra-filename` hash, which the producing job was also
+given. So a job's id is `crate` + `extra-filename`, and its dependencies are
+the ids read off its `--extern` file names. The graph is exact, with no
+timing noise.
+
+A build script compiles as a rustc job but runs invisibly, and the crate using
+its output doesn't name it in `--extern`. The build script compiles into
+`…/build/pkg-HASH1` and its output lands in `…/build/pkg-HASH2/out`, which cargo
+passes to the crate as `OUT_DIR`. Both map to the id `out:…/build/pkg`, which
+links them.
+
+The daemon records every admitted job's id and dependencies, persisted in
+`$XDG_STATE_HOME/rustc-dist/graph`. Nodes not seen for 60 days are dropped.
+
+A job's rank is its predicted cost plus the costliest chain of jobs that
+depend on it: the work that waits on this job before the build can finish.
+Ranks are cached and recomputed when the graph changes or each minute when
+costs change. On a clean build of this crate the top ranks were the
+`proc_macro2` build script, `unicode_ident`, `proc_macro2`, `quote`, `syn`,
+and `regex_syntax`: several of them tiny, but everything waits on them.
+
+For agentic rebuilds the graph is nearly exact about the future. Editing a
+crate makes cargo rebuild it and everything depending on it, so when a rebuilt
+unit arrives, its dependents are the jobs about to follow.
 
 ## Scheduling
 
-Heavy jobs go to strong cores and light jobs to weak cores, and a slot never
-sits idle while a job waits.
+The goal is to keep fast cores for the jobs the most work waits on, and to put
+jobs with time to spare on slow cores.
 
-1. Capacity curve: take the classes the job may use (local only, or the whole
-   farm), sort them slow to fast and weight them by slot count. Each class gets
-   a percentile band. On this laptop alone: LP-E 0–25, E 25–75, P 75–100.
-2. A job's percentile is the histogram rank of its predicted cost. Its ideal
-   class is the one whose band contains that percentile.
-3. When a slot frees or a job arrives, walk the waiting jobs heaviest first
-   (with aging, so light jobs are not starved by a stream of heavy ones). Give
-   each job the free slot nearest its ideal class, preferring the faster one on
-   ties. If no slot is free, the job waits.
-4. Remote slots are only for jobs that may go remote and whose predicted cost
-   is above the remote cutoff. The cutoff is learned from each server's
-   overhead (hash exchange, upload, latency). Light jobs stay home.
+1. Waiting jobs are ordered by rank, with aging: a job's priority doubles
+   every 10 s it waits.
+2. Each build's horizon is the largest rank among its waiting jobs and the
+   remaining rank of its running ones. A build is the cargo process that ran
+   the wrapper, so one agent's huge build doesn't push another's small one
+   onto slow cores.
+3. A job's slack is its build's horizon less its own rank: how much later it
+   can finish without delaying the build.
+4. For each class the daemon predicts when the job would finish there: when a
+   slot frees (now, or the earliest predicted end of a job running in that
+   class) plus the job's cost times the class's calibration. The job takes the
+   slowest class on which it finishes within its slack of the earliest finish.
+   A job with no slack takes the class where it finishes first, even if it must
+   wait for it.
+5. A job that waits for a class adds its predicted time, divided by the class's
+   CPUs, to that class's expected wait, so later jobs don't all count on the
+   same free slot.
+6. A job past its predicted time is expected to run at least half again as long
+   as it has, so an overdue estimate can't strand jobs waiting for its class.
+7. A job is placed only after it has waited 20 ms. Cargo starts a wave of ready
+   jobs within milliseconds, and the daemon should see the whole wave, including
+   the job everything else waits on, before placing any of it. Younger jobs
+   still count toward their build's horizon.
+
+Remote slots (phase 2) are for jobs that may go remote and whose predicted
+cost is above a remote cutoff, learned from each server's overhead (hash
+exchange, upload, latency). Light jobs stay home.
 
 A job is local-only if:
 
@@ -215,26 +260,15 @@ A job is local-only if:
 - it uses `-C target-cpu=native`; or
 - no server has a matching toolchain.
 
-### Measured: arrival order defeats "never idle"
+### History
 
-This crate's release build (about 100 units) was run twice through the phase 1
-daemon, the second time with history. Of the ten heaviest units, three ran on
-P-cores, six on E-cores, and `regex_syntax` on a low-power core. All ten had P
-as their ideal class.
-
-The cause is arrival order, not prediction. At build start cargo releases
-dozens of leaf crates at once (`libc`, `memchr`, ...). They fill all 16 slots,
-some of them P. The heavy crates become ready a few seconds later, find P full
-of light jobs about to finish, and start on whatever is free. A started job
-can't move.
-
-Proposed fix: earliest finish. The daemon knows each running job's start time
-and predicted wall time, so it can estimate when each class next frees a slot.
-A job takes the class where `max(now, next free) + its predicted time on that
-class` is smallest. If that class is busy, the job waits for it. Storing wall
-time in cu, like cost, gives the predicted time on any class. Each waiting job
-also gets a patience equal to the time waiting should save. After that it takes
-any free slot, so an overdue estimate can't strand it.
+The first scheduler mapped each job's cost percentile onto class bands and
+never left a slot idle. On this crate's build, three of the ten heaviest units
+reached P-cores: cargo's first wave of small crates took the P-cores before the
+heavy crates became ready. With the graph, the gating chains (`regex_syntax`,
+`regex_automata`, `aho_corasick`, `memchr`, most of `syn`) ran on P-cores, and
+fast cores carried the most work. That was measured at load 160 from other
+work, so build times say nothing yet; placement is all that was checked.
 
 ## Remote execution
 
@@ -346,13 +380,13 @@ coming back.
 
 1. Built 2026-10-30. Single box, no network: merged daemon, mandatory grants,
    classes, FIFO jobservers and pinning, calibration per power profile, job
-   table and histograms, scheduler, TOML config, `status`. Several agents on one box
-   share cores without thrashing. Heavy crates reach P-cores only when one is
-   free when they arrive (see "Measured" under Scheduling).
+   table and histograms, build graph and rank placement, TOML config,
+   `status`. Several agents on one box share cores without thrashing, and the
+   jobs the most work waits on get the fast cores.
 2. Remote: blob store and manifest protocol, dependency tracking, bwrap
    sandbox, pipelined outputs, fallback and remote pinning.
-3. Earliest-finish placement, cost tables shared across the farm, fairness
-   between builds.
+3. Cost tables and graphs shared across the farm. A measured comparison of
+   build times with and without rank placement, on an idle box.
 
 ## Open questions
 
