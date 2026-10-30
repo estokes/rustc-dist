@@ -148,19 +148,24 @@ crate name plus the `-C metadata` hash, cargo's identity for a unit (package,
 version, features, profile, target). The hash doesn't change when sources are
 edited. Each entry holds:
 
-- an hdrhistogram of cost in milli-cu (1 to 3.6M, 2 significant figures, a few
-  KB per unit);
+- an hdrhistogram of cost in milli-cu (2 significant figures, a few KB per
+  unit);
 - an hdrhistogram of wall time and of maxrss;
-- the remote-pinned flag.
+- the remote-pinned flag (phase 2).
+
+Only successful compiles are recorded. Once a unit has 256 runs its counts are
+halved, so the prediction follows the crate as it grows.
 
 The predicted cost is the unit's median, which an occasional run on a
 throttled box doesn't move. Admission uses the unit's p90 maxrss. A unit with
 no history falls back to crate name plus opt-level plus emit kinds, then to the
 median of all jobs.
 
-A second hdrhistogram, over all finished jobs (two rotating windows), sets the
+A global hdrhistogram, the sum of every unit's cost histogram, sets the
 percentile bands used in scheduling. It reflects the workload as it actually
-arrives, so a unit that runs a hundred times counts a hundred times.
+arrives, so a unit that runs a hundred times counts a hundred times. It is
+rebuilt from the units whenever the table is saved (every minute), so halving
+keeps it recent too.
 
 ## Scheduling
 
@@ -190,9 +195,26 @@ A job is local-only if:
 - it uses `-C target-cpu=native`; or
 - no server has a matching toolchain.
 
-Later: let a heavy job wait for a strong slot when waiting and then running on
-it beats running now on a weak one. That needs estimates of when running jobs
-will finish. The daemon has these for its own jobs.
+### Measured: arrival order defeats "never idle"
+
+This crate's release build (about 100 units) was run twice through the phase 1
+daemon, the second time with history. Of the ten heaviest units, three ran on
+P-cores, six on E-cores, and `regex_syntax` on a low-power core. All ten had P
+as their ideal class.
+
+The cause is arrival order, not prediction. At build start cargo releases
+dozens of leaf crates at once (`libc`, `memchr`, ...). They fill all 16 slots,
+some of them P. The heavy crates become ready a few seconds later, find P full
+of light jobs about to finish, and start on whatever is free. A started job
+can't move.
+
+Proposed fix: earliest finish. The daemon knows each running job's start time
+and predicted wall time, so it can estimate when each class next frees a slot.
+A job takes the class where `max(now, next free) + its predicted time on that
+class` is smallest. If that class is busy, the job waits for it. Storing wall
+time in cu, like cost, gives the predicted time on any class. Each waiting job
+also gets a patience equal to the time waiting should save. After that it takes
+any free slot, so an overdue estimate can't strand it.
 
 ## Remote execution
 
@@ -292,25 +314,24 @@ compile of a unit does the same work, so its histogram stays tight. Jobs that
 still use `-C incremental` stay local, because the incremental cache lives on
 the client.
 
-## Keep and replace
+## Earlier remote code
 
-Keep: `farm.rs` discovery (extended with classes), the daemon accept loop,
-`identity.rs`, `argv.rs`, the socket framing in `protocol.rs`.
-
-Replace: the argv and env rewriting in `stage.rs`, `protocol::Rewriter`, the
-snapshot diff and per-job RPC/session in `server.rs`, the parser in
-`config.rs`, and the wrapper's paths that exec rustc directly.
+Phase 1 removed the first sketch's remote modules (`farm.rs`, `remote.rs`,
+`server.rs`, `stage.rs`, `identity.rs`). They are in git at 418df61. Phase 2
+can reuse `farm.rs` discovery and `identity.rs` toolchain matching from there.
+The argv and env rewriting, `Rewriter`, and the per-job RPC/session are not
+coming back.
 
 ## Phases
 
-1. Single box, no network: merged daemon, mandatory grants, classes, FIFO
-   jobservers and pinning, `install` with calibration, job table and
-   histograms, scheduler, TOML config. This is useful on its own. Several
-   agents on one box share cores without thrashing, and heavy crates land on
-   P cores.
+1. Built 2026-10-30. Single box, no network: merged daemon, mandatory grants,
+   classes, FIFO jobservers and pinning, `install` and `calibrate`, job table
+   and histograms, scheduler, TOML config, `status`. Several agents on one box
+   share cores without thrashing. Heavy crates reach P-cores only when one is
+   free when they arrive (see "Measured" under Scheduling).
 2. Remote: blob store and manifest protocol, dependency tracking, bwrap
    sandbox, pipelined outputs, fallback and remote pinning.
-3. Waiting for a better slot, cost tables shared across the farm, fairness
+3. Earliest-finish placement, cost tables shared across the farm, fairness
    between builds.
 
 ## Open questions

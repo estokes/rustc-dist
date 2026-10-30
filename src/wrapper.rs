@@ -1,110 +1,96 @@
 use crate::{
-    argv, config,
-    daemon::spawn_from_wrapper,
-    protocol::{self, Job, ToWrapper},
+    argv::{self, Invocation},
+    client,
+    protocol::{self, Ask, Ran, Reply},
+    sys,
 };
-use anyhow::{Context, Result, bail};
-use arcstr::ArcStr;
+use anyhow::{Context, Error, Result, anyhow, bail};
+use bytes::BytesMut;
+use compact_str::format_compact;
 use std::{
     env,
     ffi::OsString,
-    io::Write,
-    os::unix::process::CommandExt,
-    path::PathBuf,
-    process::Command,
-    time::Duration,
+    io,
+    os::unix::{
+        net::UnixStream,
+        process::{CommandExt, ExitStatusExt},
+    },
+    path::Path,
+    process::{self, Command, ExitStatus},
+    time::Instant,
 };
-use tokio::{net::UnixStream, time};
 
 pub fn run(args: Vec<OsString>) -> Result<()> {
     if args.is_empty() {
-        bail!("cargo invoked the wrapper with no arguments");
+        bail!("cargo ran the wrapper without a compiler");
     }
-    if early_local(&args)? {
-        return exec_local(&args);
+    if env::var_os("RUSTC_DIST").is_some_and(|v| v == "off") {
+        return Err(exec(&args));
     }
-    match tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(drive(args.clone()))? {
-        Stop::Local => exec_local(&args),
-        Stop::Code(code) => std::process::exit(code),
-    }
-}
-
-enum Stop {
-    Local,
-    Code(i32),
-}
-
-fn early_local(args: &[OsString]) -> Result<bool> {
-    if argv::has_incremental(args) {
-        return Ok(true);
-    }
-    let cfg = match config::load_user() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("rustc-dist: {e:#}");
-            return Ok(true);
-        }
+    let ask = match argv::classify(&args) {
+        Invocation::Probe => Ask::Probe,
+        Invocation::Compile(unit) => Ask::Compile(unit),
     };
-    if cfg.base.is_none() {
-        return Ok(true);
-    }
-    let start = env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?);
-    let name = argv::crate_name(args);
-    match config::local_crates(&start) {
-        Ok(list) => {
-            Ok(name.as_deref().is_some_and(|n| list.iter().any(|c| config::names_match(c, n))))
+    let mut buf = BytesMut::new();
+    let (mut sock, reply) = client::request(ask, true, &mut buf)?;
+    match reply {
+        Reply::Trivial => Err(exec(&args)),
+        Reply::Slot { cpus, jobserver } => {
+            sys::pin(&cpus)?;
+            let status = compile(&mut sock, &mut buf, &args, &jobserver)?;
+            exit_as(status)
         }
-        Err(e) => {
-            eprintln!("rustc-dist: {e:#}");
-            Ok(true)
-        }
+        Reply::Status(_) | Reply::Restarting => bail!("unexpected reply from the daemon"),
     }
 }
 
-fn exec_local(args: &[OsString]) -> Result<()> {
+fn exec(args: &[OsString]) -> Error {
     let err = Command::new(&args[0]).args(&args[1..]).exec();
-    Err(err).context("exec rustc")
+    anyhow!(err).context(format_compact!("exec {}", Path::new(&args[0]).display()))
 }
 
-async fn drive(args: Vec<OsString>) -> Result<Stop> {
-    let mut sock = connect().await?;
-    let argv = args
-        .iter()
-        .map(|a| a.to_str().context("argument is not utf-8").map(ArcStr::from))
-        .collect::<Result<Vec<_>>>()?;
-    let env = env::vars_os()
-        .filter_map(|(k, v)| Some((ArcStr::from(k.to_str()?), ArcStr::from(v.to_str()?))))
-        .collect();
-    let cwd = env::current_dir()?;
-    let cwd = ArcStr::from(cwd.to_str().context("cwd is not utf-8")?);
-    protocol::write_msg(&mut sock, &Job { argv, env, cwd }).await?;
-    loop {
-        match protocol::read_msg::<ToWrapper>(&mut sock).await? {
-            ToWrapper::RunLocal => return Ok(Stop::Local),
-            ToWrapper::Stdout(bytes) => protocol::write_stdio(true, &bytes)?,
-            ToWrapper::Stderr(bytes) => protocol::write_stdio(false, &bytes)?,
-            ToWrapper::Exit(code) => return Ok(Stop::Code(code)),
-            ToWrapper::Fail(msg) => {
-                writeln!(std::io::stderr(), "rustc-dist: {msg}")?;
-                return Ok(Stop::Code(1));
+fn compile(
+    sock: &mut UnixStream,
+    buf: &mut BytesMut,
+    args: &[OsString],
+    jobserver: &str,
+) -> Result<ExitStatus> {
+    let parent = process::id() as libc::pid_t;
+    let mut cmd = Command::new(&args[0]);
+    cmd.args(&args[1..])
+        .env("CARGO_MAKEFLAGS", format_compact!("-j --jobserver-auth=fifo:{jobserver}").as_str());
+    // rustc must not outlive the wrapper that holds its slot.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
             }
-        }
+            if libc::getppid() != parent {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
     }
+    let start = Instant::now();
+    let status = cmd
+        .status()
+        .with_context(|| format_compact!("running {}", Path::new(&args[0]).display()))?;
+    if status.success() {
+        let wall_us = start.elapsed().as_micros() as u64;
+        let usage = sys::children_usage();
+        let ran = Ran { cpu_us: usage.cpu_us, wall_us, maxrss_kb: usage.maxrss_kb };
+        // A daemon that restarted meanwhile just misses this sample.
+        let _ = protocol::send(sock, buf, &ran);
+    }
+    Ok(status)
 }
 
-async fn connect() -> Result<UnixStream> {
-    let path = config::socket_path();
-    if let Ok(sock) = UnixStream::connect(&path).await {
-        return Ok(sock);
-    }
-    spawn_from_wrapper()?;
-    for _ in 0..100 {
-        if let Ok(sock) = UnixStream::connect(&path).await {
-            return Ok(sock);
+fn exit_as(status: ExitStatus) -> ! {
+    if let Some(sig) = status.signal() {
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
         }
-        time::sleep(Duration::from_millis(50)).await;
     }
-    bail!("daemon did not open {}", path.display())
+    process::exit(status.code().unwrap_or(1))
 }

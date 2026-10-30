@@ -1,309 +1,168 @@
 use crate::{
-    argv, config,
-    farm::{self, FarmHandle},
-    identity::{self, Identity},
-    protocol::{self, Job, ToWrapper},
-    remote::{self, Live, Outcome},
-    stage,
+    classes, config,
+    protocol::{self, Ask, PROTOCOL, Ran, Reply, Unit},
+    sched::{Admission, Msg, Sched},
+    sys,
 };
-use anyhow::{Context, Result, anyhow};
-use arcstr::ArcStr;
-use log::{info, warn};
-use netidx::{config::Config, path::Path, subscriber::SubscriberBuilder};
-use parking_lot::Mutex;
+use anyhow::{Context, Result, anyhow, bail};
+use bytes::{Bytes, BytesMut};
+use compact_str::format_compact;
+use log::{debug, info, warn};
 use std::{
-    env, fs,
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::{self, ErrorKind},
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    path::Path,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::Duration,
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::mpsc,
-    task::spawn_blocking,
+    signal::unix::{SignalKind, signal},
+    sync::{mpsc, oneshot},
     time,
 };
 
-const IDLE: Duration = Duration::from_secs(10 * 60);
-
-struct Cached {
-    path: PathBuf,
-    mtime: SystemTime,
-    identity: Identity,
-}
-
 pub async fn run() -> Result<()> {
-    fs::create_dir_all(config::runtime_dir())?;
-    init_log()?;
-    let cfg = config::load_user().context("reading config")?;
-    let Some(base) = cfg.base else {
-        anyhow::bail!("no base path in config or RUSTC_DIST_BASE");
+    let cfg = config::load()?;
+    let dir = config::runtime_dir();
+    config::make_private_dir(&dir)?;
+    let lock_path = config::lock_path();
+    let Some(_lock) = lock(&lock_path).await? else {
+        info!("another daemon holds {}", lock_path.display());
+        return Ok(());
     };
-    info!("daemon base {base}");
-    let net = Config::load_default()?;
-    let subscriber = SubscriberBuilder::new(net).build()?;
-    let farm = farm::run(subscriber, Path::from(base)).await?;
     let sock_path = config::socket_path();
-    let Some(listener) = bind_socket(&sock_path).await? else {
-        return Ok(());
-    };
-    info!("listening on {}", sock_path.display());
-    let cache = Arc::new(Mutex::new(None));
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel();
-    let mut clients = 0usize;
-    let mut idle_from = Instant::now();
-    loop {
-        let idle_left = IDLE.saturating_sub(idle_from.elapsed());
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (sock, _) = accepted?;
-                clients += 1;
-                let farm = farm.clone();
-                let cache = cache.clone();
-                let done = done_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle(sock, farm, cache).await {
-                        warn!("job: {e:#}");
-                    }
-                    let _ = done.send(());
-                });
-            }
-            _ = done_rx.recv() => {
-                clients = clients.saturating_sub(1);
-                if clients == 0 {
-                    idle_from = Instant::now();
-                }
-            }
-            _ = time::sleep(idle_left), if clients == 0 => {
-                info!("idle for {}s, exiting", IDLE.as_secs());
-                break;
-            }
-        }
-    }
     let _ = fs::remove_file(&sock_path);
-    Ok(())
-}
-
-async fn bind_socket(path: &std::path::Path) -> Result<Option<UnixListener>> {
-    match UnixListener::bind(path) {
-        Ok(listener) => return Ok(Some(listener)),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
-        Err(e) => return Err(e.into()),
+    let listener = UnixListener::bind(&sock_path)
+        .with_context(|| format_compact!("binding {}", sock_path.display()))?;
+    let classes = classes::load(&sys::allowed_cpus()?)?;
+    for (k, c) in classes.iter().enumerate() {
+        info!("class {k}: {} cpus, calibration {} ms", c.cpus.len(), c.calib_us / 1000);
     }
-    if UnixStream::connect(path).await.is_ok() {
-        info!("socket {} already taken", path.display());
-        return Ok(None);
-    }
-    let _ = fs::remove_file(path);
-    match UnixListener::bind(path) {
-        Ok(listener) => Ok(Some(listener)),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            info!("socket {} already taken", path.display());
-            Ok(None)
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn init_log() -> Result<()> {
-    let path = config::log_path();
-    let file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
-    env_logger::Builder::from_env(env_logger::Env::new().filter_or("RUSTC_DIST_LOG", "info"))
-        .target(env_logger::Target::Pipe(Box::new(file)))
-        .init();
-    Ok(())
-}
-
-async fn handle(mut sock: UnixStream, farm: FarmHandle, cache: Arc<Mutex<Option<Cached>>>) -> Result<()> {
-    let job = protocol::read_msg::<Job>(&mut sock).await?;
-    let args = arg_strs(&job.argv);
-    if argv::has_incremental(&args) || local_crate(&job) {
-        protocol::write_msg(&mut sock, &ToWrapper::RunLocal).await?;
-        return Ok(());
-    }
-    let Some(rustc) = job.argv.first() else {
-        protocol::write_msg(&mut sock, &ToWrapper::Fail(ArcStr::from("empty argv"))).await?;
-        return Ok(());
-    };
-    let rustc = PathBuf::from(rustc.as_str());
-    let identity = match probe(&cache, &rustc) {
-        Ok(id) => id,
-        Err(e) => {
-            protocol::write_msg(&mut sock, &ToWrapper::Fail(ArcStr::from(format!("{e:#}")))).await?;
-            return Ok(());
-        }
-    };
-    let target = argv::job_target(&args, &identity.host);
-    let argv = job.argv.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let env = job.env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
-    let cwd = PathBuf::from(job.cwd.as_str());
-    let staged = match spawn_blocking(move || stage::stage(&argv, &env, &cwd)).await {
-        Ok(Ok(staged)) => staged,
-        Ok(Err(e)) => {
-            warn!("staging failed, compiling locally: {e:#}");
-            protocol::write_msg(&mut sock, &ToWrapper::RunLocal).await?;
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
-    };
-    dispatch(&mut sock, &farm, &identity, &target, &staged).await
-}
-
-fn arg_strs(argv: &[ArcStr]) -> Vec<&str> {
-    argv.iter().map(ArcStr::as_str).collect()
-}
-
-fn local_crate(job: &Job) -> bool {
-    let Some(name) = argv::crate_name(&arg_strs(&job.argv)) else {
-        return false;
-    };
-    let start = job
-        .env
-        .iter()
-        .find(|(k, _)| k.as_str() == "CARGO_MANIFEST_DIR")
-        .map(|(_, v)| PathBuf::from(v.as_str()))
-        .unwrap_or_else(|| PathBuf::from(job.cwd.as_str()));
-    match config::local_crates(&start) {
-        Ok(list) => list.iter().any(|n| config::names_match(n, &name)),
-        Err(e) => {
-            warn!("local crate list: {e:#}");
-            true
-        }
-    }
-}
-
-fn probe(cache: &Mutex<Option<Cached>>, rustc: &std::path::Path) -> Result<Identity> {
-    let mtime = identity::mtime(rustc)?;
-    let mut guard = cache.lock();
-    if let Some(hit) = guard.as_ref() {
-        if hit.path == rustc && hit.mtime == mtime {
-            return Ok(hit.identity.clone());
-        }
-    }
-    let id = identity::probe(rustc)?;
-    info!(
-        "toolchain {} {} {} {}",
-        rustc.display(),
-        id.release,
-        id.commit,
-        id.host
-    );
-    *guard = Some(Cached { path: rustc.to_path_buf(), mtime, identity: id.clone() });
-    Ok(id)
-}
-
-async fn dispatch(
-    sock: &mut UnixStream,
-    farm: &FarmHandle,
-    identity: &Identity,
-    target: &str,
-    staged: &stage::Staged,
-) -> Result<()> {
-    let mut skip = Vec::new();
-    loop {
-        let Some(reservation) = farm.reserve(identity, target, &skip).await else {
-            info!("no server for {} {target}, compiling locally", identity.commit);
-            protocol::write_msg(sock, &ToWrapper::RunLocal).await?;
-            return Ok(());
-        };
-        let name = reservation.name.clone();
-        let rpc = reservation.rpc.clone();
-        info!("send {target} to {name}");
-        match run_remote(sock, farm, rpc, staged).await? {
-            RemoteEnd::Again => {
-                skip.push(name);
-                drop(reservation);
-            }
-            RemoteEnd::Finished => {
-                drop(reservation);
-                return Ok(());
-            }
-        }
-    }
-}
-
-enum RemoteEnd {
-    Again,
-    Finished,
-}
-
-async fn run_remote(
-    sock: &mut UnixStream,
-    farm: &FarmHandle,
-    rpc: Path,
-    staged: &stage::Staged,
-) -> Result<RemoteEnd> {
-    let (tx, mut rx) = mpsc::channel(32);
-    let compile = remote::compile(&farm.subscriber, rpc, staged, tx);
-    tokio::pin!(compile);
-    let mut sent = false;
-    let mut live_open = true;
+    let mem_limit_kb = (sys::mem_total_kb()? as f64 * cfg.memory_fraction) as u64;
+    let (tx, rx) = mpsc::unbounded_channel();
+    let stats_path = config::state_dir().join("jobs.hdr");
+    let (sched, grants) = Sched::new(classes, &dir, mem_limit_kb, stats_path, tx.clone())?;
+    let grants: Arc<[Bytes]> = grants.into();
+    let sched = tokio::spawn(sched.run(rx));
+    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    info!("listening on {}", sock_path.display());
     loop {
         tokio::select! {
-            biased;
-            ev = rx.recv(), if live_open => {
-                match ev {
-                    Some(Live::Stdout(bytes)) => {
-                        sent = true;
-                        protocol::write_msg(sock, &ToWrapper::Stdout(bytes)).await?;
-                    }
-                    Some(Live::Stderr(bytes)) => {
-                        sent = true;
-                        protocol::write_msg(sock, &ToWrapper::Stderr(bytes)).await?;
-                    }
-                    None => live_open = false,
-                }
-            }
-            result = &mut compile => {
-                while let Ok(ev) = rx.try_recv() {
-                    match ev {
-                        Live::Stdout(bytes) => {
-                            sent = true;
-                            protocol::write_msg(sock, &ToWrapper::Stdout(bytes)).await?;
+            accepted = listener.accept() => match accepted {
+                Ok((sock, _)) => {
+                    let (tx, grants, stop) = (tx.clone(), grants.clone(), stop_tx.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = serve(sock, tx, grants, stop).await {
+                            debug!("connection: {e:#}");
                         }
-                        Live::Stderr(bytes) => {
-                            sent = true;
-                            protocol::write_msg(sock, &ToWrapper::Stderr(bytes)).await?;
-                        }
-                    }
+                    });
                 }
-                return match result {
-                    Ok(Outcome::Busy) => {
-                        info!("server busy");
-                        Ok(RemoteEnd::Again)
-                    }
-                    Ok(Outcome::Done(code)) => {
-                        protocol::write_msg(sock, &ToWrapper::Exit(code)).await?;
-                        Ok(RemoteEnd::Finished)
-                    }
-                    Err(e) if !sent => {
-                        warn!("remote failed before output, trying another server: {e:#}");
-                        Ok(RemoteEnd::Again)
-                    }
-                    Err(e) => {
-                        protocol::write_msg(
-                            sock,
-                            &ToWrapper::Fail(ArcStr::from(format!("{e:#}"))),
-                        )
-                        .await?;
-                        Ok(RemoteEnd::Finished)
-                    }
-                };
-            }
+                Err(e) => warn!("accept: {e}"),
+            },
+            _ = stop_rx.recv() => break,
+            _ = term.recv() => break,
+            _ = int.recv() => break,
+        }
+    }
+    info!("shutting down");
+    drop(listener);
+    let _ = fs::remove_file(&sock_path);
+    let _ = tx.send(Msg::Drain);
+    sched.await?;
+    Ok(())
+}
+
+/// Take the daemon lock, waiting a few seconds for a daemon that is
+/// shutting down. None if another daemon keeps it.
+async fn lock(path: &Path) -> Result<Option<File>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format_compact!("opening {}", path.display()))?;
+    for _ in 0..100 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != ErrorKind::WouldBlock {
+            return Err(err).with_context(|| format_compact!("locking {}", path.display()));
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(None)
+}
+
+async fn serve(
+    mut sock: UnixStream,
+    tx: mpsc::UnboundedSender<Msg>,
+    grants: Arc<[Bytes]>,
+    stop: mpsc::Sender<()>,
+) -> Result<()> {
+    let mut version = [0u8; 4];
+    sock.read_exact(&mut version).await?;
+    let version = u32::from_be_bytes(version);
+    if version != PROTOCOL {
+        warn!("a client speaks protocol {version}, this daemon {PROTOCOL}; restarting");
+        let _ = stop.try_send(());
+        return Ok(());
+    }
+    let mut buf = BytesMut::new();
+    match protocol::recv_async::<Ask>(&mut sock, &mut buf).await? {
+        Ask::Probe => protocol::send_async(&mut sock, &mut buf, &Reply::Trivial).await,
+        Ask::Compile(unit) => compile(sock, buf, tx, &grants, unit).await,
+        Ask::Status => {
+            let (reply, status) = oneshot::channel();
+            tx.send(Msg::Status { reply }).map_err(|_| anyhow!("scheduler stopped"))?;
+            let status = status.await?;
+            protocol::send_async(&mut sock, &mut buf, &Reply::Status(status)).await
+        }
+        Ask::Shutdown => {
+            let _ = stop.try_send(());
+            protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await
         }
     }
 }
 
-pub fn spawn_from_wrapper() -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    fs::create_dir_all(config::runtime_dir())?;
-    let exe = env::current_exe().context("current exe")?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0);
-    cmd.spawn().map_err(|e| anyhow!(e)).context("starting daemon")?;
-    Ok(())
+async fn compile(
+    mut sock: UnixStream,
+    mut buf: BytesMut,
+    tx: mpsc::UnboundedSender<Msg>,
+    grants: &[Bytes],
+    unit: Unit,
+) -> Result<()> {
+    let (reply, mut admitted) = oneshot::channel();
+    tx.send(Msg::Submit { unit, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
+    let admission = loop {
+        tokio::select! {
+            admission = &mut admitted => break admission.context("scheduler stopped")?,
+            readable = sock.readable() => {
+                readable?;
+                match sock.try_read(&mut [0u8; 1]) {
+                    // cargo killed the wrapper while it waited
+                    Ok(0) => return Ok(()),
+                    Ok(_) => bail!("wrapper sent data while waiting for a slot"),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    };
+    match admission {
+        Admission::Restarting => protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await,
+        Admission::Slot(slot) => {
+            sock.write_all(&grants[slot.class]).await?;
+            if let Ok(ran) = protocol::recv_async::<Ran>(&mut sock, &mut buf).await {
+                slot.finish(ran);
+            }
+            Ok(())
+        }
+    }
 }
