@@ -1256,9 +1256,9 @@ dependencies = [
 
 [[package]]
 name = "immutable-chunkmap"
-version = "2.1.4"
+version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da5fe4d67d09ce2c08ff406f6758ec716206c28be92357ae5d5f798c2ef4b548"
+checksum = "0f5098ef24cf336da7cdf71d9e5aa8ba82aaef01b7413d754c11b6857c2434c6"
 dependencies = [
  "arrayvec",
  "fxhash",

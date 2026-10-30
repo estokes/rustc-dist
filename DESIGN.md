@@ -88,33 +88,57 @@ table.
 
 ## Calibration
 
-On startup the daemon compiles an embedded calibration crate (one generated
-file, no dependencies, `-C opt-level=3 -C codegen-units=1`) on every CPU at
-once, each copy pinned. Running all CPUs together measures sustained speed
-rather than single-core turbo. The median wall time per class is published as
-`BASE/NAME/class/N/calib_ms`, next to `cpus` and `free`. This takes a few
-seconds.
+Calibration runs once per core class, when the server is installed
+(`rustc-dist install`), and never again. Install also detects the classes and
+sets up the systemd user service.
 
-Calibration is the starting estimate. Each finished job updates a per-class
-drift factor (an EWMA of measured over predicted cost), so throttling, battery
-mode and load from outside the farm all show up. The adjusted speed is
-republished.
+The calibration job is a real compile: the rustc invocation for the
+`graphix-shell` crate under `--profile quick`. Install builds graphix-shell's
+dependencies in quick, with incremental off, under the wrapper in record mode.
+That saves the graphix-shell job: argv, env, cwd, and a snapshot of its input
+files (sources, `--extern` files and their dependencies).
+
+Install then replays the saved job pinned to one CPU of each class, with all
+classes running at the same time so the box is under load rather than in
+single-core turbo. Pinning to one CPU also limits codegen to that CPU, so the
+result is per-core speed. The wall time per class goes into the box's state
+file. The daemon publishes it as `BASE/NAME/class/N/calib_ms`, next to `cpus`
+and `free`.
+
+Comparing boxes needs the same job everywhere. The first box to install keeps
+the saved job's inputs in its blob store and publishes the job. Later installs
+fetch it from the farm and replay it in the sandbox, so they need neither a
+graphix checkout nor a dependency build. Until remote execution exists, every
+box records the job from a graphix checkout at the same revision.
 
 ## Cost
 
+Agentic work compiles the same units over and over: `graphix_types` hundreds
+of times a day. Each unit's past runs predict its next one.
+
 The unit of cost is one calibration compile (cu). A job that used `c` CPU
 seconds on class `k` costs `c / calib_s(k)` cu, the same number whichever box
-ran it.
+or class ran it, so every run of a unit counts toward one record.
+`graphix_types` might cost 0.3 cu: under a third of a `graphix-shell` compile.
 
-The cost table is per daemon, persisted under `$XDG_STATE_HOME`. Its key is the
-`-C metadata` hash, cargo's identity for a unit (package, version, features,
-profile, target). Each entry holds an EWMA of cost, the largest maxrss seen and
-a remote-pinned flag. If the hash is new, the daemon falls back to crate name
-plus opt-level plus emit kinds, and after that to the histogram median.
+The job table is per daemon, persisted under `$XDG_STATE_HOME`. Its key is
+crate name plus the `-C metadata` hash, cargo's identity for a unit (package,
+version, features, profile, target). The hash doesn't change when sources are
+edited. Each entry holds:
 
-The histogram is an hdrhistogram of the costs of recently finished jobs (two
-rotating windows). It does not predict anything. It turns a predicted cost
-into a percentile.
+- an hdrhistogram of cost in milli-cu (1 to 3.6M, 2 significant figures, a few
+  KB per unit);
+- an hdrhistogram of wall time and of maxrss;
+- the remote-pinned flag.
+
+The predicted cost is the unit's median, which an occasional run on a
+throttled box doesn't move. Admission uses the unit's p90 maxrss. A unit with
+no history falls back to crate name plus opt-level plus emit kinds, then to the
+median of all jobs.
+
+A second hdrhistogram, over all finished jobs (two rotating windows), sets the
+percentile bands used in scheduling. It reflects the workload as it actually
+arrives, so a unit that runs a hundred times counts a hundred times.
 
 ## Scheduling
 
@@ -239,13 +263,12 @@ proc macros are client-supplied `.so` files. Three things limit that: netidx
 permissions on `BASE`, a bwrap sandbox with no network and no server home, and
 the client-side check on output paths.
 
-## Your cargo config
+## Incremental builds
 
-`build.incremental = true` means every workspace member compiles with
-`-C incremental` in every profile, so workspace members always stay local and
-the farm only speeds up dependencies. Setting
-`profile.release.incremental = false` lets release builds of workspace crates
-go remote.
+Incremental is being turned off. Workspace crates can then go remote, and each
+compile of a unit does the same work, so its histogram stays tight. Jobs that
+still use `-C incremental` stay local, because the incremental cache lives on
+the client.
 
 ## Keep and replace
 
@@ -259,9 +282,10 @@ snapshot diff and per-job RPC/session in `server.rs`, the parser in
 ## Phases
 
 1. Single box, no network: merged daemon, mandatory grants, classes, FIFO
-   jobservers and pinning, calibration, cost table and histogram, scheduler,
-   TOML config. This is useful on its own. Several agents on one box share
-   cores without thrashing, and heavy crates land on P cores.
+   jobservers and pinning, `install` with calibration, job table and
+   histograms, scheduler, TOML config. This is useful on its own. Several
+   agents on one box share cores without thrashing, and heavy crates land on
+   P cores.
 2. Remote: blob store and manifest protocol, dependency tracking, bwrap
    sandbox, pipelined outputs, fallback and remote pinning.
 3. Waiting for a better slot, cost tables shared across the farm, fairness
