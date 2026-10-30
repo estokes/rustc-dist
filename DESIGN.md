@@ -388,6 +388,36 @@ coming back.
 3. Cost tables and graphs shared across the farm. A measured comparison of
    build times with and without rank placement, on an idle box.
 
+## Guesses to test on the quiet cluster
+
+Every number below is a guess. None has been tested on an idle box.
+
+| guess | value | where |
+|---|---|---|
+| wait before placing a job, to see cargo's whole wave | 20 ms | `src/sched.rs:44` |
+| priority doubles while waiting every | 10 s | `src/sched.rs:37` |
+| re-place waiting jobs every | 250 ms | `src/sched.rs:41` |
+| an overdue job runs at least half again its elapsed time | 1/2 | `src/sched.rs:245` |
+| neighbouring CPUs split into classes above | 8% | `src/calibrate.rs:19` |
+| calibration length | 60 s | `src/config.rs:22` |
+| calibration keys per run (about 0.25 s on a P-core) | 2^15 | `src/calibrate.rs:20` |
+| halve a unit's history at | 256 runs | `src/stats.rs:18` |
+| cost of a job with no history at all | 1 cu | `src/stats.rs:20` |
+| share of RAM predicted peaks may use | 80% | `src/config.rs:22` |
+| keep graph nodes unseen for | 60 days | `src/graph.rs:18` |
+
+Experiments, roughly in order:
+
+1. The calibration acceptance check: chunkmap class ratios against a real
+   rustc compile run the same way.
+2. The same clean build and the same edit-and-rebuild, with rank placement and
+   with plain heaviest-first placement. This needs a switch that turns ranks
+   off; add it then.
+3. Vary the gather window (0, 20, 100 ms) on clean builds, where the first wave
+   matters most.
+4. Several concurrent builds, to see whether per-build slack keeps a small
+   build fast next to a big one.
+
 ## Open questions
 
 1. One user per box is assumed. Several users would need a system daemon, and
