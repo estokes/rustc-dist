@@ -57,6 +57,10 @@ slot.
 
 ### Classes
 
+Here a CPU means a logical CPU, i.e. a hardware thread. SMT siblings are
+separate CPUs, each with its own slot. Compilers are memory bound, so the
+second thread on a core gets real work done while the first waits on memory.
+
 A box's CPUs are split into classes of equal speed, found by calibration (see
 below) and overridable in config. On this laptop sysfs suggests three:
 
@@ -103,7 +107,10 @@ Every box runs the same code from the same binary, so results compare across
 boxes with no graphix checkout, no recorded job and no blob fetch. The run
 takes seconds.
 
-Install runs the load on every CPU at once, one thread pinned to each. The
+Install runs the load on every logical CPU at once, one thread pinned to each,
+SMT siblings included. Both threads of a core run loaded, so they measure the
+same and land in the same class. Their time already reflects sharing the core,
+which is how they will run under a full farm. The
 whole box is under load, so the numbers are sustained speed with shared caches,
 memory bandwidth and SMT siblings all under contention, not single-core turbo.
 The load repeats for about a minute so laptops drop out of their short boost
