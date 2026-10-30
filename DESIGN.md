@@ -92,34 +92,37 @@ Calibration runs once per core class, when the server is installed
 (`rustc-dist install`), and never again. Install also detects the classes and
 sets up the systemd user service.
 
-The calibration job is a real compile: the rustc invocation for the
-`graphix-shell` crate under `--profile quick`. Install builds graphix-shell's
-dependencies in quick, with incremental off, under the wrapper in record mode.
-That saves the graphix-shell job: argv, env, cwd, and a snapshot of its input
-files (sources, `--extern` files and their dependencies).
+The calibration load is built into the binary: an immutable-chunkmap workload
+that behaves like a compiler. Like a compiler's symbol tables and interners, it
+is branchy, chases pointers and allocates heavily. It uses a fixed seed and a
+fixed number of operations. It runs `insert_many`, `update_many`,
+`remove_many`, `union`, `intersect`, `diff`, `get` and `range` over keys that
+are expensive to compare, and keeps several versions of each map alive the way
+a compiler holds snapshots. Its working set is well past L2.
 
-Install then replays the saved job pinned to one CPU of each class, with all
+Every box runs the same code from the same binary, so results compare across
+boxes with no graphix checkout, no recorded job and no blob fetch. The run
+takes seconds.
+
+Install runs the load on one thread pinned to one CPU of each class, with all
 classes running at the same time so the box is under load rather than in
-single-core turbo. Pinning to one CPU also limits codegen to that CPU, so the
-result is per-core speed. The wall time per class goes into the box's state
-file. The daemon publishes it as `BASE/NAME/class/N/calib_ms`, next to `cpus`
-and `free`.
+single-core turbo. The wall time per class goes into the box's state file. The
+daemon publishes it as `BASE/NAME/class/N/calib_ms`, next to `cpus` and `free`.
 
-Comparing boxes needs the same job everywhere. The first box to install keeps
-the saved job's inputs in its blob store and publishes the job. Later installs
-fetch it from the farm and replay it in the sandbox, so they need neither a
-graphix checkout nor a dependency build. Until remote execution exists, every
-box records the job from a graphix checkout at the same revision.
+Acceptance check, to run on an idle box: the time ratios between classes from
+the chunkmap load must match, within about 10%, the ratios from a real rustc
+compile pinned the same way (the `graphix-shell` crate under
+`--profile quick`). If they don't, tune the operation mix. This hasn't been run
+yet: on 2026-10-30 this box was at load 119 from graphix tests and the fuzzer.
 
 ## Cost
 
 Agentic work compiles the same units over and over: `graphix_types` hundreds
 of times a day. Each unit's past runs predict its next one.
 
-The unit of cost is one calibration compile (cu). A job that used `c` CPU
-seconds on class `k` costs `c / calib_s(k)` cu, the same number whichever box
-or class ran it, so every run of a unit counts toward one record.
-`graphix_types` might cost 0.3 cu: under a third of a `graphix-shell` compile.
+The unit of cost is one calibration run (cu). A job that used `c` CPU seconds
+on class `k` costs `c / calib_s(k)` cu, the same number whichever box or class
+ran it, so every run of a unit counts toward one record.
 
 The job table is per daemon, persisted under `$XDG_STATE_HOME`. Its key is
 crate name plus the `-C metadata` hash, cargo's identity for a unit (package,
@@ -300,6 +303,9 @@ snapshot diff and per-job RPC/session in `server.rs`, the parser in
    or should mold's threads be capped?
 4. Does cargo tolerate a second metadata artifact line? If so,
    `filter_metadata` can go.
+5. The daemon only governs rustc. Test binaries and fuzzers, which caused the
+   load of 119 above, bypass it. Should the class jobservers be offered to
+   them too?
 
 ## Checked on this box (2026-10-30)
 
