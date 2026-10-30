@@ -1,28 +1,52 @@
 use crate::{
+    blobs::{Hashes, Store},
     classes::{self, Profile},
-    config,
-    protocol::{self, Ask, PROTOCOL, Ran, Reply, Unit},
-    sched::{Admission, Msg, Sched, Setup},
+    config::{self, Config},
+    farm::{self, Load, Member},
+    protocol::{self, Ask, Job, PROTOCOL, Ran, Reply, Unit},
+    remote::{self, Event, Outcome, ToServer},
+    sandbox::{self, Server},
+    sched::{Admission, Msg, RemoteOutcome, RemoteSlot, Sched, Setup, Want},
     sys,
+    toolchain::{self, Keys},
 };
 use anyhow::{Context, Result, anyhow, bail};
-use bytes::BytesMut;
+use arcstr::ArcStr;
+use bytes::{Bytes, BytesMut};
 use compact_str::format_compact;
 use log::{debug, error, info, warn};
+use netidx::{
+    config::Config as NetConfig,
+    path::Path as NPath,
+    publisher::PublisherBuilder,
+    subscriber::{Subscriber, SubscriberBuilder},
+};
+use netidx_protocols::pack_channel::server::Listener;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     signal::unix::{SignalKind, signal},
-    sync::{mpsc, oneshot},
-    time,
+    sync::{mpsc, oneshot, watch},
+    task, time,
 };
+
+/// What every connection needs.
+struct Ctx {
+    tx: mpsc::UnboundedSender<Msg>,
+    stop: mpsc::Sender<()>,
+    keys: Keys,
+    hashes: Hashes,
+    /// Present when this box is part of a farm.
+    subscriber: Option<Subscriber>,
+}
 
 pub async fn run() -> Result<()> {
     let cfg = config::load()?;
@@ -48,9 +72,27 @@ pub async fn run() -> Result<()> {
         calibration_seconds: cfg.calibration_seconds,
     };
     let (tx, rx) = mpsc::unbounded_channel();
-    let sched = Sched::new(setup, profile, tx.clone())?;
+    let (load_tx, load) = watch::channel(Load::default());
+    let sched = Sched::new(setup, profile, load_tx, tx.clone())?;
     let mut sched = tokio::spawn(sched.run(rx));
+    let subscriber = match &cfg.base {
+        None => None,
+        Some(base) => match join(&cfg, base, load, tx.clone()).await {
+            Ok(sub) => Some(sub),
+            Err(e) => {
+                error!("working alone, could not join the farm at {base}: {e:#}");
+                None
+            }
+        },
+    };
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let ctx = Arc::new(Ctx {
+        tx: tx.clone(),
+        stop: stop_tx,
+        keys: Keys::default(),
+        hashes: Hashes::default(),
+        subscriber,
+    });
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     info!("listening on {}", sock_path.display());
@@ -58,9 +100,9 @@ pub async fn run() -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((sock, _)) => {
-                    let (tx, stop) = (tx.clone(), stop_tx.clone());
+                    let ctx = ctx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = serve(sock, tx, stop).await {
+                        if let Err(e) = serve(sock, &ctx).await {
                             debug!("connection: {e:#}");
                         }
                     });
@@ -84,6 +126,60 @@ pub async fn run() -> Result<()> {
         sched.await?;
     }
     Ok(())
+}
+
+/// Publish this box under `base`, watch the others, and take their jobs.
+async fn join(
+    cfg: &Config,
+    base: &str,
+    load: watch::Receiver<Load>,
+    tx: mpsc::UnboundedSender<Msg>,
+) -> Result<Subscriber> {
+    let net = NetConfig::load_default().context("loading the netidx config")?;
+    let publisher = PublisherBuilder::new(net.clone()).build().await?;
+    let subscriber = SubscriberBuilder::new(net).build()?;
+    let base = NPath::from(ArcStr::from(base));
+    let name = ArcStr::from(cfg.name.clone().unwrap_or_else(hostname));
+    let installed = task::spawn_blocking(toolchain::installed).await?;
+    for t in &installed {
+        info!("serving toolchain {} at {}", t.toolchain.key, t.sysroot.display());
+    }
+    let toolchains = installed.iter().map(|t| t.toolchain.clone()).collect();
+    let cache = config::cache_dir();
+    let store = Store::open(cache.join("blobs"), cfg.blob_cache_gb << 30)?;
+    let server = Arc::new(Server::new(store, cache.join("jobs"), installed, tx.clone())?);
+    let mut jobs = Listener::new(&publisher, None, farm::jobs_path(&base, &name)).await?;
+    tokio::spawn(async move {
+        loop {
+            match jobs.accept().await {
+                Ok(con) => {
+                    let server = server.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sandbox::serve(server, con).await {
+                            warn!("remote job: {e:#}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("no longer taking remote jobs: {e:#}");
+                    break;
+                }
+            }
+        }
+    });
+    let member = Member { publisher, subscriber: subscriber.clone(), base, name, toolchains };
+    tokio::spawn(async move {
+        if let Err(e) = farm::run(member, load, tx).await {
+            error!("left the farm: {e:#}");
+        }
+    });
+    Ok(subscriber)
+}
+
+fn hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().replace('/', "_"))
+        .unwrap_or_else(|_| "rustc-dist".into())
 }
 
 /// FIFOs left by a daemon that died without cleaning up.
@@ -119,37 +215,34 @@ async fn lock(path: &Path) -> Result<Option<File>> {
     Ok(None)
 }
 
-async fn serve(
-    mut sock: UnixStream,
-    tx: mpsc::UnboundedSender<Msg>,
-    stop: mpsc::Sender<()>,
-) -> Result<()> {
+async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
     let mut version = [0u8; 4];
     sock.read_exact(&mut version).await?;
     let version = u32::from_be_bytes(version);
     if version != PROTOCOL {
         warn!("a client speaks protocol {version}, this daemon {PROTOCOL}; restarting");
-        let _ = stop.try_send(());
+        let _ = ctx.stop.try_send(());
         return Ok(());
     }
     let mut buf = BytesMut::new();
     match protocol::recv_async::<Ask>(&mut sock, &mut buf).await? {
         Ask::Probe => protocol::send_async(&mut sock, &mut buf, &Reply::Trivial).await,
-        Ask::Compile { unit, build } => compile(sock, buf, tx, unit, build).await,
+        Ask::Compile { unit, build, job } => compile(sock, buf, ctx, unit, build, job).await,
         Ask::Status => {
             let (reply, status) = oneshot::channel();
-            tx.send(Msg::Status { reply }).map_err(|_| anyhow!("scheduler stopped"))?;
+            ctx.tx.send(Msg::Status { reply }).map_err(|_| anyhow!("scheduler stopped"))?;
             let status = status.await?;
             protocol::send_async(&mut sock, &mut buf, &Reply::Status(status)).await
         }
         Ask::Shutdown => {
-            let _ = stop.try_send(());
+            let _ = ctx.stop.try_send(());
             protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await
         }
         Ask::Profile { name, recalibrate } => {
             let reply = match Profile::new(&name) {
                 Ok(profile) => {
-                    tx.send(Msg::Profile { profile, recalibrate })
+                    ctx.tx
+                        .send(Msg::Profile { profile, recalibrate })
                         .map_err(|_| anyhow!("scheduler stopped"))?;
                     Reply::Done
                 }
@@ -160,38 +253,177 @@ async fn serve(
     }
 }
 
-async fn compile(
-    mut sock: UnixStream,
-    mut buf: BytesMut,
-    tx: mpsc::UnboundedSender<Msg>,
-    unit: Unit,
-    build: u32,
-) -> Result<()> {
+/// Wait for the scheduler to place a job. None if cargo killed the
+/// wrapper meanwhile.
+async fn admit(sock: &mut UnixStream, ctx: &Ctx, unit: Unit, build: u32, remote: Option<Want>) -> Result<Option<Admission>> {
     let (reply, mut admitted) = oneshot::channel();
-    tx.send(Msg::Submit { unit, build, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
-    let admission = loop {
+    ctx.tx.send(Msg::Submit { unit, build, remote, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
+    loop {
         tokio::select! {
-            admission = &mut admitted => break admission.context("scheduler stopped")?,
+            admission = &mut admitted => return Ok(Some(admission.context("scheduler stopped")?)),
             readable = sock.readable() => {
                 readable?;
                 match sock.try_read(&mut [0u8; 1]) {
-                    // cargo killed the wrapper while it waited
-                    Ok(0) => return Ok(()),
+                    Ok(0) => return Ok(None),
                     Ok(_) => bail!("wrapper sent data while waiting for a slot"),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
                     Err(e) => return Err(e.into()),
                 }
             }
         }
-    };
-    match admission {
-        Admission::Restarting => protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await,
-        Admission::Slot(slot) => {
-            sock.write_all(&slot.grant).await?;
-            if let Ok(ran) = protocol::recv_async::<Ran>(&mut sock, &mut buf).await {
-                slot.finish(ran);
+    }
+}
+
+async fn compile(
+    mut sock: UnixStream,
+    mut buf: BytesMut,
+    ctx: &Ctx,
+    unit: Unit,
+    build: u32,
+    job: Option<Job>,
+) -> Result<()> {
+    let mut want = match (&job, &ctx.subscriber) {
+        (Some(job), Some(_)) => {
+            let keys = &ctx.keys;
+            let rustc = PathBuf::from(job.rustc.as_str());
+            match task::block_in_place(|| keys.key(&rustc)) {
+                Ok(key) => Some(key),
+                Err(e) => {
+                    warn!("{e:#}");
+                    None
+                }
             }
-            Ok(())
+        }
+        _ => None,
+    };
+    // Set once a remote run failed after passing cargo an rmeta notice.
+    let mut filter_metadata = false;
+    let mut failed_remotely = false;
+    loop {
+        let remote = want.clone().map(|key| Want { key, target: job.as_ref().and_then(|j| j.target.clone()) });
+        let Some(admission) = admit(&mut sock, ctx, unit.clone(), build, remote).await? else {
+            return Ok(());
+        };
+        match admission {
+            Admission::Restarting => {
+                return protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await;
+            }
+            Admission::Slot(slot) => {
+                if filter_metadata {
+                    let reply = Reply::Slot {
+                        cpus: slot.grant.cpus.clone(),
+                        jobserver: slot.grant.jobserver.clone(),
+                        filter_metadata,
+                    };
+                    protocol::send_async(&mut sock, &mut buf, &reply).await?;
+                } else {
+                    sock.write_all(&slot.grant.frame).await?;
+                }
+                if let Ok(ran) = protocol::recv_async::<Ran>(&mut sock, &mut buf).await {
+                    slot.finish(ran);
+                    if failed_remotely {
+                        let _ = ctx.tx.send(Msg::Mismatch { unit });
+                    }
+                }
+                return Ok(());
+            }
+            Admission::Remote(r) => {
+                let job = job.as_ref().expect("only portable jobs go remote");
+                match run_remote(&mut sock, &mut buf, ctx, job, r).await {
+                    Ok(Remote::Done) => return Ok(()),
+                    Ok(Remote::Busy) => (),
+                    Ok(Remote::Failed { forwarded_metadata }) => {
+                        filter_metadata |= forwarded_metadata;
+                        failed_remotely = true;
+                        want = None;
+                    }
+                    Err(e) => {
+                        warn!("{}: {e:#}", unit.exact);
+                        failed_remotely = true;
+                        want = None;
+                    }
+                }
+            }
         }
     }
 }
+
+enum Remote {
+    Done,
+    Busy,
+    /// It failed there; build it here.
+    Failed { forwarded_metadata: bool },
+}
+
+async fn run_remote(
+    sock: &mut UnixStream,
+    buf: &mut BytesMut,
+    ctx: &Ctx,
+    job: &Job,
+    r: RemoteSlot,
+) -> Result<Remote> {
+    let subscriber = ctx.subscriber.as_ref().context("not in a farm")?;
+    let staged = task::block_in_place(|| remote::stage(job, &r.crates, &ctx.hashes))?;
+    let offer = ToServer::Offer { unit: r.unit().clone(), key: r.key.clone(), target: r.target.clone(), class: r.class };
+    let (etx, mut events) = mpsc::unbounded_channel();
+    let running = remote::run(subscriber, r.jobs.clone(), offer, job, &staged, |ev| {
+        etx.send(ev).map_err(|_| anyhow!("daemon connection gone"))
+    });
+    tokio::pin!(running);
+    // Diagnostics wait for the exit, so a failure here leaves nothing for
+    // cargo to see twice.
+    let mut held: Vec<(bool, Bytes)> = Vec::new();
+    let mut forwarded_metadata = false;
+    let mut handle = async |ev: Event, sock: &mut UnixStream, buf: &mut BytesMut| -> Result<()> {
+        match ev {
+            Event::Artifact(line) => {
+                forwarded_metadata |= line.windows(METADATA.len()).any(|w| w == METADATA);
+                protocol::send_async(sock, buf, &Reply::Output { stderr: true, data: line }).await
+            }
+            Event::Stderr(data) => {
+                held.push((true, data));
+                Ok(())
+            }
+            Event::Stdout(data) => {
+                held.push((false, data));
+                Ok(())
+            }
+        }
+    };
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut running => break outcome,
+            Some(ev) = events.recv() => handle(ev, sock, buf).await?,
+        }
+    };
+    while let Ok(ev) = events.try_recv() {
+        handle(ev, sock, buf).await?;
+    }
+    drop(handle);
+    match outcome {
+        Ok(Outcome::Exit { code: 0, cpu_us, wall_us, maxrss_kb }) => {
+            for (stderr, data) in held {
+                protocol::send_async(sock, buf, &Reply::Output { stderr, data }).await?;
+            }
+            protocol::send_async(sock, buf, &Reply::Exit(0)).await?;
+            r.finish(RemoteOutcome::Done(Ran { cpu_us, wall_us, maxrss_kb }));
+            Ok(Remote::Done)
+        }
+        Ok(Outcome::Busy) => {
+            r.finish(RemoteOutcome::Busy);
+            Ok(Remote::Busy)
+        }
+        Ok(Outcome::Exit { code, .. }) => {
+            debug!("{} exited {code} remotely, building it here", r.unit().exact);
+            r.finish(RemoteOutcome::Failed);
+            Ok(Remote::Failed { forwarded_metadata })
+        }
+        Err(e) => {
+            warn!("{} failed remotely, building it here: {e:#}", r.unit().exact);
+            r.finish(RemoteOutcome::Failed);
+            Ok(Remote::Failed { forwarded_metadata })
+        }
+    }
+}
+
+const METADATA: &[u8] = br#""emit":"metadata""#;

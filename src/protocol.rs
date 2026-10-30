@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow, bail};
 use arcstr::ArcStr;
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use netidx_core::pack::Pack;
 use netidx_derive::Pack;
 use std::io::{Read, Write};
@@ -8,27 +8,63 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 const MAX_MSG: usize = 1 << 20;
 
 /// What the scheduler knows a compile by. Job history is kept under
 /// `exact`, one cargo unit, and `coarse`, shared by every unit of that
 /// crate at the same opt-level. `id` names the job in the build graph and
-/// `deps` are the ids of the jobs whose outputs it reads.
+/// `deps` are the jobs whose outputs it reads.
 #[derive(Debug, Clone, PartialEq, Eq, Pack)]
 pub struct Unit {
     pub exact: ArcStr,
     pub coarse: ArcStr,
     pub id: ArcStr,
-    pub deps: Vec<ArcStr>,
+    pub deps: Vec<Dep>,
+}
+
+/// A job this one reads the output of. `file` is the crate file named on
+/// the command line; a build script's output directory has none.
+#[derive(Debug, Clone, PartialEq, Eq, Pack)]
+pub struct Dep {
+    pub id: ArcStr,
+    pub file: Option<ArcStr>,
+}
+
+/// What another box needs to run a compile: rustc's arguments without the
+/// compiler path, the environment cargo gave it, its directory, and the
+/// paths in its arguments that say what it reads and writes.
+#[derive(Debug, Clone, Pack)]
+pub struct Job {
+    pub rustc: ArcStr,
+    pub args: Vec<ArcStr>,
+    pub env: Vec<(ArcStr, ArcStr)>,
+    pub cwd: ArcStr,
+    pub target: Option<ArcStr>,
+    pub paths: JobPaths,
+}
+
+/// Paths as they appear in the arguments, possibly relative to `cwd`.
+#[derive(Debug, Clone, Default, Pack)]
+pub struct JobPaths {
+    pub out_dir: ArcStr,
+    /// The dep-info this unit wrote last time, listing the files it read.
+    pub dep_info: ArcStr,
+    pub sources: Vec<ArcStr>,
+    /// `-L` directories other than dependency ones: native libraries.
+    pub search: Vec<ArcStr>,
+    /// Outputs named explicitly by `--emit kind=path` or `-o`.
+    pub outputs: Vec<ArcStr>,
 }
 
 #[derive(Debug, Pack)]
+#[allow(clippy::large_enum_variant)]
 pub enum Ask {
     /// `rustc -vV`, `--print`, stdin input. Runs at once without a slot.
     Probe,
-    /// `build` is the pid of the cargo that ran the wrapper.
-    Compile { unit: Unit, build: u32 },
+    /// `build` is the pid of the cargo that ran the wrapper. `job` is
+    /// present when the compile may run on another box.
+    Compile { unit: Unit, build: u32, job: Option<Job> },
     Status,
     Shutdown,
     /// The laptop switched power profile. The daemon calibrates a profile
@@ -39,7 +75,13 @@ pub enum Ask {
 #[derive(Debug, Pack)]
 pub enum Reply {
     Trivial,
-    Slot { cpus: Vec<u32>, jobserver: ArcStr },
+    /// Run rustc here. `filter_metadata` drops rustc's rmeta notice,
+    /// because a remote run that failed already passed one to cargo.
+    Slot { cpus: Vec<u32>, jobserver: ArcStr, filter_metadata: bool },
+    /// Output of rustc run on another box, for the wrapper to print.
+    Output { stderr: bool, data: Bytes },
+    /// rustc ran on another box and exited with this code.
+    Exit(i32),
     Status(Status),
     /// This daemon is going away. Reconnect.
     Restarting,
@@ -68,6 +110,19 @@ pub struct Status {
     pub mem_running_kb: u64,
     pub graph_nodes: u32,
     pub units: Vec<UnitStatus>,
+    pub boxes: Vec<BoxStatus>,
+}
+
+/// Another box as this daemon sees it.
+#[derive(Debug, Pack)]
+pub struct BoxStatus {
+    pub name: ArcStr,
+    pub profile: ArcStr,
+    pub classes: Vec<ClassStatus>,
+    /// Jobs this box has running there.
+    pub sent: u32,
+    /// It speaks this protocol version.
+    pub compatible: bool,
 }
 
 /// A switch to a profile with no calibration yet. New jobs wait until it

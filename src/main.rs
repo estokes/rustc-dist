@@ -1,15 +1,23 @@
 mod argv;
+mod blobs;
 mod calibrate;
 mod classes;
 mod client;
 mod config;
 mod daemon;
+mod farm;
 mod graph;
 mod protocol;
+mod remote;
+mod sandbox;
 mod sched;
 mod stats;
 mod sys;
+mod toolchain;
 mod wrapper;
+
+#[cfg(test)]
+mod e2e_test;
 
 use anyhow::{Result, bail};
 use bytes::BytesMut;
@@ -145,6 +153,17 @@ fn status() -> Result<()> {
         gib(st.mem_running_kb),
         gib(st.mem_limit_kb)
     )?;
+    for b in &st.boxes {
+        let cpus: u32 = b.classes.iter().map(|c| c.cpus).sum();
+        let running: u32 = b.classes.iter().map(|c| c.running).sum();
+        let fastest = b.classes.iter().map(|c| c.calib_us).min().unwrap_or(0) as f64 / 1000.;
+        let note = if b.compatible { "" } else { ", other version" };
+        writeln!(
+            out,
+            "box {}: profile {}, {running} of {cpus} cpus busy, fastest {fastest:.1} ms, {} from here{note}",
+            b.name, b.profile, b.sent
+        )?;
+    }
     if st.units.is_empty() {
         return Ok(());
     }

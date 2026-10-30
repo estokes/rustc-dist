@@ -1,11 +1,21 @@
-use crate::protocol::Unit;
+use crate::protocol::{Dep, JobPaths, Unit};
 use arcstr::ArcStr;
 use compact_str::format_compact;
 use std::{ffi::OsStr, path::Path};
 
 pub enum Invocation {
     Probe,
-    Compile(Unit),
+    Compile(Compile),
+}
+
+pub struct Compile {
+    pub name: ArcStr,
+    pub unit: Unit,
+    /// Present when the job builds only lib or rlib crates with plain
+    /// rustc, without incremental state or host-specific codegen, so
+    /// another box with the same toolchain produces the same output.
+    pub portable: Option<JobPaths>,
+    pub target: Option<ArcStr>,
 }
 
 /// `args[0]` is the compiler cargo asked for: rustc, or clippy-driver
@@ -19,7 +29,16 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     let mut emit = "";
     let mut test = false;
     let mut out_dir_arg = None;
+    let mut target = None;
+    let mut linkless = true;
+    let mut typed = false;
+    let mut argfile = false;
     let mut deps = Vec::new();
+    let mut paths = JobPaths::default();
+    let mut crate_type = |t: &str, linkless: &mut bool| {
+        typed = true;
+        *linkless &= t.split(',').all(|t| t == "lib" || t == "rlib");
+    };
     let mut args = args[1..].iter().filter_map(|a| a.as_ref().to_str());
     while let Some(arg) = args.next() {
         match arg {
@@ -27,23 +46,37 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
             _ if arg.starts_with("--print") => return Invocation::Probe,
             "--test" => test = true,
             "--crate-name" => crate_name = args.next(),
+            "--crate-type" => crate_type(args.next().unwrap_or("bin"), &mut linkless),
             "--emit" => emit = args.next().unwrap_or(""),
             "--out-dir" => out_dir_arg = args.next(),
-            "--extern" => deps.extend(args.next().and_then(extern_id)),
+            "--target" => target = args.next(),
+            "--extern" => deps.extend(args.next().and_then(extern_dep)),
             "-C" => {
                 if let Some(v) = args.next() {
                     cg.parse(v);
                 }
             }
+            "-L" => paths.search.extend(args.next().and_then(search_dir)),
+            "-o" => paths.outputs.extend(args.next().map(ArcStr::from)),
             _ => {
-                if let Some(v) = arg.strip_prefix("--crate-name=") {
+                if arg.starts_with('@') {
+                    argfile = true;
+                } else if !arg.starts_with('-') && arg.ends_with(".rs") {
+                    paths.sources.push(ArcStr::from(arg));
+                } else if let Some(v) = arg.strip_prefix("-L") {
+                    paths.search.extend(search_dir(v));
+                } else if let Some(v) = arg.strip_prefix("--crate-name=") {
                     crate_name = Some(v);
+                } else if let Some(v) = arg.strip_prefix("--crate-type=") {
+                    crate_type(v, &mut linkless);
                 } else if let Some(v) = arg.strip_prefix("--emit=") {
                     emit = v;
                 } else if let Some(v) = arg.strip_prefix("--out-dir=") {
                     out_dir_arg = Some(v);
+                } else if let Some(v) = arg.strip_prefix("--target=") {
+                    target = Some(v);
                 } else if let Some(v) = arg.strip_prefix("--extern=") {
-                    deps.extend(extern_id(v));
+                    deps.extend(extern_dep(v));
                 } else if let Some(v) = arg.strip_prefix("-C") {
                     cg.parse(v);
                 }
@@ -51,10 +84,10 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
         }
     }
     let Some(name) = crate_name else { return Invocation::Probe };
-    let test = if test { ":test" } else { "" };
+    let suffix = if test { ":test" } else { "" };
     let metadata = cg.metadata;
     let opt = if cg.opt.is_empty() { "0" } else { cg.opt };
-    let exact: ArcStr = format_compact!("{driver}:{name}:{metadata}:{emit}{test}").as_str().into();
+    let exact: ArcStr = format_compact!("{driver}:{name}:{metadata}:{emit}{suffix}").as_str().into();
     let id = if name.starts_with("build_script_") {
         out_dir_arg.and_then(|d| build_group(Path::new(d)))
     } else if !cg.extra.is_empty() {
@@ -63,13 +96,36 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
         None
     };
     if let Some(dir) = out_dir.and_then(|d| Path::new(d).parent()) {
-        deps.extend(build_group(dir));
+        deps.extend(build_group(dir).map(|id| Dep { id, file: None }));
     }
-    Invocation::Compile(Unit {
-        coarse: format_compact!("{driver}:{name}:O{opt}:{emit}{test}").as_str().into(),
-        id: id.unwrap_or_else(|| exact.clone()),
-        exact,
-        deps,
+    let portable = driver == "rustc"
+        && typed
+        && linkless
+        && !test
+        && !argfile
+        && !cg.incremental
+        && !cg.native_cpu;
+    let portable = match out_dir_arg {
+        Some(out_dir) if portable => {
+            paths.dep_info = format_compact!("{out_dir}/{name}{}.d", cg.extra).as_str().into();
+            paths.out_dir = ArcStr::from(out_dir);
+            paths.outputs.extend(
+                emit.split(',').filter_map(|e| e.split_once('=')).map(|(_, p)| ArcStr::from(p)),
+            );
+            Some(paths)
+        }
+        _ => None,
+    };
+    Invocation::Compile(Compile {
+        name: ArcStr::from(name),
+        unit: Unit {
+            coarse: format_compact!("{driver}:{name}:O{opt}:{emit}{suffix}").as_str().into(),
+            id: id.unwrap_or_else(|| exact.clone()),
+            exact,
+            deps,
+        },
+        portable,
+        target: target.map(ArcStr::from),
     })
 }
 
@@ -78,6 +134,8 @@ struct Codegen<'a> {
     metadata: &'a str,
     extra: &'a str,
     opt: &'a str,
+    incremental: bool,
+    native_cpu: bool,
 }
 
 impl<'a> Codegen<'a> {
@@ -88,16 +146,31 @@ impl<'a> Codegen<'a> {
             self.extra = v;
         } else if let Some(v) = arg.strip_prefix("opt-level=") {
             self.opt = v;
+        } else if arg == "incremental" || arg.starts_with("incremental=") {
+            self.incremental = true;
+        } else if arg == "target-cpu=native" {
+            self.native_cpu = true;
         }
     }
 }
 
+/// A `-L` directory other rustc jobs don't write: `native=`, `all=`, or
+/// a bare path.
+fn search_dir(spec: &str) -> Option<ArcStr> {
+    match spec.split_once('=') {
+        Some(("native" | "all", dir)) => Some(ArcStr::from(dir)),
+        Some(("dependency" | "crate" | "framework", _)) => None,
+        _ => Some(ArcStr::from(spec)),
+    }
+}
+
 /// `name=…/libfoo-1a2b.rmeta` is the output of the job with id `foo-1a2b`.
-fn extern_id(spec: &str) -> Option<ArcStr> {
+fn extern_dep(spec: &str) -> Option<Dep> {
     let (_, path) = spec.split_once('=')?;
     let file = Path::new(path).file_name()?.to_str()?;
     let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
-    Some(ArcStr::from(stem.strip_prefix("lib").unwrap_or(stem)))
+    let id = ArcStr::from(stem.strip_prefix("lib").unwrap_or(stem));
+    Some(Dep { id, file: Some(ArcStr::from(path)) })
 }
 
 /// A build script compiles into `…/build/pkg-HASH1` and runs into
@@ -113,11 +186,15 @@ fn build_group(dir: &Path) -> Option<ArcStr> {
 mod test {
     use super::*;
 
-    fn unit(args: &[&str], out_dir: Option<&str>) -> Unit {
+    fn compile(args: &[&str], out_dir: Option<&str>) -> Compile {
         match classify(args, out_dir.map(OsStr::new)) {
-            Invocation::Compile(u) => u,
+            Invocation::Compile(c) => c,
             Invocation::Probe => panic!("{args:?} classified as a probe"),
         }
+    }
+
+    fn unit(args: &[&str], out_dir: Option<&str>) -> Unit {
+        compile(args, out_dir).unit
     }
 
     #[test]
@@ -174,8 +251,12 @@ mod test {
             None,
         );
         assert_eq!(a.id.as_str(), "a-8169c16474ca1297");
-        let deps: Vec<&str> = a.deps.iter().map(|d| d.as_str()).collect();
-        assert_eq!(deps, ["outside-80db8be130f292f3", "serde_derive-1234abcd"]);
+        let ids: Vec<&str> = a.deps.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["outside-80db8be130f292f3", "serde_derive-1234abcd"]);
+        assert_eq!(
+            a.deps[0].file.as_deref(),
+            Some("/t/release/deps/liboutside-80db8be130f292f3.rmeta")
+        );
     }
 
     #[test]
@@ -193,6 +274,52 @@ mod test {
             &["rustc", "--crate-name", "proc_macro2", "src/lib.rs", "-C", "extra-filename=-9f"],
             Some("/t/release/build/proc-macro2-707e471db1d82c2a/out"),
         );
-        assert_eq!(lib.deps, vec![script.id]);
+        assert_eq!(lib.deps, vec![Dep { id: script.id, file: None }]);
+    }
+
+    #[test]
+    fn only_portable_lib_builds_may_go_remote() {
+        let lib = [
+            "rustc", "--crate-name", "a", "--crate-type", "lib", "--emit=dep-info,metadata,link",
+            "-C", "extra-filename=-77", "--out-dir", "/t/deps",
+        ];
+        assert!(compile(&lib, None).portable.is_some());
+        let with = |extra: &[&str]| {
+            let mut args = lib.to_vec();
+            args.extend_from_slice(extra);
+            compile(&args, None)
+        };
+        assert!(with(&["-C", "incremental=/t/inc"]).portable.is_none());
+        assert!(with(&["-Ctarget-cpu=native"]).portable.is_none());
+        assert!(with(&["--test"]).portable.is_none());
+        assert!(with(&["--crate-type", "proc-macro"]).portable.is_none());
+        assert!(with(&["@/tmp/args"]).portable.is_none());
+        assert!(with(&["--crate-type=rlib"]).portable.is_some());
+        assert_eq!(
+            with(&["--target", "aarch64-unknown-linux-gnu"]).target.as_deref(),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        let no_type = ["rustc", "--crate-name", "b", "src/main.rs", "--out-dir", "/t"];
+        assert!(compile(&no_type, None).portable.is_none(), "no crate type means bin");
+        let clippy = ["clippy-driver", "rustc", "--crate-name", "a", "--crate-type", "lib", "--out-dir", "/t"];
+        assert!(compile(&clippy, None).portable.is_none());
+    }
+
+    #[test]
+    fn job_paths() {
+        let c = compile(
+            &[
+                "rustc", "--crate-name", "a", "--crate-type", "lib", "a/src/lib.rs", "--cfg", "feature=\"x\"",
+                "--emit=dep-info,metadata,link", "-C", "extra-filename=-77", "--out-dir", "/t/deps",
+                "-L", "dependency=/t/deps", "-L", "native=/t/build/a-1/out", "-L/usr/lib/extra",
+            ],
+            None,
+        );
+        let p = c.portable.unwrap();
+        assert_eq!(p.out_dir.as_str(), "/t/deps");
+        assert_eq!(p.dep_info.as_str(), "/t/deps/a-77.d");
+        assert_eq!(p.sources, ["a/src/lib.rs"]);
+        assert_eq!(p.search, ["/t/build/a-1/out", "/usr/lib/extra"]);
+        assert!(p.outputs.is_empty());
     }
 }

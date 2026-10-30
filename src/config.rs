@@ -15,12 +15,50 @@ pub struct Config {
     pub memory_fraction: f64,
     /// How long the daemon runs the calibration load for a new profile.
     pub calibration_seconds: u64,
+    /// The netidx path every box of the farm publishes under. Without it
+    /// this box works alone.
+    pub base: Option<String>,
+    /// This box's name under `base`. The host name by default.
+    pub name: Option<String>,
+    /// How much disk other boxes' inputs may use here.
+    pub blob_cache_gb: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { memory_fraction: 0.8, calibration_seconds: 60 }
+        Self { memory_fraction: 0.8, calibration_seconds: 60, base: None, name: None, blob_cache_gb: 20 }
     }
+}
+
+/// `rustc-dist.toml` in a project.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Project {
+    /// Crates to build on this box only.
+    pub local: Vec<String>,
+}
+
+impl Project {
+    pub fn keeps_local(&self, crate_name: &str) -> bool {
+        let norm = |s: &str| s.replace('-', "_");
+        self.local.iter().any(|l| norm(l) == norm(crate_name))
+    }
+}
+
+/// The nearest `rustc-dist.toml` at or above `start`, the directory cargo
+/// ran in, which is where cargo looks for its own config.
+pub fn project(start: &Path) -> Result<Project> {
+    for dir in start.ancestors() {
+        let path = dir.join("rustc-dist.toml");
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                return toml::from_str(&text).with_context(|| format_compact!("parsing {}", path.display()));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format_compact!("reading {}", path.display())),
+        }
+    }
+    Ok(Project::default())
 }
 
 pub fn load() -> Result<Config> {
@@ -45,6 +83,11 @@ fn xdg(var: &str, home_rel: &str) -> PathBuf {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(home_rel),
     }
+}
+
+/// Other boxes' inputs and the jobs built from them.
+pub fn cache_dir() -> PathBuf {
+    xdg("XDG_CACHE_HOME", ".cache").join("rustc-dist")
 }
 
 pub fn systemd_unit_dir() -> PathBuf {
@@ -82,4 +125,26 @@ pub fn make_private_dir(dir: &Path) -> Result<()> {
         .mode(0o700)
         .create(dir)
         .with_context(|| format_compact!("creating {}", dir.display()))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn project_files_are_found_above_the_cargo_dir() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-project-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("ws/crates/a"))?;
+        assert!(project(&dir.join("ws/crates/a"))?.local.is_empty());
+        fs::write(dir.join("ws/rustc-dist.toml"), "local = [\n  \"sqlx-macros\",\n  \"openssl_sys\",\n]\n")?;
+        let p = project(&dir.join("ws/crates/a"))?;
+        assert!(p.keeps_local("sqlx_macros"));
+        assert!(p.keeps_local("openssl-sys"));
+        assert!(!p.keeps_local("serde"));
+        fs::write(dir.join("ws/rustc-dist.toml"), "lokal = []\n")?;
+        assert!(project(&dir).is_ok() && project(&dir.join("ws")).is_err());
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 }

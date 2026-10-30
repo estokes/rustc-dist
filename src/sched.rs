@@ -1,15 +1,19 @@
 use crate::{
     calibrate,
     classes::{self, Class, Profile},
+    farm::{BoxState, ClassState, Load},
     graph::Graph,
-    protocol::{ClassStatus, Ran, Reply, Status, Switching, Unit, UnitStatus, frame},
+    protocol::{
+        BoxStatus, ClassStatus, PROTOCOL, Ran, Reply, Status, Switching, Unit, UnitStatus, frame,
+    },
     stats::{Prediction, Sample, Stats},
 };
 use anyhow::{Context, Result};
 use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
 use compact_str::format_compact;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
+use netidx::path::Path as NPath;
 use netidx_core::atomic_id;
 use poolshark::local::LPooled;
 use serde::{Deserialize, Serialize};
@@ -27,10 +31,11 @@ use std::{
 };
 use tokio::{
     io::unix::AsyncFd,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task,
     time::{self, MissedTickBehavior},
 };
+use triomphe::Arc;
 
 /// A waiting job's priority doubles every this many seconds, so jobs
 /// little work waits on are not starved by a stream of ones a lot does.
@@ -42,13 +47,37 @@ const RECHECK: Duration = Duration::from_millis(250);
 /// A job is placed only after it has waited this long, so the daemon sees
 /// a wave of jobs cargo starts together before deciding where each goes.
 const GATHER: Duration = Duration::from_millis(20);
+/// Only jobs predicted to take this long on the fastest local class are
+/// worth sending to another box.
+const REMOTE_MIN_US: u64 = 1_000_000;
+/// The predicted cost of running a job on another box: connecting,
+/// sending inputs it lacks, and fetching outputs.
+const REMOTE_OVERHEAD_US: u64 = 200_000;
+/// A box that answered busy is not offered jobs for this long.
+const BUSY_BACKOFF: Duration = Duration::from_secs(2);
+/// A unit that failed remotely and then built locally this many times is
+/// kept local.
+const PIN_AFTER: u8 = 2;
 
 atomic_id!(LayoutId);
 atomic_id!(JobId);
 
+/// What a job needs to run on another box.
+pub struct Want {
+    pub key: ArcStr,
+    pub target: Option<ArcStr>,
+}
+
 pub enum Msg {
-    Submit { unit: Unit, build: u32, reply: oneshot::Sender<Admission> },
+    Submit { unit: Unit, build: u32, remote: Option<Want>, reply: oneshot::Sender<Admission> },
     Finished { job: JobId, unit: Unit, ran: Option<Ran> },
+    /// Another box offers this one a job for `class`.
+    Offer { unit: Unit, class: u32, reply: oneshot::Sender<Option<Slot>> },
+    RemoteDone { job: JobId, unit: Unit, outcome: RemoteOutcome },
+    /// A unit failed on another box and then built here.
+    Mismatch { unit: Unit },
+    /// Another box's state changed, or it left.
+    Farm { name: ArcStr, state: Option<(NPath, BoxState)> },
     Status { reply: oneshot::Sender<Status> },
     Profile { profile: Profile, recalibrate: bool },
     Calibrated { profile: Profile, result: Result<Vec<Class>> },
@@ -57,13 +86,20 @@ pub enum Msg {
 
 pub enum Admission {
     Slot(Slot),
+    Remote(RemoteSlot),
     Restarting,
 }
 
-/// Held while a wrapper runs rustc. Dropping it frees the slot.
+/// A class's cpus and jobserver, and the framed `Reply::Slot` for them.
+pub struct Grant {
+    pub frame: Bytes,
+    pub cpus: Vec<u32>,
+    pub jobserver: ArcStr,
+}
+
+/// Held while rustc runs on this box. Dropping it frees the slot.
 pub struct Slot {
-    /// The framed `Reply::Slot` for the wrapper.
-    pub grant: Bytes,
+    pub grant: Arc<Grant>,
     job: JobId,
     unit: Unit,
     ran: Option<Ran>,
@@ -82,6 +118,47 @@ impl Drop for Slot {
             job: self.job,
             unit: self.unit.clone(),
             ran: self.ran.take(),
+        });
+    }
+}
+
+pub enum RemoteOutcome {
+    Done(Ran),
+    Busy,
+    Failed,
+}
+
+/// Held while a job runs on another box. Dropping it without an outcome
+/// counts as a failure.
+pub struct RemoteSlot {
+    pub jobs: NPath,
+    pub class: u32,
+    pub key: ArcStr,
+    pub target: Option<ArcStr>,
+    /// The crate files below the job, which it must send.
+    pub crates: Vec<ArcStr>,
+    job: JobId,
+    unit: Unit,
+    outcome: Option<RemoteOutcome>,
+    tx: mpsc::UnboundedSender<Msg>,
+}
+
+impl RemoteSlot {
+    pub fn unit(&self) -> &Unit {
+        &self.unit
+    }
+
+    pub fn finish(mut self, outcome: RemoteOutcome) {
+        self.outcome = Some(outcome);
+    }
+}
+
+impl Drop for RemoteSlot {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::RemoteDone {
+            job: self.job,
+            unit: self.unit.clone(),
+            outcome: self.outcome.take().unwrap_or(RemoteOutcome::Failed),
         });
     }
 }
@@ -159,7 +236,7 @@ struct Layout {
     /// Fastest first.
     classes: Vec<Class>,
     fifos: Vec<Fifo>,
-    grants: Vec<Bytes>,
+    grants: Vec<Arc<Grant>>,
     running: Vec<u32>,
 }
 
@@ -173,8 +250,14 @@ impl Layout {
             let path = fifo_dir.join(format_compact!("class-{}-{k}", id.inner()).as_str());
             let jobserver = ArcStr::from(path.to_str().context("jobserver path is not utf-8")?);
             fifos.push(Fifo::create(path, class.cpus.len())?);
-            frame(&mut buf, &Reply::Slot { cpus: class.cpus.clone(), jobserver })?;
-            grants.push(buf.split().freeze());
+            let reply = Reply::Slot {
+                cpus: class.cpus.clone(),
+                jobserver: jobserver.clone(),
+                filter_metadata: false,
+            };
+            frame(&mut buf, &reply)?;
+            let frame = buf.split().freeze();
+            grants.push(Arc::new(Grant { frame, cpus: class.cpus.clone(), jobserver }));
         }
         Ok(Self { id, running: vec![0; classes.len()], classes, fifos, grants })
     }
@@ -216,20 +299,33 @@ pub struct Setup {
     pub calibration_seconds: u64,
 }
 
+/// A job that may run on another box, with the crate files it reads.
+struct Portable {
+    key: ArcStr,
+    target: Option<ArcStr>,
+    crates: Vec<ArcStr>,
+}
+
 struct Waiting {
     unit: Unit,
     build: u32,
     pred: Prediction,
     rank_mcu: u64,
+    portable: Option<Portable>,
     since: Instant,
     reply: oneshot::Sender<Admission>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Local { layout: LayoutId, class: usize },
+    Remote { remote: usize, class: usize },
 }
 
 struct Running {
     job: JobId,
     build: u32,
-    layout: LayoutId,
-    class: usize,
+    place: Place,
     calib_us: u64,
     mem_kb: u64,
     cost_mcu: u64,
@@ -249,6 +345,27 @@ impl Running {
     fn rank_left_mcu(&self, now: Instant) -> u64 {
         let done = now.duration_since(self.start).as_micros() as u64 * 1000 / self.calib_us;
         self.rank_mcu.saturating_sub(done.min(self.cost_mcu))
+    }
+}
+
+/// Another box as this one knows it.
+struct RemoteBox {
+    name: ArcStr,
+    jobs: NPath,
+    state: Option<BoxState>,
+    /// Jobs sent to each class and not yet done.
+    sent: Vec<u32>,
+    backoff_until: Option<Instant>,
+}
+
+impl RemoteBox {
+    fn usable(&self, now: Instant, p: &Portable) -> Option<&BoxState> {
+        let state = self.state.as_ref()?;
+        let ready = state.protocol == PROTOCOL
+            && state.accepting
+            && self.backoff_until.is_none_or(|t| now >= t)
+            && state.toolchains.iter().any(|t| t.builds(&p.key, p.target.as_deref()));
+        ready.then_some(state)
     }
 }
 
@@ -273,15 +390,24 @@ pub struct Sched {
     starved: bool,
     /// When the next job too young to place becomes old enough.
     gathering: Option<Instant>,
+    remotes: Vec<RemoteBox>,
+    /// Units that failed remotely and then built here, and how often.
+    mismatches: HashMap<ArcStr, u8>,
     stats: Stats,
     graph: Graph,
+    load: watch::Sender<Load>,
     tx: mpsc::UnboundedSender<Msg>,
 }
 
 impl Sched {
     /// Start in `profile`. If it was never calibrated, calibrate before
-    /// admitting anything.
-    pub fn new(setup: Setup, profile: Profile, tx: mpsc::UnboundedSender<Msg>) -> Result<Self> {
+    /// admitting anything. `load` receives this box's load as it changes.
+    pub fn new(
+        setup: Setup,
+        profile: Profile,
+        load: watch::Sender<Load>,
+        tx: mpsc::UnboundedSender<Msg>,
+    ) -> Result<Self> {
         let stats = Stats::load(&setup.state_dir.join("jobs.hdr")).unwrap_or_else(|e| {
             warn!("starting with empty job stats: {e:#}");
             Stats::new()
@@ -300,7 +426,7 @@ impl Sched {
         };
         let layout = Layout::new(classes, &setup.fifo_dir)?;
         log_classes(&profile, &layout.classes);
-        Ok(Self {
+        let mut sched = Self {
             setup,
             profile,
             empty: vec![false; layout.classes.len()],
@@ -312,10 +438,15 @@ impl Sched {
             queue: Vec::new(),
             starved: false,
             gathering: None,
+            remotes: Vec::new(),
+            mismatches: HashMap::new(),
             stats,
             graph,
+            load,
             tx,
-        })
+        };
+        sched.publish();
+        Ok(sched)
     }
 
     pub async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Msg>) {
@@ -354,6 +485,7 @@ impl Sched {
                 Event::Save => self.save(),
             }
             self.dispatch();
+            self.publish();
         }
         for w in self.queue.drain(..) {
             let _ = w.reply.send(Admission::Restarting);
@@ -381,13 +513,16 @@ impl Sched {
     /// False when the scheduler should stop.
     fn handle(&mut self, msg: Msg) -> Result<bool> {
         match msg {
-            Msg::Submit { unit, build, reply } => {
-                self.graph.record(&unit);
-                let rank_mcu = self.graph.rank(&unit.id, &self.stats);
-                let pred = self.stats.predict(&unit.exact, &unit.coarse);
-                self.queue.push(Waiting { unit, build, pred, rank_mcu, since: Instant::now(), reply });
-            }
+            Msg::Submit { unit, build, remote, reply } => self.submit(unit, build, remote, reply),
             Msg::Finished { job, unit, ran } => self.finished(job, &unit, ran),
+            Msg::Offer { unit, class, reply } => {
+                let slot = self.offer(unit, class as usize);
+                // If the asker is gone the slot comes back through Drop.
+                let _ = reply.send(slot);
+            }
+            Msg::RemoteDone { job, unit, outcome } => self.remote_done(job, &unit, outcome),
+            Msg::Mismatch { unit } => *self.mismatches.entry(unit.exact).or_default() += 1,
+            Msg::Farm { name, state } => self.farm(name, state),
             Msg::Status { reply } => {
                 let _ = reply.send(self.status());
             }
@@ -398,31 +533,127 @@ impl Sched {
         Ok(true)
     }
 
+    fn submit(&mut self, unit: Unit, build: u32, remote: Option<Want>, reply: oneshot::Sender<Admission>) {
+        self.graph.record(&unit);
+        let rank_mcu = self.graph.rank(&unit.id, &self.stats);
+        let pred = self.stats.predict(&unit.exact, &unit.coarse);
+        let pinned = self.mismatches.get(&unit.exact).is_some_and(|n| *n >= PIN_AFTER);
+        let portable = match remote {
+            Some(Want { key, target }) if !pinned => {
+                self.graph.inputs(&unit.deps).map(|crates| Portable { key, target, crates })
+            }
+            _ => None,
+        };
+        self.queue.push(Waiting { unit, build, pred, rank_mcu, portable, since: Instant::now(), reply });
+    }
+
     fn finished(&mut self, job: JobId, unit: &Unit, ran: Option<Ran>) {
+        let Some(r) = self.take_running(job) else { return };
+        let Place::Local { layout: id, class } = r.place else {
+            warn!("job {job:?} finished locally but ran remotely");
+            return;
+        };
+        let layout = if self.layout.id == id {
+            &mut self.layout
+        } else if let Some(l) = self.retired.iter_mut().find(|l| l.id == id) {
+            l
+        } else {
+            warn!("job {job:?} finished in unknown layout {id:?}");
+            return;
+        };
+        layout.release(class);
+        self.retired.retain(|l| !l.idle());
+        if let Some(ran) = ran {
+            self.record(unit, &ran, r.calib_us);
+        }
+    }
+
+    fn take_running(&mut self, job: JobId) -> Option<Running> {
         let Some(i) = self.running.iter().position(|r| r.job == job) else {
             warn!("unknown job {job:?} finished");
-            return;
+            return None;
         };
         let r = self.running.swap_remove(i);
         self.mem_running_kb -= r.mem_kb;
-        let layout = if self.layout.id == r.layout {
-            &mut self.layout
-        } else if let Some(l) = self.retired.iter_mut().find(|l| l.id == r.layout) {
-            l
-        } else {
-            warn!("job {job:?} finished in unknown layout {:?}", r.layout);
-            return;
+        Some(r)
+    }
+
+    fn record(&mut self, unit: &Unit, ran: &Ran, calib_us: u64) {
+        debug!("{} used {} ms cpu in {} ms", unit.exact, ran.cpu_us / 1000, ran.wall_us / 1000);
+        let sample = Sample {
+            cost_mcu: ran.cpu_us * 1000 / calib_us,
+            wall_ms: ran.wall_us / 1000,
+            mem_kb: ran.maxrss_kb,
         };
-        layout.release(r.class);
-        self.retired.retain(|l| !l.idle());
-        if let Some(ran) = ran {
-            let sample = Sample {
-                cost_mcu: ran.cpu_us * 1000 / r.calib_us,
-                wall_ms: ran.wall_us / 1000,
-                mem_kb: ran.maxrss_kb,
-            };
-            self.stats.record(unit, sample);
+        self.stats.record(unit, sample);
+    }
+
+    fn remote_done(&mut self, job: JobId, unit: &Unit, outcome: RemoteOutcome) {
+        let Some(r) = self.take_running(job) else { return };
+        let Place::Remote { remote, class } = r.place else { return };
+        let rb = &mut self.remotes[remote];
+        rb.sent[class] = rb.sent[class].saturating_sub(1);
+        match outcome {
+            RemoteOutcome::Done(ran) => {
+                self.mismatches.remove(&unit.exact);
+                self.record(unit, &ran, r.calib_us);
+            }
+            RemoteOutcome::Busy => {
+                info!("{} is busy", rb.name);
+                rb.backoff_until = Some(Instant::now() + BUSY_BACKOFF);
+            }
+            RemoteOutcome::Failed => (),
         }
+    }
+
+    fn farm(&mut self, name: ArcStr, state: Option<(NPath, BoxState)>) {
+        let i = match self.remotes.iter().position(|r| r.name == name) {
+            Some(i) => i,
+            None => {
+                self.remotes.push(RemoteBox {
+                    name,
+                    jobs: NPath::root(),
+                    state: None,
+                    sent: Vec::new(),
+                    backoff_until: None,
+                });
+                self.remotes.len() - 1
+            }
+        };
+        let rb = &mut self.remotes[i];
+        match state {
+            Some((jobs, state)) => {
+                rb.sent.resize(state.classes.len(), 0);
+                rb.jobs = jobs;
+                rb.state = Some(state);
+            }
+            None => rb.state = None,
+        }
+    }
+
+    /// Admit a job another box offers, if a token is free in `class` and
+    /// no job of this box's own is waiting.
+    fn offer(&mut self, unit: Unit, class: usize) -> Option<Slot> {
+        let refuse = |why: &str| {
+            debug!("refusing {}: {why}", unit.exact);
+            None
+        };
+        if !matches!(self.switch, Switch::No) {
+            return refuse("switching profile");
+        }
+        if self.queue.iter().any(|w| !w.reply.is_closed()) {
+            return refuse("local jobs are waiting");
+        }
+        let class = class.min(self.layout.classes.len() - 1);
+        let pred = self.stats.predict(&unit.exact, &unit.coarse);
+        if !self.running.is_empty() && self.mem_running_kb + pred.mem_kb > self.setup.mem_limit_kb {
+            return refuse("no memory");
+        }
+        if self.layout.fifos[class].take(1) == 0 {
+            return refuse("no token");
+        }
+        let rank_mcu = pred.cost_mcu;
+        Some(self.admit(unit, 0, pred, rank_mcu, class, Instant::now()))
     }
 
     fn switch_to(&mut self, to: Profile, recalibrate: bool) -> Result<()> {
@@ -450,10 +681,10 @@ impl Sched {
         Ok(())
     }
 
-    /// Start a pending calibration once nothing is running.
+    /// Start a pending calibration once nothing runs here.
     fn advance(&mut self) {
         let Switch::Draining(to) = &self.switch else { return };
-        if !self.running.is_empty() {
+        if self.running.iter().any(|r| matches!(r.place, Place::Local { .. })) {
             return;
         }
         let profile = to.clone();
@@ -509,12 +740,13 @@ impl Sched {
         Ok(())
     }
 
-    /// µs until a slot of `class` is expected to free, from the jobs
+    /// µs until a slot of local `class` is expected to free, from the jobs
     /// running in it.
     fn frees_in_us(&self, class: usize, now: Instant) -> u64 {
+        let here = Place::Local { layout: self.layout.id, class };
         self.running
             .iter()
-            .filter(|r| r.layout == self.layout.id && r.class == class)
+            .filter(|r| r.place == here)
             .map(|r| r.left_us(now))
             .min()
             .unwrap_or(0)
@@ -570,59 +802,144 @@ impl Sched {
         }
         let mut frees_in: LPooled<Vec<u64>> = LPooled::take();
         frees_in.extend((0..held.len()).map(|k| if held[k] > 0 { 0 } else { self.frees_in_us(k, now) }));
-        let mut granted: LPooled<Vec<(usize, usize)>> = LPooled::take();
+        let fastest = self.layout.classes[0].calib_us;
+        let mut cands: LPooled<Vec<Cand>> = LPooled::take();
+        let mut granted: LPooled<Vec<(usize, Place)>> = LPooled::take();
         for &i in admissible.iter() {
             let w = &self.queue[i];
+            cands.clear();
+            cands.extend(self.layout.classes.iter().enumerate().map(|(k, c)| Cand {
+                calib_us: c.calib_us,
+                frees_in_us: frees_in[k],
+                overhead_us: 0,
+                place: Place::Local { layout: self.layout.id, class: k },
+            }));
+            if let Some(p) = &w.portable
+                && time_us(w.pred.cost_mcu, fastest) >= REMOTE_MIN_US
+            {
+                for (r, rb) in self.remotes.iter().enumerate() {
+                    let Some(state) = rb.usable(now, p) else { continue };
+                    for (k, c) in state.classes.iter().enumerate() {
+                        if c.running + rb.sent[k] < c.cpus {
+                            cands.push(Cand {
+                                calib_us: c.calib_us,
+                                frees_in_us: 0,
+                                overhead_us: REMOTE_OVERHEAD_US,
+                                place: Place::Remote { remote: r, class: k },
+                            });
+                        }
+                    }
+                }
+            }
             let slack_mcu = horizon[&w.build].saturating_sub(w.rank_mcu);
-            let class = choose(&self.layout.classes, &frees_in, w.pred.cost_mcu, slack_mcu);
-            if held[class] == 0 {
-                // Jobs after this one see the queue it joins, so they don't
-                // all count on the same next free slot.
-                let c = &self.layout.classes[class];
-                frees_in[class] += time_us(w.pred.cost_mcu, c.calib_us) / c.cpus.len() as u64;
-                self.starved = true;
-                continue;
+            let cand = &cands[choose(&cands, w.pred.cost_mcu, slack_mcu, fastest)];
+            match cand.place {
+                Place::Remote { remote, class } => {
+                    self.remotes[remote].sent[class] += 1;
+                    granted.push((i, cand.place));
+                }
+                Place::Local { class, .. } if held[class] == 0 => {
+                    // Jobs after this one see the queue it joins, so they
+                    // don't all count on the same next free slot.
+                    let c = &self.layout.classes[class];
+                    frees_in[class] += time_us(w.pred.cost_mcu, c.calib_us) / c.cpus.len() as u64;
+                    self.starved = true;
+                }
+                Place::Local { class, .. } => {
+                    held[class] -= 1;
+                    if held[class] == 0 {
+                        frees_in[class] = self.frees_in_us(class, now);
+                    }
+                    granted.push((i, cand.place));
+                }
             }
-            held[class] -= 1;
-            if held[class] == 0 {
-                frees_in[class] = self.frees_in_us(class, now);
-            }
-            granted.push((i, class));
         }
         for (fifo, n) in self.layout.fifos.iter().zip(held.iter()) {
             fifo.give(*n);
         }
         granted.sort_unstable_by_key(|&(i, _)| std::cmp::Reverse(i));
-        for &(i, class) in granted.iter() {
+        for &(i, place) in granted.iter() {
             let w = self.queue.swap_remove(i);
-            self.grant(w, class, now);
+            match place {
+                Place::Local { class, .. } => {
+                    let slot = self.admit(w.unit, w.build, w.pred, w.rank_mcu, class, now);
+                    // If the wrapper is gone the slot comes back through Drop.
+                    let _ = w.reply.send(Admission::Slot(slot));
+                }
+                Place::Remote { remote, class } => self.send_remote(w, remote, class, now),
+            }
         }
     }
 
-    fn grant(&mut self, w: Waiting, class: usize, now: Instant) {
+    fn admit(&mut self, unit: Unit, build: u32, pred: Prediction, rank_mcu: u64, class: usize, now: Instant) -> Slot {
         let job = JobId::new();
         self.layout.running[class] += 1;
-        self.mem_running_kb += w.pred.mem_kb;
+        self.mem_running_kb += pred.mem_kb;
+        self.running.push(Running {
+            job,
+            build,
+            place: Place::Local { layout: self.layout.id, class },
+            calib_us: self.layout.classes[class].calib_us,
+            mem_kb: pred.mem_kb,
+            cost_mcu: pred.cost_mcu,
+            rank_mcu,
+            start: now,
+        });
+        Slot { grant: self.layout.grants[class].clone(), job, unit, ran: None, tx: self.tx.clone() }
+    }
+
+    fn send_remote(&mut self, w: Waiting, remote: usize, class: usize, now: Instant) {
+        let rb = &self.remotes[remote];
+        debug!("sending {} to {} class {class}", w.unit.exact, rb.name);
+        let calib_us = rb.state.as_ref().map_or(1_000_000, |s| s.classes[class].calib_us);
+        let job = JobId::new();
         self.running.push(Running {
             job,
             build: w.build,
-            layout: self.layout.id,
-            class,
-            calib_us: self.layout.classes[class].calib_us,
-            mem_kb: w.pred.mem_kb,
+            place: Place::Remote { remote, class },
+            calib_us,
+            mem_kb: 0,
             cost_mcu: w.pred.cost_mcu,
             rank_mcu: w.rank_mcu,
             start: now,
         });
-        let slot = Slot {
-            grant: self.layout.grants[class].clone(),
+        let p = w.portable.expect("remote placement needs a portable job");
+        let slot = RemoteSlot {
+            jobs: rb.jobs.clone(),
+            class: class as u32,
+            key: p.key,
+            target: p.target,
+            crates: p.crates,
             job,
             unit: w.unit,
-            ran: None,
+            outcome: None,
             tx: self.tx.clone(),
         };
         // If the wrapper is gone the slot comes back through Drop.
-        let _ = w.reply.send(Admission::Slot(slot));
+        let _ = w.reply.send(Admission::Remote(slot));
+    }
+
+    /// Tell the farm this box's load, if it changed.
+    fn publish(&mut self) {
+        let classes = self.layout.classes.iter().zip(&self.layout.running);
+        let profile = self.profile.name();
+        let accepting = matches!(self.switch, Switch::No);
+        self.load.send_if_modified(|load| {
+            let same = load.profile == *profile
+                && load.accepting == accepting
+                && load.classes.len() == self.layout.classes.len()
+                && load.classes.iter().zip(classes.clone()).all(|(l, (c, r))| {
+                    l.calib_us == c.calib_us && l.cpus as usize == c.cpus.len() && l.running == *r
+                });
+            if !same {
+                load.profile = profile.clone();
+                load.accepting = accepting;
+                load.classes = classes
+                    .map(|(c, r)| ClassState { calib_us: c.calib_us, cpus: c.cpus.len() as u32, running: *r })
+                    .collect();
+            }
+            !same
+        });
     }
 
     fn status(&mut self) -> Status {
@@ -642,6 +959,24 @@ impl Sched {
                 })
             })
             .take(20)
+            .collect();
+        let boxes = self
+            .remotes
+            .iter()
+            .filter_map(|rb| {
+                let state = rb.state.as_ref()?;
+                Some(BoxStatus {
+                    name: rb.name.clone(),
+                    profile: state.profile.clone(),
+                    classes: state
+                        .classes
+                        .iter()
+                        .map(|c| ClassStatus { calib_us: c.calib_us, cpus: c.cpus, running: c.running })
+                        .collect(),
+                    sent: rb.sent.iter().sum(),
+                    compatible: state.protocol == PROTOCOL,
+                })
+            })
             .collect();
         Status {
             profile: self.profile.name().clone(),
@@ -667,6 +1002,7 @@ impl Sched {
             mem_running_kb: self.mem_running_kb,
             graph_nodes: self.graph.len() as u32,
             units,
+            boxes,
         }
     }
 
@@ -692,20 +1028,37 @@ fn log_classes(profile: &Profile, classes: &[Class]) {
     }
 }
 
-/// The slowest class on which a job still finishes within its slack, so
-/// faster classes stay free for jobs more work waits on. With no slack,
-/// the class where it finishes first, even if it must wait for it.
-/// Classes are fastest first; `frees_in` is µs until each has a slot.
-fn choose(classes: &[Class], frees_in: &[u64], cost_mcu: u64, slack_mcu: u64) -> usize {
-    let finish = |k: usize| frees_in[k] + time_us(cost_mcu, classes[k].calib_us);
-    let first = (0..classes.len()).map(finish).min().unwrap_or(0);
-    let slack = time_us(slack_mcu, classes[0].calib_us);
-    (0..classes.len()).rev().find(|&k| finish(k) <= first + slack).unwrap_or(0)
+/// Somewhere a job could run.
+struct Cand {
+    calib_us: u64,
+    /// µs until it has a slot.
+    frees_in_us: u64,
+    /// µs a job spends getting there and back.
+    overhead_us: u64,
+    place: Place,
+}
+
+/// The slowest candidate on which a job still finishes within its slack,
+/// so faster ones stay free for jobs more work waits on. With no slack,
+/// the one where it finishes first, even if it must wait for it. Between
+/// equally fast candidates the earlier wins, so local beats remote.
+/// `ref_calib_us` turns slack into time.
+fn choose(cands: &[Cand], cost_mcu: u64, slack_mcu: u64, ref_calib_us: u64) -> usize {
+    let finish = |c: &Cand| c.frees_in_us + c.overhead_us + time_us(cost_mcu, c.calib_us);
+    let first = cands.iter().map(finish).min().unwrap_or(0);
+    let deadline = first + time_us(slack_mcu, ref_calib_us);
+    cands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| finish(c) <= deadline)
+        .max_by(|(i, a), (j, b)| a.calib_us.cmp(&b.calib_us).then(j.cmp(i)))
+        .map_or(0, |(i, _)| i)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::toolchain::Toolchain;
     use anyhow::bail;
     use netidx_core::pack::Pack;
     use std::{fs::OpenOptions, io::Read};
@@ -719,26 +1072,36 @@ mod test {
             exact: ArcStr::from(name),
             coarse: ArcStr::from(name),
             id: ArcStr::from(name),
-            deps: deps.iter().map(|d| ArcStr::from(*d)).collect(),
+            deps: deps.iter().map(|d| crate::protocol::Dep { id: ArcStr::from(*d), file: None }).collect(),
         }
+    }
+
+    fn local(calib_us: u64, frees_in_us: u64) -> Cand {
+        Cand { calib_us, frees_in_us, overhead_us: 0, place: Place::Local { layout: LayoutId::new(), class: 0 } }
     }
 
     #[test]
     fn choose_spends_slack_on_slower_classes() {
-        let classes = [class(1000, &[0]), class(2000, &[1]), class(4000, &[2])];
         // 1000 mcu takes 1, 2 or 4 ms. All free.
-        assert_eq!(choose(&classes, &[0, 0, 0], 1000, 0), 0);
-        assert_eq!(choose(&classes, &[0, 0, 0], 1000, 1000), 1);
-        assert_eq!(choose(&classes, &[0, 0, 0], 1000, 3000), 2);
+        let free = [local(1000, 0), local(2000, 0), local(4000, 0)];
+        assert_eq!(choose(&free, 1000, 0, 1000), 0);
+        assert_eq!(choose(&free, 1000, 1000, 1000), 1);
+        assert_eq!(choose(&free, 1000, 3000, 1000), 2);
         // The fast class frees in 5 ms: with no slack, start now on the middle one.
-        assert_eq!(choose(&classes, &[5000, 0, 0], 1000, 0), 1);
+        assert_eq!(choose(&[local(1000, 5000), local(2000, 0), local(4000, 0)], 1000, 0, 1000), 1);
         // Plenty of slack: wait 1 ms for the slow class rather than take a free fast one.
-        assert_eq!(choose(&classes, &[0, 0, 1000], 1000, 10_000), 2);
+        assert_eq!(choose(&[local(1000, 0), local(2000, 0), local(4000, 1000)], 1000, 10_000, 1000), 2);
+        // A remote class as fast as a local one loses the tie, and its
+        // overhead counts against it.
+        let mut remote = local(1000, 0);
+        remote.overhead_us = 200;
+        assert_eq!(choose(&[local(1000, 0), remote], 1000, 1000, 1000), 0);
     }
 
     struct Harness {
         tx: mpsc::UnboundedSender<Msg>,
         dir: PathBuf,
+        load: watch::Receiver<Load>,
     }
 
     impl Harness {
@@ -763,7 +1126,8 @@ mod test {
                 calibration_seconds: 4,
             };
             let (tx, rx) = mpsc::unbounded_channel();
-            let mut sched = Sched::new(setup, Profile::DEFAULT, tx.clone())?;
+            let (load_tx, load) = watch::channel(Load::default());
+            let mut sched = Sched::new(setup, Profile::DEFAULT, load_tx, tx.clone())?;
             for &(name, cost_mcu, mem_kb) in costs {
                 for _ in 0..5 {
                     sched.stats.record(&unit(name, &[]), Sample { cost_mcu, wall_ms: 1, mem_kb });
@@ -775,13 +1139,17 @@ mod test {
             sched.stats.dirty = false;
             sched.graph.dirty = false;
             tokio::spawn(sched.run(rx));
-            Ok(Self { tx, dir })
+            Ok(Self { tx, dir, load })
+        }
+
+        fn submit_with(&self, name: &str, remote: Option<Want>) -> oneshot::Receiver<Admission> {
+            let (reply, rx) = oneshot::channel();
+            self.tx.send(Msg::Submit { unit: unit(name, &[]), build: 1, remote, reply }).unwrap();
+            rx
         }
 
         fn submit(&self, name: &str) -> oneshot::Receiver<Admission> {
-            let (reply, rx) = oneshot::channel();
-            self.tx.send(Msg::Submit { unit: unit(name, &[]), build: 1, reply }).unwrap();
-            rx
+            self.submit_with(name, None)
         }
 
         fn profile(&self, name: &str) {
@@ -806,16 +1174,21 @@ mod test {
     /// The first cpu of the class a slot was granted. The tests give each
     /// class a distinct first cpu.
     fn cpu(slot: &Slot) -> u32 {
-        let mut body = &slot.grant[4..];
+        let mut body = &slot.grant.frame[4..];
         match Reply::decode(&mut body).unwrap() {
             Reply::Slot { cpus, .. } => cpus[0],
             _ => panic!("not a slot"),
         }
     }
 
+    async fn admitted(rx: oneshot::Receiver<Admission>) -> Result<Admission> {
+        Ok(time::timeout(Duration::from_secs(5), rx).await??)
+    }
+
     async fn slot(rx: oneshot::Receiver<Admission>) -> Result<Slot> {
-        match time::timeout(Duration::from_secs(5), rx).await?? {
+        match admitted(rx).await? {
             Admission::Slot(s) => Ok(s),
+            Admission::Remote(_) => bail!("sent remote"),
             Admission::Restarting => bail!("restarting"),
         }
     }
@@ -906,6 +1279,69 @@ mod test {
         assert!(pending(&mut second).await);
         drop(first);
         assert_eq!(cpu(&slot(second).await?), 0);
+        Ok(())
+    }
+
+    fn remote_box(calib_us: u64, cpus: u32, running: u32) -> (NPath, BoxState) {
+        let toolchains = vec![Toolchain { key: "c h".into(), targets: vec!["h".into()] }];
+        let classes = vec![ClassState { calib_us, cpus, running }];
+        let state =
+            BoxState { protocol: PROTOCOL, profile: "default".into(), accepting: true, toolchains, classes };
+        (NPath::from("/farm/b/jobs"), state)
+    }
+
+    fn want() -> Option<Want> {
+        Some(Want { key: "c h".into(), target: None })
+    }
+
+    #[tokio::test]
+    async fn a_big_job_goes_to_a_faster_box() -> Result<()> {
+        // 5 s here, 1 s there.
+        let h = Harness::start("remote", vec![class(1000, &[0])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;
+        h.tx.send(Msg::Farm { name: "b".into(), state: Some(remote_box(200, 4, 0)) })?;
+        match admitted(h.submit_with("big", want())).await? {
+            Admission::Remote(r) => {
+                assert_eq!(r.jobs, NPath::from("/farm/b/jobs"));
+                assert!(r.crates.is_empty());
+                r.finish(RemoteOutcome::Busy);
+            }
+            _ => bail!("not sent remote"),
+        }
+        // Busy: the box is avoided for a while, so the next one stays here.
+        assert!(matches!(admitted(h.submit_with("big", want())).await?, Admission::Slot(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_needs_a_matching_toolchain_and_a_free_slot() -> Result<()> {
+        let h = Harness::start("nomatch", vec![class(1000, &[0, 1])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;
+        h.tx.send(Msg::Farm { name: "full".into(), state: Some(remote_box(200, 4, 4)) })?;
+        let other = Some(Want { key: "other h".into(), target: None });
+        h.tx.send(Msg::Farm { name: "b".into(), state: Some(remote_box(200, 4, 0)) })?;
+        assert!(matches!(admitted(h.submit_with("big", other)).await?, Admission::Slot(_)));
+        let target = Some(Want { key: "c h".into(), target: Some("wasm32".into()) });
+        assert!(matches!(admitted(h.submit_with("big", target)).await?, Admission::Slot(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn offers_are_refused_while_local_jobs_wait() -> Result<()> {
+        let h = Harness::start("offer", vec![class(1000, &[0])], u64::MAX, &[], &[])?;
+        let offer = || {
+            let (reply, rx) = oneshot::channel();
+            h.tx.send(Msg::Offer { unit: unit("r", &[]), class: 0, reply }).unwrap();
+            rx
+        };
+        let served = offer().await?.expect("a free slot");
+        assert_eq!(h.status().await.classes[0].running, 1);
+        let mut local = h.submit("l");
+        assert!(pending(&mut local).await);
+        assert!(offer().await?.is_none(), "a local job is waiting");
+        drop(served);
+        slot(local).await?;
+        let mut load = h.load.clone();
+        load.changed().await?;
+        assert_eq!(load.borrow().classes[0].cpus, 1);
         Ok(())
     }
 

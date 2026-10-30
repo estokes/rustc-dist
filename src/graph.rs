@@ -1,4 +1,7 @@
-use crate::{protocol::Unit, stats::Stats};
+use crate::{
+    protocol::{Dep, Unit},
+    stats::Stats,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use bytes::{BufMut, BytesMut};
@@ -16,14 +19,14 @@ use std::{
 
 /// Nodes not seen for this many days are dropped when the graph loads.
 const KEEP_DAYS: u32 = 60;
-const MAGIC: &[u8; 8] = b"rdgraph1";
+const MAGIC: &[u8; 8] = b"rdgraph2";
 
 #[derive(Pack)]
 struct Node {
     id: ArcStr,
     exact: ArcStr,
     coarse: ArcStr,
-    deps: Vec<ArcStr>,
+    deps: Vec<Dep>,
     seen_day: u32,
 }
 
@@ -82,13 +85,14 @@ impl Graph {
                 Vec::new()
             }
         };
-        for dep in old_deps.iter().filter(|d| !unit.deps.contains(d)) {
-            if let Some(ds) = self.dependents.get_mut(dep) {
+        let has = |deps: &[Dep], id: &ArcStr| deps.iter().any(|d| &d.id == id);
+        for dep in old_deps.iter().filter(|d| !has(&unit.deps, &d.id)) {
+            if let Some(ds) = self.dependents.get_mut(&dep.id) {
                 ds.retain(|d| d != &unit.id);
             }
         }
-        for dep in unit.deps.iter().filter(|d| !old_deps.contains(d)) {
-            self.dependents.entry(dep.clone()).or_default().push(unit.id.clone());
+        for dep in unit.deps.iter().filter(|d| !has(&old_deps, &d.id)) {
+            self.dependents.entry(dep.id.clone()).or_default().push(unit.id.clone());
         }
         self.ranks.clear();
         self.dirty = true;
@@ -119,6 +123,26 @@ impl Graph {
         rank
     }
 
+    /// The crate files a job with `deps` reads: its own and, through the
+    /// graph, those of every crate below it, since rustc loads the metadata
+    /// of indirect dependencies too. None if a crate below it was never
+    /// seen compiling, so its dependencies are unknown.
+    pub fn inputs(&self, deps: &[Dep]) -> Option<Vec<ArcStr>> {
+        let mut files = Vec::new();
+        let mut seen: LPooled<HashMap<ArcStr, ()>> = LPooled::take();
+        let mut stack: LPooled<Vec<&Dep>> = LPooled::take();
+        stack.extend(deps);
+        while let Some(dep) = stack.pop() {
+            let Some(file) = &dep.file else { continue };
+            if seen.insert(dep.id.clone(), ()).is_some() {
+                continue;
+            }
+            files.push(file.clone());
+            stack.extend(&self.nodes.get(&dep.id)?.deps);
+        }
+        Some(files)
+    }
+
     /// Every node with its rank and job key, for `status`.
     pub fn ranked(&mut self, stats: &Stats) -> Vec<(ArcStr, u64)> {
         let ids: Vec<ArcStr> = self.nodes.keys().cloned().collect();
@@ -145,7 +169,7 @@ impl Graph {
         let mut graph = Self::new();
         for node in nodes.into_iter().filter(|n| n.seen_day >= oldest) {
             for dep in &node.deps {
-                graph.dependents.entry(dep.clone()).or_default().push(node.id.clone());
+                graph.dependents.entry(dep.id.clone()).or_default().push(node.id.clone());
             }
             graph.nodes.insert(node.id.clone(), node);
         }
@@ -184,7 +208,10 @@ mod test {
             exact: ArcStr::from(id),
             coarse: ArcStr::from(id),
             id: ArcStr::from(id),
-            deps: deps.iter().map(|d| ArcStr::from(*d)).collect(),
+            deps: deps
+                .iter()
+                .map(|d| Dep { id: ArcStr::from(*d), file: Some(format_compact!("/t/lib{d}.rmeta").as_str().into()) })
+                .collect(),
         }
     }
 
@@ -230,6 +257,17 @@ mod test {
         g.record(&unit("app", &["itoa"]));
         about(g.rank(&"regex".into(), &s), 4000);
         about(g.rank(&"itoa".into(), &s), 2050);
+    }
+
+    #[test]
+    fn inputs_include_indirect_crates() {
+        let g = build();
+        let app = unit("app", &["regex", "itoa"]);
+        let mut files = g.inputs(&app.deps).unwrap();
+        files.sort();
+        assert_eq!(files, ["/t/libitoa.rmeta", "/t/liblibc.rmeta", "/t/libregex.rmeta", "/t/libregex_syntax.rmeta"]);
+        let unknown = unit("x", &["never_built"]);
+        assert!(g.inputs(&unknown.deps).is_none());
     }
 
     #[test]
