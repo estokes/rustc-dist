@@ -832,7 +832,8 @@ impl Sched {
                 }
             }
             let slack_mcu = horizon[&w.build].saturating_sub(w.rank_mcu);
-            let cand = &cands[choose(&cands, w.pred.cost_mcu, slack_mcu, fastest)];
+            let local = self.layout.classes.len();
+            let cand = &cands[choose(&cands, local, w.pred.cost_mcu, slack_mcu, fastest)];
             match cand.place {
                 Place::Remote { remote, class } => {
                     self.remotes[remote].sent[class] += 1;
@@ -1038,21 +1039,29 @@ struct Cand {
     place: Place,
 }
 
-/// The slowest candidate on which a job still finishes within its slack,
-/// so faster ones stay free for jobs more work waits on. With no slack,
-/// the one where it finishes first, even if it must wait for it. Between
-/// equally fast candidates the earlier wins, so local beats remote.
-/// `ref_calib_us` turns slack into time.
-fn choose(cands: &[Cand], cost_mcu: u64, slack_mcu: u64, ref_calib_us: u64) -> usize {
+/// Where a job runs. The first `local` candidates are this box's classes:
+/// the job takes the slowest of them on which it still finishes within its
+/// slack, so faster ones stay free for jobs more work waits on, or with no
+/// slack the one where it finishes first, even if it must wait for it.
+/// The rest are other boxes, which are spare capacity: the job goes to one
+/// if it finishes there sooner than on its local choice. `ref_calib_us`
+/// turns slack into time.
+fn choose(cands: &[Cand], local: usize, cost_mcu: u64, slack_mcu: u64, ref_calib_us: u64) -> usize {
     let finish = |c: &Cand| c.frees_in_us + c.overhead_us + time_us(cost_mcu, c.calib_us);
-    let first = cands.iter().map(finish).min().unwrap_or(0);
+    let here = &cands[..local];
+    let first = here.iter().map(finish).min().unwrap_or(0);
     let deadline = first + time_us(slack_mcu, ref_calib_us);
-    cands
+    let pick = here
         .iter()
         .enumerate()
         .filter(|(_, c)| finish(c) <= deadline)
         .max_by(|(i, a), (j, b)| a.calib_us.cmp(&b.calib_us).then(j.cmp(i)))
-        .map_or(0, |(i, _)| i)
+        .map_or(0, |(i, _)| i);
+    let away = cands[local..].iter().enumerate().min_by_key(|(_, c)| finish(c));
+    match away {
+        Some((j, c)) if finish(c) < finish(&cands[pick]) => local + j,
+        _ => pick,
+    }
 }
 
 #[cfg(test)]
@@ -1084,18 +1093,23 @@ mod test {
     fn choose_spends_slack_on_slower_classes() {
         // 1000 mcu takes 1, 2 or 4 ms. All free.
         let free = [local(1000, 0), local(2000, 0), local(4000, 0)];
-        assert_eq!(choose(&free, 1000, 0, 1000), 0);
-        assert_eq!(choose(&free, 1000, 1000, 1000), 1);
-        assert_eq!(choose(&free, 1000, 3000, 1000), 2);
+        assert_eq!(choose(&free, 3, 1000, 0, 1000), 0);
+        assert_eq!(choose(&free, 3, 1000, 1000, 1000), 1);
+        assert_eq!(choose(&free, 3, 1000, 3000, 1000), 2);
         // The fast class frees in 5 ms: with no slack, start now on the middle one.
-        assert_eq!(choose(&[local(1000, 5000), local(2000, 0), local(4000, 0)], 1000, 0, 1000), 1);
+        assert_eq!(choose(&[local(1000, 5000), local(2000, 0), local(4000, 0)], 3, 1000, 0, 1000), 1);
         // Plenty of slack: wait 1 ms for the slow class rather than take a free fast one.
-        assert_eq!(choose(&[local(1000, 0), local(2000, 0), local(4000, 1000)], 1000, 10_000, 1000), 2);
-        // A remote class as fast as a local one loses the tie, and its
-        // overhead counts against it.
-        let mut remote = local(1000, 0);
-        remote.overhead_us = 200;
-        assert_eq!(choose(&[local(1000, 0), remote], 1000, 1000, 1000), 0);
+        assert_eq!(choose(&[local(1000, 0), local(2000, 0), local(4000, 1000)], 3, 1000, 10_000, 1000), 2);
+        let remote = |calib_us| {
+            let mut c = local(calib_us, 0);
+            c.overhead_us = 200;
+            c
+        };
+        // A remote class no faster than the local one loses to its overhead.
+        assert_eq!(choose(&[local(1000, 0), remote(1000)], 1, 1000, 0, 1000), 0);
+        // Slack keeps a job on a slow local class, but another box that
+        // finishes it sooner wins anyway: it costs this box nothing.
+        assert_eq!(choose(&[local(1000, 0), local(4000, 0), remote(1000)], 2, 1000, 10_000, 1000), 2);
     }
 
     struct Harness {

@@ -272,46 +272,70 @@ work, so build times say nothing yet; placement is all that was checked.
 
 ## Remote execution
 
+### Farm
+
+A daemon whose config has `base` joins the farm. It publishes one packed value
+at `BASE/NAME/state`: protocol version, profile, whether it accepts jobs (not
+while switching profile), its toolchains, and each class's calibration, CPUs
+and running count. A changed load is republished at most every 100 ms. The
+daemon watches every other box under `BASE` and takes jobs at
+`BASE/NAME/jobs`, a netidx pack channel listener. Each job is one connection.
+
+Toolchains are rustup's (`~/.rustup/toolchains/*`). A compiler is matched by
+rustc's commit hash and host, and a job with `--target` also needs that
+target's standard library installed. The client learns the key of the rustc
+cargo runs from `rustc -vV`, cached by path and mtime.
+
+A server admits a remote job only into a free token of the class asked for,
+and only when none of its own jobs is waiting, so local work comes first. It
+answers busy otherwise, and the client leaves that box alone for 2 s. An
+admitted job holds a normal slot: it shares the class's jobserver and CPUs
+with local jobs, and its cost goes into the server's history too.
+
 ### Inputs
 
 Inputs are addressed by content. The client daemon caches
-`(path, size, mtime, inode) -> blake3`. Outputs it received from a server are
-hashed from the bytes already in hand.
+`(path, size, mtime, inode) -> blake3`. The input set is:
 
-The input set is:
+- Sources: every file the unit's previous dep-info
+  (`<out-dir>/<crate><extra>.d`) lists, which includes files outside the
+  package, plus everything in the package directories those files came from,
+  so a newly added module is found. Without dep-info the package directory is
+  walked whole, skipping `target` and hidden directories. A walk past 256 MB
+  keeps the job local.
+- The `OUT_DIR` tree and `-L` directories other than dependency ones. Static
+  libraries get bundled into rlibs.
+- Crates: the `--extern` files plus, through the build graph, those of every
+  crate below them, since rustc loads the metadata of indirect dependencies.
+  If a crate below was never seen compiling, its dependencies are unknown and
+  the job stays local.
+- Nothing under `/usr`, `/etc`, `/lib*`, `/bin`, `/sbin`, `/proc`, `/dev`,
+  `/sys` or `/run`. The sandbox mounts the server's own, and a server needs its
+  own system libraries anyway.
 
-- Sources: the unit's previous dep-info (`<out-dir>/<crate><extra>.d`) if
-  present. It is exact and includes files outside the package. Otherwise, walk
-  `CARGO_MANIFEST_DIR`, skipping `target` and `.git`.
-- The `OUT_DIR` tree and `-L native=` directories. Static libraries get bundled
-  into rlibs.
-- Crates: the `--extern` files plus everything they depend on, directly or
-  indirectly. The daemon sees every compile on its box, so it records each
-  artifact's externs and can expand those dependencies itself. For artifacts
-  it never saw, every rmeta and rlib in the `-L dependency=` directories goes
-  in. Only hashes cross the wire, and each file is uploaded once per server.
-
-Each server keeps a read-only blob store (LRU, size cap). At job start the
-client sends a manifest `[(path, hash, mode)]`. The server answers with the
-hashes it lacks, the client sends those in chunks, then sends go. Once a server
-is warm, a job costs a manifest plus whatever sources changed.
-
-Transport: one persistent netidx channel per pair of boxes, carrying many
-jobs. This replaces the per-job RPC and per-job published session.
+Each server keeps a read-only blob store under `~/.cache/rustc-dist`, evicting
+the least recently used past `blob_cache_gb` but never anything used in the
+last 10 minutes. The client sends a manifest of paths and hashes; the server
+answers with the hashes it lacks; the client sends those in 1 MB chunks and
+the server checks each blob's hash before storing it. Once a server is warm a
+job sends a manifest and whatever sources changed.
 
 ### Sandbox
 
-The job tree is hardlinks from the blob store, laid out at the client's
+The job tree is hard links from the blob store, laid out at the client's
 absolute paths. The server runs rustc under bwrap with:
 
-- `--unshare-all` (no network), `--die-with-parent`;
-- read-only binds of `/usr /lib /lib64 /bin /etc` and the toolchain sysroot;
-- tmpfs on `/tmp` and `/home`, so nothing in the server's home leaks in (a
-  checkout at the same path on the server cannot be picked up by accident);
-- read-write binds of the job tree at the client's paths;
+- `--unshare-all` (no network, own pid namespace), `--die-with-parent`, and
+  `--as-pid-1`. With rustc as pid 1, `wait4` on bwrap reports rustc's CPU
+  time; behind bwrap's own init it reported 10 ms for 5 s of work.
+- read-only binds of `/usr` and `/etc`, the host's `/bin`, `/lib*` and `/sbin`
+  as they are (symlinks on merged-usr systems), and the toolchain sysroot;
+- a tmpfs on `/tmp` unless client paths live there; nothing else of the host,
+  so a checkout at the same path on the server can't be picked up;
+- read-write binds of the job tree's top-level directories at `/`;
 - the class FIFO bound in, and CPU affinity set before exec;
-- argv and cwd unchanged; the client's env minus jobserver variables, `LD_*`
-  and `RUSTC_WRAPPER`; `PATH=/usr/bin:/bin`.
+- argv and cwd unchanged; the client's env minus jobserver variables, `LD_*`,
+  `PATH`, `TMPDIR` and the wrappers.
 
 Because the paths are the client's, nothing is rewritten. Argv, env
 (`env!("CARGO_MANIFEST_DIR")`), diagnostics, dep-info, debuginfo and panic
@@ -321,33 +345,35 @@ locations all name client paths.
 
 Cargo pipelines builds. It passes `--emit=dep-info,metadata,link
 --json=...,artifacts` and starts dependents as soon as rustc prints
-`{"artifact":"...rmeta","emit":"metadata"}`. The current code forwards that
-line live but writes outputs only after rustc exits. A dependent can therefore
-start before the rmeta exists on the client.
+`{"artifact":"...rmeta","emit":"metadata"}`. rustc prints such a line for the
+dep-info, the rmeta and the rlib.
 
 The server reads rustc's stderr line by line. On an artifact line it sends the
 file, then the line. The client writes the file (temp plus rename, keeping the
-server's mode), then forwards the line. All other output is held until exit.
-The outputs are the files named by artifact lines, with a diff of the out-dir
-as a fallback. The client accepts outputs only under `--out-dir` and `--emit`
-paths.
+server's mode) and forwards the line to the wrapper at once. All other output
+is held until rustc exits. The client accepts outputs only directly in
+`--out-dir` and explicit `--emit`/`-o` directories.
 
 ### Failure
 
-Any remote failure (non-zero exit, sandbox error, dropped connection) reruns
-on a local slot, and the held-back diagnostics are discarded. A unit that fails
-remotely but passes locally is marked remote-pinned in the cost table. Typical
-causes are proc macros that read the network or the environment (sqlx), or an
-include of a file the client never sent. If the metadata line was already
-forwarded, the wrapper drops it from the rerun's output (`filter_metadata`).
-Real compile errors get compiled twice. They usually fail fast.
+Any remote failure (non-zero exit, staging or sandbox error, dropped
+connection) reruns on a local slot, and the held-back diagnostics are
+discarded. If the rmeta line was already forwarded, the wrapper drops it from
+the rerun's output. A unit that fails remotely and then builds locally twice is
+kept local until the daemon restarts. Typical causes are proc macros that read
+the network or the environment (sqlx), or an include of a file the client
+never sent. Real compile errors get compiled twice. They usually fail fast.
 
 ## Config
 
 Config is real TOML (`toml` + serde), parsed into two separate structs.
 
-- User, `~/.config/rustc-dist.toml`: `base`, `name`, a `rustc` override, class
-  overrides, the memory fraction.
+- User, `~/.config/rustc-dist.toml`: `memory_fraction`,
+  `calibration_seconds`, and for a farm `base` (the netidx path every box
+  publishes under), `name` (the host name by default) and `blob_cache_gb`.
+  Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit
+  those to override them. The netidx config is netidx's own (`NETIDX_CFG` or
+  its default paths).
 - Project, `rustc-dist.toml` at or above cargo's cwd (`/proc/$PPID/cwd`, which
   is where cargo looks for its own config): `local = [...]`. Starting from
   `CARGO_MANIFEST_DIR` does not work. For registry deps it points into
@@ -383,10 +409,50 @@ coming back.
    table and histograms, build graph and rank placement, TOML config,
    `status`. Several agents on one box share cores without thrashing, and the
    jobs the most work waits on get the fast cores.
-2. Remote: blob store and manifest protocol, dependency tracking, bwrap
-   sandbox, pipelined outputs, fallback and remote pinning.
+2. Built 2026-10-30. Remote: farm membership over netidx, toolchain
+   matching, blob store and manifest protocol, inputs from dep-info and the
+   build graph, bwrap sandbox, pipelined outputs, local fallback and remote
+   pinning. See "Farm test" below.
 3. Cost tables and graphs shared across the farm. A measured comparison of
    build times with and without rank placement, on an idle box.
+
+## Farm test (2026-10-30)
+
+Two daemons on this laptop, each with its own state, talking through a private
+netidx resolver: A with 2 slow CPUs, B with 4 fast ones. A built this crate
+twice. The first build only taught A costs and the graph; unknown jobs are
+predicted below the 1 s remote cutoff, so nothing left. On the clean second
+build A sent 18 jobs to B: 16 compiled there, 1 failed and was rebuilt locally,
+1 got a busy answer. The build succeeded and the binary ran. Wall times on a
+box at load 100+ from other work mean nothing.
+
+What the test found:
+
+- Remote CPU time read 10 ms for every job, because bwrap's init hid rustc
+  from `wait4`. Fixed with `--as-pid-1`; the end-to-end test now checks it.
+- The failure was `cc`, whose modules live in `src/target/`: the input walk
+  skipped every directory named `target`. It now skips directories holding
+  cargo's `CACHEDIR.TAG`. Rebuilt, `cc` compiled on B.
+- A `-sys` crate's `-L /usr/lib` made staging walk all of `/usr/lib`. System
+  directories are now never sent; the sandbox mounts the server's.
+- Too little went remote. Slack sent heavy jobs to A's slow local class, and
+  the small jobs that can't go remote queued behind them while B idled. Slack
+  now chooses only among local classes, and a job goes remote whenever that
+  finishes sooner than its local choice.
+- B answered busy with free slots published, because each remote rustc's
+  codegen threads took the rest of the class's tokens. That is correct; the
+  client backs off for 2 s. Publishing free tokens instead of admitted jobs
+  would avoid the round trip, but tokens can't be counted without taking them.
+
+Known gaps:
+
+- Not yet run across two machines.
+- One connection per job. A persistent connection per pair of boxes would
+  save the setup if it shows up in measurements.
+- Upload and output file I/O run on async worker threads.
+- The first build of a project stays local, since its costs are unknown.
+- A server's `status` lists units from its own graph, so jobs it served for
+  others don't appear there, though they are in its job history.
 
 ## Guesses to test on the quiet cluster
 
@@ -405,6 +471,11 @@ Every number below is a guess. None has been tested on an idle box.
 | cost of a job with no history at all | 1 cu | `src/stats.rs:20` |
 | share of RAM predicted peaks may use | 80% | `src/config.rs:22` |
 | keep graph nodes unseen for | 60 days | `src/graph.rs:18` |
+| only send jobs predicted to take at least | 1 s | `src/sched.rs` `REMOTE_MIN_US` |
+| predicted cost of going remote | 200 ms | `src/sched.rs` `REMOTE_OVERHEAD_US` |
+| leave a busy box alone for | 2 s | `src/sched.rs` `BUSY_BACKOFF` |
+| keep a unit local after remote-fail, local-pass | 2 times | `src/sched.rs` `PIN_AFTER` |
+| blob cache | 20 GB | `src/config.rs` |
 
 Experiments, roughly in order:
 

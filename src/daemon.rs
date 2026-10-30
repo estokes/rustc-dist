@@ -415,6 +415,9 @@ async fn run_remote(
         }
         Ok(Outcome::Exit { code, .. }) => {
             debug!("{} exited {code} remotely, building it here", r.unit().exact);
+            for (_, line) in held.iter().filter(|(stderr, _)| *stderr).take(5) {
+                debug!("remote stderr: {}", String::from_utf8_lossy(line).trim_end());
+            }
             r.finish(RemoteOutcome::Failed);
             Ok(Remote::Failed { forwarded_metadata })
         }

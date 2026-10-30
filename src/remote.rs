@@ -139,7 +139,9 @@ impl Collect<'_> {
         self.dirs.insert(path);
     }
 
-    /// Every file under `root`, skipping `target` and hidden directories.
+    /// Every file under `root`, skipping hidden directories and cargo's
+    /// output directories, which cargo marks with `CACHEDIR.TAG`. A module
+    /// directory may well be named `target`.
     fn walk(&mut self, root: &Path, recursive: bool) -> Result<()> {
         if system(root) {
             return Ok(());
@@ -153,9 +155,10 @@ impl Collect<'_> {
                 let name = e.file_name();
                 let Ok(ft) = e.file_type() else { continue };
                 if ft.is_dir() {
-                    let skip = name == "target" || name.to_string_lossy().starts_with('.');
+                    let path = e.path();
+                    let skip = name.to_string_lossy().starts_with('.') || path.join("CACHEDIR.TAG").exists();
                     if recursive && !skip {
-                        stack.push(e.path());
+                        stack.push(path);
                     }
                 } else if fs::metadata(e.path()).is_ok_and(|m| m.is_file()) {
                     self.walked += e.metadata().map(|m| m.len()).unwrap_or(0);
@@ -338,6 +341,27 @@ mod test {
         assert_eq!(absolute(Path::new("/w/ws"), "a/src/lib.rs"), PathBuf::from("/w/ws/a/src/lib.rs"));
         assert_eq!(absolute(Path::new("/w/ws"), "../x/./y.rs"), PathBuf::from("/w/x/y.rs"));
         assert_eq!(absolute(Path::new("/w"), "/abs/z"), PathBuf::from("/abs/z"));
+    }
+
+    #[test]
+    fn walks_module_dirs_named_target_but_not_cargo_output() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-walk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for d in ["src/target", "target/release", ".git"] {
+            fs::create_dir_all(dir.join(d))?;
+        }
+        for f in ["src/lib.rs", "src/target/apple.rs", "target/CACHEDIR.TAG", "target/release/big", ".git/HEAD"] {
+            fs::write(dir.join(f), "x")?;
+        }
+        let hashes = Hashes::default();
+        let mut c = Collect { hashes: &hashes, files: Vec::new(), dirs: HashSet::new(), seen: HashSet::new(), walked: 0 };
+        c.walk(&dir, true)?;
+        let mut got: Vec<String> =
+            c.files.iter().map(|f| f.path.trim_start_matches(dir.to_str().unwrap()).to_string()).collect();
+        got.sort();
+        assert_eq!(got, ["/src/lib.rs", "/src/target/apple.rs"]);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
