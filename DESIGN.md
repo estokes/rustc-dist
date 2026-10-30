@@ -57,9 +57,8 @@ slot.
 
 ### Classes
 
-A box's CPUs are split into classes of equal speed, detected from sysfs (core
-type from `/sys/devices/cpu_core` and `cpu_atom`, `cpuinfo_max_freq`,
-`cpu_capacity`), overridable in config. This laptop:
+A box's CPUs are split into classes of equal speed, found by calibration (see
+below) and overridable in config. On this laptop sysfs suggests three:
 
 | class | cpus | max freq    |
 |-------|------|-------------|
@@ -104,15 +103,28 @@ Every box runs the same code from the same binary, so results compare across
 boxes with no graphix checkout, no recorded job and no blob fetch. The run
 takes seconds.
 
-Install runs the load on one thread pinned to one CPU of each class, with all
-classes running at the same time so the box is under load rather than in
-single-core turbo. The wall time per class goes into the box's state file. The
-daemon publishes it as `BASE/NAME/class/N/calib_ms`, next to `cpus` and `free`.
+Install runs the load on every CPU at once, one thread pinned to each. The
+whole box is under load, so the numbers are sustained speed with shared caches,
+memory bandwidth and SMT siblings all under contention, not single-core turbo.
+The load repeats for about a minute so laptops drop out of their short boost
+window. Each CPU's time is the median of its later repetitions. Per-thread
+working set is a few tens of MB, so a box with many cores doesn't run out of
+memory.
+
+The classes come from those times. Sort the CPUs by time and start a new class
+wherever two neighbours differ by more than about 8%. Two core types that
+measure the same land in one class, which is right for scheduling. A class's
+`calib_ms` is the median of its members' times.
+
+Install refuses to run on a busy box, judged by load average, because other
+work would distort the times. The classes and times go into the box's state
+file. The daemon publishes each class at `BASE/NAME/class/N/` with `calib_ms`,
+`cpus` and `free`.
 
 Acceptance check, to run on an idle box: the time ratios between classes from
 the chunkmap load must match, within about 10%, the ratios from a real rustc
-compile pinned the same way (the `graphix-shell` crate under
-`--profile quick`). If they don't, tune the operation mix. This hasn't been run
+compile run the same way (the `graphix-shell` crate under `--profile quick`,
+one pinned copy per CPU). If they don't, tune the operation mix. This hasn't been run
 yet: on 2026-10-30 this box was at load 119 from graphix tests and the fuzzer.
 
 ## Cost
