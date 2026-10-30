@@ -1,19 +1,19 @@
 use crate::{
-    classes, config,
+    classes::{self, Profile},
+    config,
     protocol::{self, Ask, PROTOCOL, Ran, Reply, Unit},
-    sched::{Admission, Msg, Sched},
+    sched::{Admission, Msg, Sched, Setup},
     sys,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use compact_str::format_compact;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::Path,
-    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -37,16 +37,19 @@ pub async fn run() -> Result<()> {
     let _ = fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format_compact!("binding {}", sock_path.display()))?;
-    let classes = classes::load(&sys::allowed_cpus()?)?;
-    for (k, c) in classes.iter().enumerate() {
-        info!("class {k}: {} cpus, calibration {} ms", c.cpus.len(), c.calib_us / 1000);
-    }
-    let mem_limit_kb = (sys::mem_total_kb()? as f64 * cfg.memory_fraction) as u64;
+    remove_stale_fifos(&dir);
+    let state_dir = config::state_dir();
+    let profile = classes::current(&state_dir);
+    let setup = Setup {
+        state_dir,
+        fifo_dir: dir,
+        allowed: sys::allowed_cpus()?,
+        mem_limit_kb: (sys::mem_total_kb()? as f64 * cfg.memory_fraction) as u64,
+        calibration_seconds: cfg.calibration_seconds,
+    };
     let (tx, rx) = mpsc::unbounded_channel();
-    let stats_path = config::state_dir().join("jobs.hdr");
-    let (sched, grants) = Sched::new(classes, &dir, mem_limit_kb, stats_path, tx.clone())?;
-    let grants: Arc<[Bytes]> = grants.into();
-    let sched = tokio::spawn(sched.run(rx));
+    let sched = Sched::new(setup, profile, tx.clone())?;
+    let mut sched = tokio::spawn(sched.run(rx));
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -55,15 +58,19 @@ pub async fn run() -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((sock, _)) => {
-                    let (tx, grants, stop) = (tx.clone(), grants.clone(), stop_tx.clone());
+                    let (tx, stop) = (tx.clone(), stop_tx.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = serve(sock, tx, grants, stop).await {
+                        if let Err(e) = serve(sock, tx, stop).await {
                             debug!("connection: {e:#}");
                         }
                     });
                 }
                 Err(e) => warn!("accept: {e}"),
             },
+            _ = &mut sched => {
+                error!("the scheduler stopped");
+                break;
+            }
             _ = stop_rx.recv() => break,
             _ = term.recv() => break,
             _ = int.recv() => break,
@@ -73,8 +80,20 @@ pub async fn run() -> Result<()> {
     drop(listener);
     let _ = fs::remove_file(&sock_path);
     let _ = tx.send(Msg::Drain);
-    sched.await?;
+    if !sched.is_finished() {
+        sched.await?;
+    }
     Ok(())
+}
+
+/// FIFOs left by a daemon that died without cleaning up.
+fn remove_stale_fifos(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("class-") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Take the daemon lock, waiting a few seconds for a daemon that is
@@ -103,7 +122,6 @@ async fn lock(path: &Path) -> Result<Option<File>> {
 async fn serve(
     mut sock: UnixStream,
     tx: mpsc::UnboundedSender<Msg>,
-    grants: Arc<[Bytes]>,
     stop: mpsc::Sender<()>,
 ) -> Result<()> {
     let mut version = [0u8; 4];
@@ -117,7 +135,7 @@ async fn serve(
     let mut buf = BytesMut::new();
     match protocol::recv_async::<Ask>(&mut sock, &mut buf).await? {
         Ask::Probe => protocol::send_async(&mut sock, &mut buf, &Reply::Trivial).await,
-        Ask::Compile(unit) => compile(sock, buf, tx, &grants, unit).await,
+        Ask::Compile(unit) => compile(sock, buf, tx, unit).await,
         Ask::Status => {
             let (reply, status) = oneshot::channel();
             tx.send(Msg::Status { reply }).map_err(|_| anyhow!("scheduler stopped"))?;
@@ -128,6 +146,17 @@ async fn serve(
             let _ = stop.try_send(());
             protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await
         }
+        Ask::Profile { name, recalibrate } => {
+            let reply = match Profile::new(&name) {
+                Ok(profile) => {
+                    tx.send(Msg::Profile { profile, recalibrate })
+                        .map_err(|_| anyhow!("scheduler stopped"))?;
+                    Reply::Done
+                }
+                Err(e) => Reply::Refused(format_compact!("{e:#}").as_str().into()),
+            };
+            protocol::send_async(&mut sock, &mut buf, &reply).await
+        }
     }
 }
 
@@ -135,7 +164,6 @@ async fn compile(
     mut sock: UnixStream,
     mut buf: BytesMut,
     tx: mpsc::UnboundedSender<Msg>,
-    grants: &[Bytes],
     unit: Unit,
 ) -> Result<()> {
     let (reply, mut admitted) = oneshot::channel();
@@ -158,7 +186,7 @@ async fn compile(
     match admission {
         Admission::Restarting => protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await,
         Admission::Slot(slot) => {
-            sock.write_all(&grants[slot.class]).await?;
+            sock.write_all(&slot.grant).await?;
             if let Ok(ran) = protocol::recv_async::<Ran>(&mut sock, &mut buf).await {
                 slot.finish(ran);
             }

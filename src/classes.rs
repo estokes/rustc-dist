@@ -1,9 +1,13 @@
-use crate::config;
 use anyhow::{Context, Result, bail};
+use arcstr::{ArcStr, literal};
 use compact_str::format_compact;
 use log::warn;
 use serde::{Deserialize, Serialize};
-use std::{fs, io::ErrorKind, path::PathBuf};
+use std::{
+    fmt, fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 /// CPUs of equal measured speed. `calib_us` is the median time one
 /// calibration run took on them with every CPU loaded.
@@ -13,26 +17,81 @@ pub struct Class {
     pub cpus: Vec<u32>,
 }
 
+/// Every allowed CPU as one class with a calibration of one second, so
+/// costs are CPU seconds. Used only when calibration fails.
+pub fn fallback(allowed: &[u32]) -> Vec<Class> {
+    vec![Class { calib_us: 1_000_000, cpus: allowed.to_vec() }]
+}
+
+/// A power profile name, also used as a file name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile(ArcStr);
+
+impl Profile {
+    pub const DEFAULT: Profile = Profile(literal!("default"));
+
+    pub fn new(name: &str) -> Result<Self> {
+        let ok = !name.is_empty()
+            && name.len() <= 64
+            && !name.starts_with('.')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if !ok {
+            bail!("profile names are 1 to 64 of A-Z a-z 0-9 - _ . and don't start with a dot");
+        }
+        Ok(Self(ArcStr::from(name)))
+    }
+
+    pub fn name(&self) -> &ArcStr {
+        &self.0
+    }
+}
+
+impl fmt::Display for Profile {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct StateFile {
     class: Vec<Class>,
 }
 
-fn path() -> PathBuf {
-    config::state_dir().join("classes.toml")
+fn profile_path(state_dir: &Path, profile: &Profile) -> PathBuf {
+    state_dir.join("profiles").join(format_compact!("{profile}.toml").as_str())
 }
 
-/// The calibrated classes, fastest first, restricted to `allowed`. If
-/// the box was never calibrated, every allowed CPU is one class with a
-/// calibration of one second, so costs are CPU seconds.
-pub fn load(allowed: &[u32]) -> Result<Vec<Class>> {
-    let path = path();
+fn current_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("profile")
+}
+
+/// The profile the laptop was last switched to.
+pub fn current(state_dir: &Path) -> Profile {
+    let path = current_path(state_dir);
+    match fs::read_to_string(&path) {
+        Ok(text) => Profile::new(text.trim()).unwrap_or_else(|e| {
+            warn!("{}: {e:#}", path.display());
+            Profile::DEFAULT
+        }),
+        Err(e) if e.kind() == ErrorKind::NotFound => Profile::DEFAULT,
+        Err(e) => {
+            warn!("reading {}: {e}", path.display());
+            Profile::DEFAULT
+        }
+    }
+}
+
+pub fn set_current(state_dir: &Path, profile: &Profile) -> Result<()> {
+    write_atomic(&current_path(state_dir), profile.name().as_bytes())
+}
+
+/// The calibrated classes of `profile`, fastest first, restricted to
+/// `allowed`. None if the profile was never calibrated.
+pub fn load(state_dir: &Path, profile: &Profile, allowed: &[u32]) -> Result<Option<Vec<Class>>> {
+    let path = profile_path(state_dir, profile);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            warn!("{} is missing; run `rustc-dist install` to calibrate", path.display());
-            return Ok(vec![Class { calib_us: 1_000_000, cpus: allowed.to_vec() }]);
-        }
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format_compact!("reading {}", path.display())),
     };
     let file: StateFile =
@@ -62,17 +121,34 @@ pub fn load(allowed: &[u32]) -> Result<Vec<Class>> {
     if classes.is_empty() {
         bail!("{}: no usable classes", path.display());
     }
-    Ok(classes)
+    Ok(Some(classes))
 }
 
-pub fn save(classes: &[Class]) -> Result<()> {
-    let path = path();
+pub fn save(state_dir: &Path, profile: &Profile, classes: &[Class]) -> Result<()> {
+    let text = toml::to_string(&StateFile { class: classes.to_vec() })?;
+    write_atomic(&profile_path(state_dir, profile), text.as_bytes())
+}
+
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format_compact!("creating {}", dir.display()))?;
     }
-    let text = toml::to_string(&StateFile { class: classes.to_vec() })?;
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, text).with_context(|| format_compact!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, &path).with_context(|| format_compact!("writing {}", path.display()))?;
-    Ok(())
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, data).with_context(|| format_compact!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format_compact!("writing {}", path.display()))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn profile_names() {
+        for good in ["performance", "power-saver", "AC_1.2"] {
+            assert!(Profile::new(good).is_ok(), "{good}");
+        }
+        for bad in ["", "../x", "a/b", ".hidden", "sp ace", &"x".repeat(65)] {
+            assert!(Profile::new(bad).is_err(), "{bad}");
+        }
+    }
 }

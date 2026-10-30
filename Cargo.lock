@@ -1208,6 +1208,7 @@ dependencies = [
  "log",
  "netidx-core",
  "netidx-derive",
+ "nohash",
  "poolshark",
  "serde",
  "tokio",

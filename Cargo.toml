@@ -16,6 +16,7 @@ libc = "0.2"
 log = "0.4"
 netidx-core = { path = "../netidx/netidx-core", default-features = false }
 netidx-derive = { path = "../netidx/netidx-derive" }
+nohash = "0.2.0"
 poolshark = "0.2"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

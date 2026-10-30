@@ -40,7 +40,9 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             let status = compile(&mut sock, &mut buf, &args, &jobserver)?;
             exit_as(status)
         }
-        Reply::Status(_) | Reply::Restarting => bail!("unexpected reply from the daemon"),
+        Reply::Status(_) | Reply::Restarting | Reply::Done | Reply::Refused(_) => {
+            bail!("unexpected reply from the daemon")
+        }
     }
 }
 

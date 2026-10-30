@@ -28,10 +28,12 @@ pub fn allowed_cpus() -> Result<Vec<u32>> {
     Ok(cpus)
 }
 
-pub fn load_average() -> Result<f64> {
-    let text = fs::read_to_string("/proc/loadavg").context("reading /proc/loadavg")?;
-    let first = text.split_whitespace().next().context("empty /proc/loadavg")?;
-    first.parse().context("parsing /proc/loadavg")
+/// CPU time the calling thread has used. Unlike wall time, it doesn't
+/// grow while the thread waits for a CPU that other work holds.
+pub fn thread_cpu_us() -> u64 {
+    let mut ts: libc::timespec = unsafe { mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
 pub fn mem_total_kb() -> Result<u64> {

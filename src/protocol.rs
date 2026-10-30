@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 const MAX_MSG: usize = 1 << 20;
 
 /// What the scheduler knows a compile by. `exact` is one cargo unit;
@@ -26,6 +26,9 @@ pub enum Ask {
     Compile(Unit),
     Status,
     Shutdown,
+    /// The laptop switched power profile. The daemon calibrates a profile
+    /// the first time it sees it, or again if asked.
+    Profile { name: ArcStr, recalibrate: bool },
 }
 
 #[derive(Debug, Pack)]
@@ -35,6 +38,8 @@ pub enum Reply {
     Status(Status),
     /// This daemon is going away. Reconnect.
     Restarting,
+    Done,
+    Refused(ArcStr),
 }
 
 /// Sent by the wrapper after rustc succeeds. A failed or killed rustc
@@ -48,11 +53,25 @@ pub struct Ran {
 
 #[derive(Debug, Pack)]
 pub struct Status {
+    pub profile: ArcStr,
+    pub switching: Switching,
     pub classes: Vec<ClassStatus>,
+    /// Jobs still running under an earlier profile's layout.
+    pub finishing: u32,
     pub waiting: u32,
     pub mem_limit_kb: u64,
     pub mem_running_kb: u64,
     pub units: Vec<UnitStatus>,
+}
+
+/// A switch to a profile with no calibration yet. New jobs wait until it
+/// is done.
+#[derive(Debug, Pack)]
+pub enum Switching {
+    No,
+    /// Waiting for running jobs to finish.
+    Draining(ArcStr),
+    Calibrating(ArcStr),
 }
 
 #[derive(Debug, Pack)]

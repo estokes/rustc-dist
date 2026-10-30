@@ -1,7 +1,4 @@
-use crate::{
-    classes::{self, Class},
-    client, config, sys,
-};
+use crate::{classes::Class, client, config, sys};
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use compact_str::format_compact;
@@ -9,6 +6,7 @@ use immutable_chunkmap::map::MapM;
 use std::{
     env, fs,
     hint::black_box,
+    io::{self, Write},
     ops::Bound,
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
@@ -54,15 +52,15 @@ fn keys() -> Vec<ArcStr> {
 /// One calibration run: build a map in batches, keeping old versions
 /// alive the way a compiler holds snapshots, with lookups, range scans,
 /// bulk updates and removals, and set operations against old versions.
-/// None if `stop` was raised part way.
-fn run_once(keys: &[ArcStr], stop: &AtomicBool) -> Option<u64> {
+/// None if `stop` was given and raised part way.
+fn run_once(keys: &[ArcStr], stop: Option<&AtomicBool>) -> Option<u64> {
     let mut rng = Rng(SEED);
     let pick = |rng: &mut Rng| keys[rng.below(keys.len())].clone();
     let mut map = Map::new();
     let mut snaps: [Map; 8] = std::array::from_fn(|_| Map::new());
     let mut sum = 0u64;
     for b in 0..KEYS / BATCH {
-        if stop.load(Ordering::Relaxed) {
+        if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
             return None;
         }
         map = map.insert_many((0..BATCH).map(|_| (pick(&mut rng), rng.next())));
@@ -97,23 +95,28 @@ fn run_once(keys: &[ArcStr], stop: &AtomicBool) -> Option<u64> {
     Some(sum)
 }
 
-/// Median time of the runs that started after `warm`, with the thread
-/// pinned to `cpu`.
+/// Median CPU time of the runs that started after `warm`, with the thread
+/// pinned to `cpu`. CPU time leaves out the time other work holds the CPU,
+/// so a busy box still measures each core's speed. A CPU too slow to start
+/// a run after `warm` uses its earlier runs; every CPU finishes at least one.
 fn worker(cpu: u32, t0: Instant, warm: Duration, stop: &AtomicBool) -> Result<u64> {
     sys::pin(&[cpu])?;
     let keys = keys();
-    let mut times = Vec::new();
+    let mut warming = Vec::new();
+    let mut measured = Vec::new();
     loop {
         let start = Instant::now();
-        let Some(sum) = run_once(&keys, stop) else { break };
+        let cpu_start = sys::thread_cpu_us();
+        let interruptible = !(warming.is_empty() && measured.is_empty());
+        let Some(sum) = run_once(&keys, interruptible.then_some(stop)) else { break };
         black_box(sum);
-        if start.duration_since(t0) >= warm {
-            times.push(start.elapsed().as_micros() as u64);
+        let t = sys::thread_cpu_us() - cpu_start;
+        if start.duration_since(t0) >= warm { measured.push(t) } else { warming.push(t) }
+        if stop.load(Ordering::Relaxed) {
+            break;
         }
     }
-    if times.is_empty() {
-        bail!("cpu {cpu} finished no measured run, raise --seconds");
-    }
+    let times = if measured.is_empty() { &mut warming } else { &mut measured };
     times.sort_unstable();
     Ok(times[times.len() / 2])
 }
@@ -162,30 +165,31 @@ fn group(mut times: Vec<(u32, u64)>) -> Vec<Class> {
     classes
 }
 
-pub fn calibrate(seconds: u64, force: bool) -> Result<Vec<Class>> {
+/// Calibrate the classes of whatever profile the box is in now.
+pub fn run(cpus: &[u32], seconds: u64) -> Result<Vec<Class>> {
+    Ok(group(measure(cpus, seconds)?))
+}
+
+/// Measure and print this box's classes without saving them.
+pub fn print(seconds: u64) -> Result<()> {
     let cpus = sys::allowed_cpus()?;
-    let load = sys::load_average()?;
-    let busy = (cpus.len() as f64 * 0.1).max(1.5);
-    if load > busy && !force {
-        bail!("load average {load:.1} is above {busy:.1}; calibrate on an idle box, or pass --force");
-    }
     eprintln!("calibrating {} cpus for {seconds}s", cpus.len());
     let times = measure(&cpus, seconds)?;
     for &(cpu, t) in &times {
         eprintln!("  cpu {cpu:3}: {:.1} ms", t as f64 / 1000.);
     }
-    let classes = group(times);
-    for (k, c) in classes.iter().enumerate() {
-        println!("class {k}: {:.1} ms, cpus {:?}", c.calib_us as f64 / 1000., c.cpus);
+    let mut out = io::stdout().lock();
+    for (k, c) in group(times).iter().enumerate() {
+        writeln!(out, "class {k}: {:.1} ms, cpus {:?}", c.calib_us as f64 / 1000., c.cpus)?;
     }
-    Ok(classes)
+    Ok(())
 }
 
-pub fn install(seconds: u64, force: bool) -> Result<()> {
-    let classes = calibrate(seconds, force)?;
-    classes::save(&classes)?;
+/// Enable the systemd user service. The daemon calibrates the current
+/// profile when it starts if that profile has no calibration yet.
+pub fn install() -> Result<()> {
     if client::shutdown()? {
-        eprintln!("stopped the running daemon so it picks up the new classes");
+        eprintln!("stopped the running daemon so systemd can own it");
     }
     let exe = env::current_exe()?.canonicalize().context("finding rustc-dist")?;
     let dir = config::systemd_unit_dir();
@@ -235,9 +239,8 @@ mod test {
     #[test]
     fn the_load_is_deterministic() {
         let keys = keys();
-        let stop = AtomicBool::new(false);
-        assert_eq!(run_once(&keys, &stop), run_once(&keys, &stop));
-        stop.store(true, Ordering::Relaxed);
-        assert_eq!(run_once(&keys, &stop), None);
+        assert_eq!(run_once(&keys, None), run_once(&keys, None));
+        let stop = AtomicBool::new(true);
+        assert_eq!(run_once(&keys, Some(&stop)), None);
     }
 }

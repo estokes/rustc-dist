@@ -13,11 +13,13 @@ use std::{
 pub struct Config {
     /// Share of MemTotal that the predicted peak memory of running jobs may use.
     pub memory_fraction: f64,
+    /// How long the daemon runs the calibration load for a new profile.
+    pub calibration_seconds: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { memory_fraction: 0.8 }
+        Self { memory_fraction: 0.8, calibration_seconds: 60 }
     }
 }
 
@@ -31,6 +33,9 @@ pub fn load() -> Result<Config> {
     };
     if !(cfg.memory_fraction > 0. && cfg.memory_fraction <= 1.) {
         bail!("{}: memory_fraction must be in (0, 1]", path.display());
+    }
+    if cfg.calibration_seconds < 4 {
+        bail!("{}: calibration_seconds must be at least 4", path.display());
     }
     Ok(cfg)
 }

@@ -91,9 +91,24 @@ table.
 
 ## Calibration
 
-Calibration runs once per core class, when the server is installed
-(`rustc-dist install`), and never again. Install also detects the classes and
-sets up the systemd user service.
+Calibration runs once per power profile, the first time the daemon sees the
+profile's name. On a laptop the desktop runs `rustc-dist profile NAME` when the
+power profile changes (KDE can run a script on each switch). Names are the
+user's choice. A box that never switches stays in the profile `default`. The
+daemon remembers the last profile across restarts, so a new box calibrates
+`default` the first time its daemon starts. `rustc-dist install` only sets up
+the systemd user service. `rustc-dist profile NAME --recalibrate` measures a
+profile again.
+
+Switching to a profile that already has a calibration applies at once, to new
+jobs. Jobs already running finish on the old profile's classes and
+jobservers, which go away when their last job ends. Until then the box can be
+oversubscribed by at most the jobs that were running at the switch. Switching
+to a profile with no calibration holds new jobs. Once every running job is
+done, the daemon calibrates, saves the result, and resumes. It doesn't try to
+guess whether other work on the box will distort the numbers. Calibrate each
+profile ahead of time on an idle box, with `rustc-dist profile NAME
+--recalibrate`.
 
 The calibration load is built into the binary: an immutable-chunkmap workload
 that behaves like a compiler. Like a compiler's symbol tables and interners, it
@@ -107,14 +122,16 @@ Every box runs the same code from the same binary, so results compare across
 boxes with no graphix checkout, no recorded job and no blob fetch. The run
 takes seconds.
 
-Install runs the load on every logical CPU at once, one thread pinned to each,
+Calibration runs the load on every logical CPU at once, one thread pinned to each,
 SMT siblings included. Both threads of a core run loaded, so they measure the
 same and land in the same class. Their time already reflects sharing the core,
 which is how they will run under a full farm. The
 whole box is under load, so the numbers are sustained speed with shared caches,
 memory bandwidth and SMT siblings all under contention, not single-core turbo.
 The load repeats for about a minute so laptops drop out of their short boost
-window. Each CPU's time is the median of its later repetitions. Per-thread
+window. Each run is timed by its thread's CPU time, not wall time, so time
+spent waiting for a CPU that other work holds doesn't count. Each CPU's time
+is the median of its later repetitions. Per-thread
 working set is a few tens of MB, so a box with many cores doesn't run out of
 memory.
 
@@ -123,10 +140,13 @@ wherever two neighbours differ by more than about 8%. Two core types that
 measure the same land in one class, which is right for scheduling. A class's
 `calib_ms` is the median of its members' times.
 
-Install refuses to run on a busy box, judged by load average, because other
-work would distort the times. The classes and times go into the box's state
-file. The daemon publishes each class at `BASE/NAME/class/N/` with `calib_ms`,
-`cpus` and `free`.
+`rustc-dist calibrate` measures and prints without saving. Each profile's
+classes go in `~/.local/state/rustc-dist/profiles/NAME.toml`. In phase 2 the
+daemon publishes each class at `BASE/NAME/class/N/` with `calib_ms`, `cpus` and
+`free`.
+
+Job costs are normalized by the calibration of the class each job ran on, so
+one job history serves every profile.
 
 Acceptance check, to run on an idle box: the time ratios between classes from
 the chunkmap load must match, within about 10%, the ratios from a real rustc
@@ -325,8 +345,8 @@ coming back.
 ## Phases
 
 1. Built 2026-10-30. Single box, no network: merged daemon, mandatory grants,
-   classes, FIFO jobservers and pinning, `install` and `calibrate`, job table
-   and histograms, scheduler, TOML config, `status`. Several agents on one box
+   classes, FIFO jobservers and pinning, calibration per power profile, job
+   table and histograms, scheduler, TOML config, `status`. Several agents on one box
    share cores without thrashing. Heavy crates reach P-cores only when one is
    free when they arrive (see "Measured" under Scheduling).
 2. Remote: blob store and manifest protocol, dependency tracking, bwrap
