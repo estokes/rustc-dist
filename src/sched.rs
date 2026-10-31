@@ -1582,7 +1582,15 @@ impl Sched {
                 ClassState { rate: rate.get(), cpus: c.cpus.len() as u32, free, frees_in_ms }
             },
         ));
-        let profile = self.profile.name();
+        // A box switching shows the profile it is switching to: it takes no
+        // offers meanwhile, and its status says how far along it is.
+        let profile = match &self.switch {
+            Switch::No => &self.profile,
+            Switch::Draining(to)
+            | Switch::Calibrating { next: Some((to, _)), .. }
+            | Switch::Calibrating { profile: to, next: None } => to,
+        }
+        .name();
         self.load.send_if_modified(|load| {
             let mut changed = answered || load.profile != *profile || load.classes.len() != classes.len();
             load.classes.resize(classes.len(), ClassState { rate: 0, cpus: 0, free: 0, frees_in_ms: None });
@@ -2721,6 +2729,7 @@ mod test {
         let mut waiting = h.submit("a");
         assert!(pending(&mut waiting).await, "a free token exists but the switch holds it");
         assert!(matches!(h.status().await.switching, Switching::Draining(_)));
+        assert_eq!(h.load.borrow().profile.as_str(), "never-seen", "it shows the profile it is switching to");
         // Stop before the calibration itself would start.
         drop(h);
         drop(running);
