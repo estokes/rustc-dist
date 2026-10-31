@@ -292,9 +292,12 @@ jobs with time to spare on slow cores.
 4. For each class the daemon predicts when the job would finish there: when a
    slot frees (now, or the earliest predicted end of a job running in that
    class) plus the job's cost over the class's rate. The job takes the
-   slowest class on which it finishes within its slack of the earliest finish.
-   A job with no slack takes the class where it finishes first, even if it must
-   wait for it.
+   slowest class on which it finishes within its slack of the earliest
+   finish, choosing among classes with a free slot if any of them will do.
+   It never waits for a slow class while a faster one sits idle: a short job
+   on a fast core delays a later critical job by at most its own run time,
+   while an idle core is lost. A job with no slack takes the class where it
+   finishes first, even if it must wait for it.
 5. A job that waits for a class adds its predicted time, divided by the class's
    CPUs, to that class's expected wait, so later jobs don't all count on the
    same free slot. A class whose last token a pass hands out frees no sooner
@@ -307,8 +310,9 @@ jobs with time to spare on slow cores.
    still count toward their build's horizon.
 
 A job that may go remote considers other boxes if it has no history (neither
-the unit nor its crate has run before), or if it is predicted to take at least
-1 s on the fastest local class. A job with history chooses among local classes
+the unit nor its crate has run before), if it is predicted to take at least
+1 s on the fastest local class, or if no local class has a free slot left, so
+it would wait here. A job with history chooses among local classes
 as above, and goes to another box instead if it would finish there sooner,
 counting 200 ms for the trip. A job with no history has nothing to predict
 with, so it takes free capacity: the fastest local class with a token, else the
@@ -726,6 +730,14 @@ What the test found:
   The daemon now shuts its publisher down before exiting.
 - Publishers on these workstations listen on loopback by default. `bind` in
   the config sets where other boxes reach a box.
+- Slack held short jobs for the LPE class while P and E sat idle. In a build
+  sampled every 100 ms or so, 100 to 120 jobs waited for the first 18 s while
+  LPE was 100% busy and E had 10 to 12 of its 12 slots free, 3 to 50% busy.
+  Over the build, jobs waited about 31 s while P or E had a free slot. Each
+  was a short job off the long chain with hundreds of seconds of slack, and
+  short jobs never left the box, being under the 1 s cutoff. Now a job takes
+  a free class within its slack before waiting for a slower one, and a job
+  that would wait here may go to another box whatever its size.
 - Cargo holds about 4 open files per running job, so 256 jobs fail with "Too
   many open files" under the usual soft limit of 1024 (this test's shell had
   a higher one). 128 fits, still covers the farm's 126 slots, and builds as

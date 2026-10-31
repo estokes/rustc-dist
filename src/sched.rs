@@ -49,8 +49,8 @@ const RECHECK: Duration = Duration::from_millis(250);
 /// A job is placed only after it has waited this long, so the daemon sees
 /// a wave of jobs cargo starts together before deciding where each goes.
 const GATHER: Duration = Duration::from_millis(20);
-/// Only jobs predicted to take this long on the fastest local class are
-/// worth sending to another box.
+/// While a local class has a free slot, only jobs predicted to take this
+/// long on the fastest local class are worth sending to another box.
 const REMOTE_MIN_US: u64 = 1_000_000;
 /// The predicted cost of running a job on another box: connecting,
 /// sending inputs it lacks, and fetching outputs.
@@ -1272,10 +1272,11 @@ impl Sched {
         for &i in admissible.iter() {
             let w = &self.queue[i];
             let fits = !mem_blocked && (first_here || w.pred.mem_kb <= mem_free);
+            let full_here = held.iter().all(|&n| n == 0);
             let away = w
                 .portable
                 .as_ref()
-                .filter(|_| !w.pred.known || time_us(w.pred.cost_mi, fastest) >= REMOTE_MIN_US);
+                .filter(|_| !w.pred.known || full_here || time_us(w.pred.cost_mi, fastest) >= REMOTE_MIN_US);
             let picked = if light(&w.pred) {
                 let local = if fits { rates.len() } else { 0 };
                 cands.clear();
@@ -1692,22 +1693,25 @@ struct Cand {
 
 /// Where a job runs. The first `local` candidates are this box's classes:
 /// the job takes the slowest of them on which it still finishes within its
-/// slack, so faster ones stay free for jobs more work waits on, or with no
-/// slack the one where it finishes first, even if it must wait for it.
-/// The rest are other boxes, which are spare capacity: the job goes to one
-/// if it finishes there sooner than on its local choice. `ref_rate` turns
-/// slack into time.
+/// slack, so faster ones stay free for jobs more work waits on. It takes
+/// one with a free slot if any will do, rather than wait for a slower one
+/// while a faster one sits idle; with no slack it takes the one where it
+/// finishes first, even if it must wait for it. The rest are other boxes,
+/// which are spare capacity: the job goes to one if it finishes there
+/// sooner than on its local choice. `ref_rate` turns slack into time.
 fn choose(cands: &[Cand], local: usize, cost_mi: u64, slack_mi: u64, ref_rate: u64) -> usize {
     let finish = |c: &Cand| c.frees_in_us + c.overhead_us + time_us(cost_mi, c.rate);
     let here = &cands[..local];
     let first = here.iter().map(finish).min().unwrap_or(0);
     let deadline = first + time_us(slack_mi, ref_rate);
-    let pick = here
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| finish(c) <= deadline)
-        .min_by(|(i, a), (j, b)| a.rate.cmp(&b.rate).then(i.cmp(j)))
-        .map_or(0, |(i, _)| i);
+    let slowest = |free_only: bool| {
+        here.iter()
+            .enumerate()
+            .filter(|(_, c)| finish(c) <= deadline && (!free_only || c.frees_in_us == 0))
+            .min_by(|(i, a), (j, b)| a.rate.cmp(&b.rate).then(i.cmp(j)))
+            .map(|(i, _)| i)
+    };
+    let pick = slowest(true).or_else(|| slowest(false)).unwrap_or(0);
     let away = cands[local..].iter().enumerate().min_by_key(|(_, c)| finish(c));
     match away {
         Some((j, c)) if finish(c) < finish(&cands[pick]) => local + j,
@@ -1787,9 +1791,17 @@ mod test {
         assert_eq!(choose(&free, 3, 1000, 3000, rate(1000)), 2);
         // The fast class frees in 5 ms: with no slack, start now on the middle one.
         assert_eq!(choose(&[local(1000, 5000), local(2000, 0), local(4000, 0)], 3, 1000, 0, rate(1000)), 1);
-        // Plenty of slack: wait 1 ms for the slow class rather than take a free fast one.
+        // Plenty of slack, but the slow class is busy: take the slowest free
+        // one rather than wait for it while faster ones sit idle.
         let slow_frees_soon = [local(1000, 0), local(2000, 0), local(4000, 1000)];
-        assert_eq!(choose(&slow_frees_soon, 3, 1000, 10_000, rate(1000)), 2);
+        assert_eq!(choose(&slow_frees_soon, 3, 1000, 10_000, rate(1000)), 1);
+        // Every class busy: plenty of slack waits for the slow one.
+        let all_busy = [local(1000, 500), local(2000, 500), local(4000, 1000)];
+        assert_eq!(choose(&all_busy, 3, 1000, 10_000, rate(1000)), 2);
+        // No slack: wait for the fast class rather than take a free slow one
+        // that finishes later.
+        let fast_frees_soon = [local(1000, 500), local(2000, 10_000), local(4000, 0)];
+        assert_eq!(choose(&fast_frees_soon, 3, 1000, 0, rate(1000)), 0);
         let remote = |calib_us| {
             let mut c = local(calib_us, 0);
             c.overhead_us = 200;
@@ -2011,7 +2023,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn a_small_job_waits_for_a_slow_core_while_bigger_work_runs() -> Result<()> {
+    async fn a_small_job_takes_a_free_fast_core_rather_than_wait_for_a_slow_one() -> Result<()> {
         // gate takes 1 s, the work after it 50 s, small 10 or 20 ms.
         let h = Harness::start(
             "reserve",
@@ -2023,39 +2035,10 @@ mod test {
         let gate = slot(h.submit("gate")).await?;
         assert_eq!(cpu(&gate), 0);
         let first = slot(h.submit("small")).await?;
-        assert_eq!(cpu(&first), 1);
-        // A fast cpu is free, but the build has work coming, so the second
-        // small job waits for the slow one.
-        let mut second = h.submit("small");
-        assert!(pending(&mut second).await);
-        drop(first);
-        assert_eq!(cpu(&slot(second).await?), 1);
-        drop(gate);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn jobs_stop_queueing_for_a_slow_class_once_the_queue_eats_their_slack() -> Result<()> {
-        // gate's chain leaves each small job about 1 s of slack. A small job
-        // takes 0.225 s on the fast class and 0.45 s on the slow one, which
-        // has one cpu: running, one queued, and a third would finish too late.
-        let h = Harness::start(
-            "queue",
-            vec![class(1000, &[0, 2, 3]), class(2000, &[1])],
-            u64::MAX,
-            &[("gate", 100_000, 1), ("after", 1_100_000, 1), ("small", 225_000, 1)],
-            &[("after", &["gate"])],
-        )?;
-        let gate = slot(h.submit("gate")).await?;
-        let first = slot(h.submit("small")).await?;
-        assert_eq!(cpu(&first), 1);
-        let mut queued = h.submit("small");
-        let later: Vec<_> = (0..3).map(|_| h.submit("small")).collect();
-        assert!(pending(&mut queued).await, "one more fits in the slow queue");
-        for s in later {
-            assert_eq!(cpu(&slot(s).await?), 0, "the rest go fast");
-        }
-        drop((gate, first));
+        assert_eq!(cpu(&first), 1, "with slack to spare, the slow cpu");
+        let second = slot(h.submit("small")).await?;
+        assert_eq!(cpu(&second), 0, "the slow cpu is busy and a fast one is free");
+        drop((gate, first, second));
         Ok(())
     }
 
@@ -2107,6 +2090,28 @@ mod test {
         assert!(matches!(admitted(h.submit_with("big", want())).await?, Admission::Slot(_)));
         h.farm(remote_box(200, 4, 4, 3));
         assert!(matches!(admitted(h.submit_with("big", want())).await?, Admission::Remote(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn short_jobs_go_away_once_no_local_slot_is_free() -> Result<()> {
+        // 0.5 s here, 0.1 s there: too short to send while a slot is free here.
+        let h = Harness::start("short", vec![class(1000, &[0])], u64::MAX, &[("small", 500_000, 1)], &[])?;
+        h.farm(remote_box(200, 4, 4, 1));
+        let here = slot(h.submit_with("small", want())).await?;
+        match admitted(h.submit_with("small", want())).await? {
+            Admission::Remote(r) => r.finish(RemoteOutcome::Busy { version: 2 }),
+            _ => bail!("waited for the busy slot here"),
+        }
+        drop(here);
+        // A box that would take longer than waiting here doesn't get it.
+        let h = Harness::start("short-slow", vec![class(1000, &[0])], u64::MAX, &[("small", 500_000, 1)], &[])?;
+        h.farm(remote_box(20_000, 4, 4, 1));
+        let here = slot(h.submit_with("small", want())).await?;
+        let mut waits = h.submit_with("small", want());
+        assert!(pending(&mut waits).await);
+        drop(here);
+        slot(waits).await?;
         Ok(())
     }
 
