@@ -196,8 +196,12 @@ class adds its instructions and CPU time to the class's rate, which weighs the
 calibration as 10 CPU-seconds of jobs and halves the weight of older jobs every
 60 CPU-seconds. Class speeds so come to reflect rustc rather than chunkmap,
 which replaces the acceptance check once planned here (comparing chunkmap's
-class ratios against a real compile's). Learned rates aren't saved yet; a
-restarted daemon starts again from calibration.
+class ratios against a real compile's). What each class has learned is saved
+per profile in `~/.local/state/rustc-dist/rates/NAME.toml`, with the job stats
+every minute and on shutdown, and when the profile changes, so a restarted
+daemon carries on from it. Each entry names its class's CPUs and calibrated
+rate; a new calibration, or a class edited by hand, starts from calibration
+again.
 
 ## Cost
 
@@ -504,7 +508,7 @@ Config is real TOML (`toml` + serde), parsed into two separate structs.
   publishes under), `name` (the host name by default), `blob_cache_gb` and
   `remote_links` (on by default).
   Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit
-  those to override them. The netidx config is netidx's own (`NETIDX_CFG` or
+  those to override them. Their learned rates live in `rates/` beside it. The netidx config is netidx's own (`NETIDX_CFG` or
   its default paths).
 - Project, `rustc-dist.toml` at or above cargo's cwd (`/proc/$PPID/cwd`, which
   is where cargo looks for its own config): `local = [...]`. Starting from

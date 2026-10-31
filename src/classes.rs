@@ -58,8 +58,28 @@ struct StateFile {
     class: Vec<Class>,
 }
 
+/// What jobs pinned to a class taught the daemon about its speed:
+/// instructions and CPU-µs, older jobs weighing less. Learning started
+/// from `calibrated`, the class's calibrated rate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Learned {
+    pub cpus: Vec<u32>,
+    pub calibrated: u64,
+    pub instr: f64,
+    pub cpu_us: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LearnedFile {
+    class: Vec<Learned>,
+}
+
 fn profile_path(state_dir: &Path, profile: &Profile) -> PathBuf {
     state_dir.join("profiles").join(format_compact!("{profile}.toml").as_str())
+}
+
+fn learned_path(state_dir: &Path, profile: &Profile) -> PathBuf {
+    state_dir.join("rates").join(format_compact!("{profile}.toml").as_str())
 }
 
 fn current_path(state_dir: &Path) -> PathBuf {
@@ -130,6 +150,25 @@ pub fn save(state_dir: &Path, profile: &Profile, classes: &[Class]) -> Result<()
     write_atomic(&profile_path(state_dir, profile), text.as_bytes())
 }
 
+/// The class speeds jobs taught the daemon under `profile`, if any.
+pub fn load_learned(state_dir: &Path, profile: &Profile) -> Result<Vec<Learned>> {
+    let path = learned_path(state_dir, profile);
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            let file: LearnedFile =
+                toml::from_str(&text).with_context(|| format_compact!("parsing {}", path.display()))?;
+            Ok(file.class)
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format_compact!("reading {}", path.display())),
+    }
+}
+
+pub fn save_learned(state_dir: &Path, profile: &Profile, learned: Vec<Learned>) -> Result<()> {
+    let text = toml::to_string(&LearnedFile { class: learned })?;
+    write_atomic(&learned_path(state_dir, profile), text.as_bytes())
+}
+
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format_compact!("creating {}", dir.display()))?;
@@ -151,5 +190,19 @@ mod test {
         for bad in ["", "../x", "a/b", ".hidden", "sp ace", &"x".repeat(65)] {
             assert!(Profile::new(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn learned_rates_round_trip() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-learned-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let profile = Profile::new("battery")?;
+        assert!(load_learned(&dir, &profile)?.is_empty());
+        let learned = vec![Learned { cpus: vec![0, 2], calibrated: 4100, instr: 3.5e10, cpu_us: 1.25e7 }];
+        save_learned(&dir, &profile, learned.clone())?;
+        assert_eq!(load_learned(&dir, &profile)?, learned);
+        assert!(load_learned(&dir, &Profile::DEFAULT)?.is_empty(), "kept per profile");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

@@ -1,6 +1,6 @@
 use crate::{
     calibrate,
-    classes::{self, Class, Profile},
+    classes::{self, Class, Learned, Profile},
     farm::{BoxState, ClassState, Load},
     graph::Graph,
     protocol::{
@@ -290,6 +290,19 @@ impl Rate {
         Self { instr: rate as f64 * RATE_PRIOR_US, cpu_us: RATE_PRIOR_US }
     }
 
+    /// What `class` learned before, if it learned from its current
+    /// calibration.
+    fn restored(class: &Class, learned: &[Learned]) -> Self {
+        let positive = |x: f64| x.is_finite() && x > 0.;
+        let usable = |l: &&Learned| {
+            l.cpus == class.cpus && l.calibrated == class.rate && positive(l.instr) && positive(l.cpu_us)
+        };
+        match learned.iter().find(usable) {
+            Some(l) => Self { instr: l.instr, cpu_us: l.cpu_us },
+            None => Self::seeded(class.rate),
+        }
+    }
+
     fn add(&mut self, instr: u64, cpu_us: u64) {
         let keep = 0.5f64.powf(cpu_us as f64 / RATE_HALF_LIFE_US);
         self.instr = self.instr * keep + instr as f64;
@@ -342,9 +355,13 @@ fn repay(fifos: &[Fifo], order: &[usize], mut n: u32, lent: &mut [u32]) {
 /// new layout for new jobs; the old one lives until its jobs finish.
 struct Layout {
     id: LayoutId,
+    profile: Profile,
     /// Fastest at calibration first.
     classes: Vec<Class>,
+    /// Learned from jobs, and saved with the profile.
     rates: Vec<Rate>,
+    /// The rates changed since they were saved.
+    learned: bool,
     fifos: Vec<Fifo>,
     grants: Vec<Arc<Grant>>,
     /// Light jobs pinned to each class.
@@ -353,7 +370,9 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(classes: Vec<Class>, fifo_dir: &Path, tokens_per_cpu: f64) -> Result<Self> {
+    /// The rates start from what `profile` learned before.
+    fn new(profile: Profile, classes: Vec<Class>, setup: &Setup) -> Result<Self> {
+        let (fifo_dir, tokens_per_cpu) = (&setup.fifo_dir, setup.tokens_per_cpu);
         let id = LayoutId::new();
         let mut fifos = Vec::with_capacity(classes.len());
         let mut grants = Vec::with_capacity(classes.len());
@@ -372,9 +391,41 @@ impl Layout {
             let frame = buf.split().freeze();
             grants.push(Arc::new(Grant { frame, cpus: class.cpus.clone(), jobserver }));
         }
-        let rates = classes.iter().map(|c| Rate::seeded(c.rate)).collect();
+        let learned = classes::load_learned(&setup.state_dir, &profile).unwrap_or_else(|e| {
+            warn!("starting from calibration: {e:#}");
+            Vec::new()
+        });
+        let rates = classes.iter().map(|c| Rate::restored(c, &learned)).collect();
         let running = vec![0; classes.len()];
-        Ok(Self { id, running, classes, rates, fifos, grants, spread: Vec::new() })
+        let layout =
+            Self { id, profile, running, classes, rates, learned: false, fifos, grants, spread: Vec::new() };
+        for (k, c) in layout.classes.iter().enumerate() {
+            let (calibrated, now) = (c.rate as f64 / 1000., layout.rates[k].get() as f64 / 1000.);
+            info!("{} class {k}: {} cpus, {now:.2} G instructions/s, {calibrated:.2} calibrated", layout.profile, c.cpus.len());
+        }
+        Ok(layout)
+    }
+
+    /// A job pinned to `class` retired `instr` instructions in `cpu_us`.
+    fn learn(&mut self, class: usize, instr: u64, cpu_us: u64) {
+        self.rates[class].add(instr, cpu_us);
+        self.learned = true;
+    }
+
+    fn save_learned(&mut self, state_dir: &Path) {
+        if !self.learned {
+            return;
+        }
+        let learned = self
+            .classes
+            .iter()
+            .zip(&self.rates)
+            .map(|(c, r)| Learned { cpus: c.cpus.clone(), calibrated: c.rate, instr: r.instr, cpu_us: r.cpu_us })
+            .collect();
+        match classes::save_learned(state_dir, &self.profile, learned) {
+            Ok(()) => self.learned = false,
+            Err(e) => warn!("saving what {} learned: {e:#}", self.profile),
+        }
     }
 
     fn idle(&self) -> bool {
@@ -705,8 +756,7 @@ impl Sched {
                 (classes::fallback(&setup.allowed), Switch::Draining(profile.clone()))
             }
         };
-        let layout = Layout::new(classes, &setup.fifo_dir, setup.tokens_per_cpu)?;
-        log_classes(&profile, &layout.classes);
+        let layout = Layout::new(profile.clone(), classes, &setup)?;
         let mut sched = Self {
             setup,
             profile,
@@ -879,10 +929,13 @@ impl Sched {
                 if let Some(ran) = &ran
                     && let Some(n) = ran.instructions
                 {
-                    layout.rates[class].add(n, ran.cpu_us);
+                    layout.learn(class, n, ran.cpu_us);
                 }
             }
             _ => layout.unspread(job),
+        }
+        for l in self.retired.iter_mut().filter(|l| l.idle()) {
+            l.save_learned(&self.setup.state_dir);
         }
         self.retired.retain(|l| !l.idle());
         if let Some(ran) = ran {
@@ -1092,7 +1145,8 @@ impl Sched {
     }
 
     fn apply(&mut self, profile: Profile, classes: Vec<Class>) -> Result<()> {
-        let layout = Layout::new(classes, &self.setup.fifo_dir, self.setup.tokens_per_cpu)?;
+        self.layout.save_learned(&self.setup.state_dir);
+        let layout = Layout::new(profile.clone(), classes, &self.setup)?;
         let old = mem::replace(&mut self.layout, layout);
         if !old.idle() {
             self.retired.push(old);
@@ -1101,7 +1155,6 @@ impl Sched {
         if let Err(e) = classes::set_current(&self.setup.state_dir, &profile) {
             warn!("recording profile {profile}: {e:#}");
         }
-        log_classes(&profile, &self.layout.classes);
         self.profile = profile;
         Ok(())
     }
@@ -1608,6 +1661,9 @@ impl Sched {
     }
 
     fn save(&mut self) {
+        for layout in std::iter::once(&mut self.layout).chain(&mut self.retired) {
+            layout.save_learned(&self.setup.state_dir);
+        }
         if self.stats.dirty {
             self.stats.rebuild_global();
             self.graph.invalidate();
@@ -1620,12 +1676,6 @@ impl Sched {
         {
             warn!("saving the build graph: {e:#}");
         }
-    }
-}
-
-fn log_classes(profile: &Profile, classes: &[Class]) {
-    for (k, c) in classes.iter().enumerate() {
-        info!("{profile} class {k}: {} cpus, {:.2} G instructions/s", c.cpus.len(), c.rate as f64 / 1000.);
     }
 }
 
@@ -1793,16 +1843,8 @@ mod test {
         Room { memory: Box::new(move || Ok(BoxMemory { capacity_kb, used_kb: 0 })), tokens_per_cpu: 1. }
     }
 
-    fn sched(
-        dir: &Path,
-        classes: Vec<Class>,
-        room: Room,
-        costs: &[(&str, u64, u64)],
-        edges: &[(&str, &[&str])],
-    ) -> Result<(Sched, mpsc::UnboundedReceiver<Msg>, watch::Receiver<Load>)> {
-        let _ = fs::remove_dir_all(dir);
-        fs::create_dir_all(dir)?;
-        classes::save(dir, &Profile::DEFAULT, &classes)?;
+    /// A scheduler on the state in `dir`, in the default profile.
+    fn open(dir: &Path, room: Room) -> Result<(Sched, mpsc::UnboundedReceiver<Msg>, watch::Receiver<Load>)> {
         let setup = Setup {
             state_dir: dir.to_path_buf(),
             fifo_dir: dir.to_path_buf(),
@@ -1813,7 +1855,20 @@ mod test {
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let (load_tx, load) = watch::channel(Load::default());
-        let mut sched = Sched::new(setup, Profile::DEFAULT, load_tx, tx)?;
+        Ok((Sched::new(setup, Profile::DEFAULT, load_tx, tx)?, rx, load))
+    }
+
+    fn sched(
+        dir: &Path,
+        classes: Vec<Class>,
+        room: Room,
+        costs: &[(&str, u64, u64)],
+        edges: &[(&str, &[&str])],
+    ) -> Result<(Sched, mpsc::UnboundedReceiver<Msg>, watch::Receiver<Load>)> {
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir)?;
+        classes::save(dir, &Profile::DEFAULT, &classes)?;
+        let (mut sched, rx, load) = open(dir, room)?;
         for &(name, cost_mi, mem_kb) in costs {
             for _ in 0..5 {
                 let origin = Origin::Here;
@@ -2213,6 +2268,27 @@ mod test {
         job.finish(Ran { cpu_us, wall_us: cpu_us, maxrss_kb: 1, instructions, front: None });
         let learned = h.status().await.classes[0].rate;
         assert!(learned.abs_diff(3000) < 30, "{learned}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learned_class_rates_outlive_the_daemon_until_recalibration() -> Result<()> {
+        let dir = scratch("learned");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0]), class(2000, &[1])], room(u64::MAX), &[], &[])?;
+        let cpu_us = 600_000_000;
+        s.layout.learn(0, cpu_us * 3000, cpu_us);
+        s.save();
+        drop(s);
+        let (s, _rx, _load) = open(&dir, room(u64::MAX))?;
+        let learned = s.layout.rates[0].get();
+        assert!(learned.abs_diff(3000) < 30, "{learned}");
+        assert_eq!(s.layout.rates[1].get(), rate(2000), "learned nothing");
+        drop(s);
+        classes::save(&dir, &Profile::DEFAULT, &[class(900, &[0]), class(2000, &[1])])?;
+        let (s, _rx, _load) = open(&dir, room(u64::MAX))?;
+        assert_eq!(s.layout.rates[0].get(), rate(900), "a new calibration starts over");
+        drop(s);
+        fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
