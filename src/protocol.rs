@@ -1,3 +1,4 @@
+use crate::farm::ClassState;
 use anyhow::{Result, anyhow, bail};
 use arcstr::ArcStr;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -8,8 +9,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 5;
-const MAX_MSG: usize = 1 << 20;
+pub const PROTOCOL: u32 = 6;
+const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under
 /// `exact`, one cargo unit, and `coarse`, shared by every unit of that
@@ -118,7 +119,7 @@ pub struct Status {
 pub struct BoxStatus {
     pub name: ArcStr,
     pub profile: ArcStr,
-    pub classes: Vec<ClassStatus>,
+    pub classes: Vec<ClassState>,
     /// Jobs this box has running there.
     pub sent: u32,
     /// It speaks this protocol version.
@@ -139,18 +140,28 @@ pub enum Switching {
 pub struct ClassStatus {
     pub calib_us: u64,
     pub cpus: u32,
+    /// Jobs of this box's builds.
     pub running: u32,
+    /// Other boxes' jobs.
+    pub serving: u32,
+    /// Tokens in its jobserver.
+    pub free: u32,
 }
 
 #[derive(Debug, Pack)]
 pub struct UnitStatus {
     pub key: ArcStr,
-    pub runs: u64,
+    /// Runs for this box's builds, here and on other boxes.
+    pub here: u64,
+    pub sent: u64,
+    /// Runs here for other boxes' builds.
+    pub served: u64,
     pub cost_mcu: u64,
     pub wall_ms: u64,
     pub mem_kb: u64,
-    /// Its cost plus the costliest chain of jobs that depend on it.
-    pub rank_mcu: u64,
+    /// Its cost plus the costliest chain of jobs that depend on it, if it
+    /// is in this box's build graph.
+    pub rank_mcu: Option<u64>,
 }
 
 pub fn frame<T: Pack>(buf: &mut BytesMut, v: &T) -> Result<()> {

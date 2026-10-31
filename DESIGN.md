@@ -238,7 +238,8 @@ jobs with time to spare on slow cores.
    wait for it.
 5. A job that waits for a class adds its predicted time, divided by the class's
    CPUs, to that class's expected wait, so later jobs don't all count on the
-   same free slot.
+   same free slot. A class whose last token a pass hands out frees no sooner
+   than the quickest job that pass placed there.
 6. A job past its predicted time is expected to run at least half again as long
    as it has, so an overdue estimate can't strand jobs waiting for its class.
 7. A job is placed only after it has waited 20 ms. Cargo starts a wave of ready
@@ -246,9 +247,14 @@ jobs with time to spare on slow cores.
    the job everything else waits on, before placing any of it. Younger jobs
    still count toward their build's horizon.
 
-Remote slots (phase 2) are for jobs that may go remote and whose predicted
-cost is above a remote cutoff, learned from each server's overhead (hash
-exchange, upload, latency). Light jobs stay home.
+A job that may go remote considers other boxes if it has no history (neither
+the unit nor its crate has run before), or if it is predicted to take at least
+1 s on the fastest local class. A job with history chooses among local classes
+as above, and goes to another box instead if it would finish there sooner,
+counting 200 ms for the trip. A job with no history has nothing to predict
+with, so it takes free capacity: the fastest local class with a token, else the
+fastest other box with one free, else it waits for the local class expected to
+free first. Light jobs with history stay home.
 
 A job is local-only if:
 
@@ -275,11 +281,16 @@ work, so build times say nothing yet; placement is all that was checked.
 ### Farm
 
 A daemon whose config has `base` joins the farm. It publishes one packed value
-at `BASE/NAME/state`: protocol version, profile, whether it accepts jobs (not
-while switching profile), its toolchains, and each class's calibration, CPUs
-and running count. A changed load is republished at most every 100 ms. The
-daemon watches every other box under `BASE` and takes jobs at
-`BASE/NAME/jobs`, a netidx pack channel listener. Each job is one connection.
+at `BASE/NAME/state`: protocol version, profile, a version number, its
+toolchains, and each class's calibration, CPUs and free tokens. Free tokens
+are counted in the class's jobserver FIFO with `FIONREAD`, which doesn't take
+them, so they leave out the tokens rustc's codegen threads hold. A box
+publishes no free tokens while it switches profile or its own jobs wait. The
+scheduler counts after every event, and every 100 ms while jobs run, since
+codegen threads take and return tokens without telling it. A changed load is
+republished at most every 100 ms. The daemon watches every other box under
+`BASE` and takes jobs at `BASE/NAME/jobs`, a netidx pack channel listener.
+Each job is one connection.
 
 Toolchains are rustup's (`~/.rustup/toolchains/*`). A compiler is matched by
 rustc's commit hash and host, and a job with `--target` also needs that
@@ -288,9 +299,26 @@ cargo runs from `rustc -vV`, cached by path and mtime.
 
 A server admits a remote job only into a free token of the class asked for,
 and only when none of its own jobs is waiting, so local work comes first. It
-answers busy otherwise, and the client leaves that box alone for 2 s. An
-admitted job holds a normal slot: it shares the class's jobserver and CPUs
-with local jobs, and its cost goes into the server's history too.
+answers busy otherwise. An admitted job holds a normal slot: it shares the
+class's jobserver and CPUs with local jobs, and its cost goes into the
+server's history too.
+
+Each answer, accepted or busy, names the version of the server's state that
+first reflects it, and the server publishes that version right after. A
+client offers a class only while the jobs it sent there that the box's state
+doesn't count yet are fewer than the free tokens published. A sent job stops
+counting once the box has accepted it and published the version its answer
+named. After a busy answer the client skips the box until it publishes the
+version named. So a client neither counts its own jobs twice nor offers into
+tokens it has already taken, and every refusal makes the server publish a
+fresh state. Versions start from zero when a box restarts, which clients see
+as a version going down. Memory isn't published, so a box can still refuse
+for memory.
+
+`status` lists every unit the box has run, with runs split three ways: this
+box's builds run here, this box's builds run elsewhere, and other boxes'
+builds run here. Units outside this box's build graph have no rank. Each class
+shows this box's jobs, other boxes' jobs and free tokens.
 
 ### Inputs
 
@@ -420,8 +448,8 @@ coming back.
 
 Two daemons on this laptop, each with its own state, talking through a private
 netidx resolver: A with 2 slow CPUs, B with 4 fast ones. A built this crate
-twice. The first build only taught A costs and the graph; unknown jobs are
-predicted below the 1 s remote cutoff, so nothing left. On the clean second
+twice. The first build only taught A costs and the graph; unknown jobs were
+then predicted below the 1 s remote cutoff, so nothing left. On the clean second
 build A sent 18 jobs to B: 16 compiled there, 1 failed and was rebuilt locally,
 1 got a busy answer. The build succeeded and the binary ran. Wall times on a
 box at load 100+ from other work mean nothing.
@@ -440,9 +468,11 @@ What the test found:
   now chooses only among local classes, and a job goes remote whenever that
   finishes sooner than its local choice.
 - B answered busy with free slots published, because each remote rustc's
-  codegen threads took the rest of the class's tokens. That is correct; the
-  client backs off for 2 s. Publishing free tokens instead of admitted jobs
-  would avoid the round trip, but tokens can't be counted without taking them.
+  codegen threads took the rest of the class's tokens. Boxes now publish free
+  tokens, counted with `FIONREAD`, and the version in each answer replaced the
+  2 s backoff. The same work found that a client counted each of its jobs on
+  a box twice (in the box's running count and its own sent count), so one
+  client could fill at most half a box.
 
 Known gaps:
 
@@ -450,9 +480,11 @@ Known gaps:
 - One connection per job. A persistent connection per pair of boxes would
   save the setup if it shows up in measurements.
 - Upload and output file I/O run on async worker threads.
-- The first build of a project stays local, since its costs are unknown.
-- A server's `status` lists units from its own graph, so jobs it served for
-  others don't appear there, though they are in its job history.
+- A job stays local if the build graph doesn't know every crate below it,
+  which happens when a project's target directory was built before the daemon
+  first saw it.
+- The memory limit takes a prefix of the queue before placement, so local
+  memory holds back jobs that would have gone to another box.
 
 ## Guesses to test on the quiet cluster
 
@@ -473,7 +505,7 @@ Every number below is a guess. None has been tested on an idle box.
 | keep graph nodes unseen for | 60 days | `src/graph.rs:18` |
 | only send jobs predicted to take at least | 1 s | `src/sched.rs` `REMOTE_MIN_US` |
 | predicted cost of going remote | 200 ms | `src/sched.rs` `REMOTE_OVERHEAD_US` |
-| leave a busy box alone for | 2 s | `src/sched.rs` `BUSY_BACKOFF` |
+| count free tokens while jobs run every | 100 ms | `src/sched.rs` `SAMPLE` |
 | keep a unit local after remote-fail, local-pass | 2 times | `src/sched.rs` `PIN_AFTER` |
 | blob cache | 20 GB | `src/config.rs` |
 

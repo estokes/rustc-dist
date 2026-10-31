@@ -24,11 +24,13 @@ const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 /// How often to look for boxes joining or leaving.
 const LIST_EVERY: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone, PartialEq, Eq, Pack)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pack)]
 pub struct ClassState {
     pub calib_us: u64,
     pub cpus: u32,
-    pub running: u32,
+    /// Jobserver tokens an offer to this class would find now: none while
+    /// the box switches profile or its own jobs wait.
+    pub free: u32,
 }
 
 /// What a box publishes at `BASE/NAME/state`.
@@ -36,8 +38,9 @@ pub struct ClassState {
 pub struct BoxState {
     pub protocol: u32,
     pub profile: ArcStr,
-    /// False while it switches profile, when it refuses every job.
-    pub accepting: bool,
+    /// Counts the states the box has published since it started. Its
+    /// answer to an offer names the first version that reflects it.
+    pub version: u64,
     pub toolchains: Vec<Toolchain>,
     pub classes: Vec<ClassState>,
 }
@@ -46,7 +49,7 @@ pub struct BoxState {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Load {
     pub profile: ArcStr,
-    pub accepting: bool,
+    pub version: u64,
     pub classes: Vec<ClassState>,
 }
 
@@ -80,7 +83,7 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
     let state = |load: &Load| BoxState {
         protocol: PROTOCOL,
         profile: load.profile.clone(),
-        accepting: load.accepting,
+        version: load.version,
         toolchains: m.toolchains.clone(),
         classes: load.classes.clone(),
     };

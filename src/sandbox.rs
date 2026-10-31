@@ -2,7 +2,7 @@ use crate::{
     blobs::{self, Hash, Store, Upload},
     protocol::Ran,
     remote::{ARTIFACT, CHUNK, FileEntry, FromServer, SYSTEM, ToServer},
-    sched::{Msg, Slot},
+    sched::{Answer, Msg, Slot},
     sys,
     toolchain::Installed,
 };
@@ -69,11 +69,12 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
     };
     let (reply, admitted) = oneshot::channel();
     server.tx.send(Msg::Offer { unit, class, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
-    let Some(slot) = admitted.await? else {
-        con.send_one(&FromServer::Busy).await?;
+    let Answer { slot, version } = admitted.await?;
+    let Some(slot) = slot else {
+        con.send_one(&FromServer::Busy { version }).await?;
         return Ok(());
     };
-    con.send_one(&FromServer::Accepted).await?;
+    con.send_one(&FromServer::Accepted { version }).await?;
     match job(&server, &con, tc, &slot).await {
         Ok(Some(ran)) => slot.finish(ran),
         Ok(None) => (),

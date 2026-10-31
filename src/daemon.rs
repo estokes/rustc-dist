@@ -376,6 +376,10 @@ async fn run_remote(
     let mut forwarded_metadata = false;
     let mut handle = async |ev: Event, sock: &mut UnixStream, buf: &mut BytesMut| -> Result<()> {
         match ev {
+            Event::Accepted { version } => {
+                r.accepted(version);
+                Ok(())
+            }
             Event::Artifact(line) => {
                 forwarded_metadata |= line.windows(METADATA.len()).any(|w| w == METADATA);
                 protocol::send_async(sock, buf, &Reply::Output { stderr: true, data: line }).await
@@ -409,8 +413,8 @@ async fn run_remote(
             r.finish(RemoteOutcome::Done(Ran { cpu_us, wall_us, maxrss_kb }));
             Ok(Remote::Done)
         }
-        Ok(Outcome::Busy) => {
-            r.finish(RemoteOutcome::Busy);
+        Ok(Outcome::Busy { version }) => {
+            r.finish(RemoteOutcome::Busy { version });
             Ok(Remote::Busy)
         }
         Ok(Outcome::Exit { code, .. }) => {

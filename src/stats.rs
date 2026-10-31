@@ -18,12 +18,24 @@ use std::{
 const HALVE_AT: u64 = 256;
 /// Predicted cost of a job when nothing at all has been recorded.
 const UNKNOWN_COST_MCU: u64 = 1000;
-const MAGIC: &[u8; 8] = b"rdstats1";
+const MAGIC: &[u8; 8] = b"rdstats2";
+
+/// Whose build a run was for and where it ran.
+#[derive(Clone, Copy)]
+pub enum Origin {
+    /// This box's build, run here.
+    Here,
+    /// This box's build, run on another box.
+    Sent,
+    /// Another box's build, run here.
+    Served,
+}
 
 pub struct Sample {
     pub cost_mcu: u64,
     pub wall_ms: u64,
     pub mem_kb: u64,
+    pub origin: Origin,
 }
 
 struct Hists {
@@ -31,18 +43,21 @@ struct Hists {
     cost: Histogram<u32>,
     wall_ms: Histogram<u32>,
     mem_kb: Histogram<u32>,
+    /// Runs by `Origin`, never halved.
+    runs: [u64; 3],
 }
 
 impl Hists {
     fn new() -> Self {
         let h = |high| Histogram::new_with_bounds(1, high, 2).expect("histogram bounds");
-        Self { cost: h(100_000_000), wall_ms: h(36_000_000), mem_kb: h(1 << 30) }
+        Self { cost: h(100_000_000), wall_ms: h(36_000_000), mem_kb: h(1 << 30), runs: [0; 3] }
     }
 
     fn record(&mut self, s: &Sample) {
         self.cost.saturating_record(s.cost_mcu.max(1));
         self.wall_ms.saturating_record(s.wall_ms.max(1));
         self.mem_kb.saturating_record(s.mem_kb.max(1));
+        self.runs[s.origin as usize] += 1;
     }
 
     fn halve(&mut self) {
@@ -62,17 +77,23 @@ impl Hists {
         self.cost.add(&other.cost).expect("same bounds");
         self.wall_ms.add(&other.wall_ms).expect("same bounds");
         self.mem_kb.add(&other.mem_kb).expect("same bounds");
+        for (r, o) in self.runs.iter_mut().zip(other.runs) {
+            *r += o;
+        }
     }
 }
 
 pub struct Prediction {
     pub cost_mcu: u64,
     pub mem_kb: u64,
+    /// It comes from the unit's or its crate's own runs, not every job's.
+    pub known: bool,
 }
 
 /// What `status` shows of a unit.
 pub struct UnitInfo {
-    pub runs: u64,
+    /// Runs by `Origin`.
+    pub runs: [u64; 3],
     pub cost_mcu: u64,
     pub wall_ms: u64,
     pub mem_kb: u64,
@@ -97,25 +118,28 @@ impl Stats {
                 (h.cost.value_at_quantile(0.5), h.mem_kb.value_at_quantile(0.9))
             })
         };
-        let (cost_mcu, mem_kb) = known(&self.exact, exact)
-            .or_else(|| known(&self.coarse, coarse))
-            .unwrap_or_else(|| {
-                if self.global.cost.is_empty() {
-                    (UNKNOWN_COST_MCU, 0)
-                } else {
-                    (self.global.cost.value_at_quantile(0.5), self.global.mem_kb.value_at_quantile(0.5))
-                }
-            });
-        Prediction { cost_mcu, mem_kb }
+        if let Some((cost_mcu, mem_kb)) = known(&self.exact, exact).or_else(|| known(&self.coarse, coarse))
+        {
+            return Prediction { cost_mcu, mem_kb, known: true };
+        }
+        let (cost_mcu, mem_kb) = if self.global.cost.is_empty() {
+            (UNKNOWN_COST_MCU, 0)
+        } else {
+            (self.global.cost.value_at_quantile(0.5), self.global.mem_kb.value_at_quantile(0.5))
+        };
+        Prediction { cost_mcu, mem_kb, known: false }
     }
 
-    pub fn info(&self, exact: &ArcStr) -> Option<UnitInfo> {
-        let h = self.exact.get(exact).filter(|h| !h.cost.is_empty())?;
-        Some(UnitInfo {
-            runs: h.cost.len(),
-            cost_mcu: h.cost.value_at_quantile(0.5),
-            wall_ms: h.wall_ms.value_at_quantile(0.5),
-            mem_kb: h.mem_kb.value_at_quantile(0.9),
+    /// Every unit with runs.
+    pub fn units(&self) -> impl Iterator<Item = (&ArcStr, UnitInfo)> {
+        self.exact.iter().filter(|(_, h)| !h.cost.is_empty()).map(|(key, h)| {
+            let info = UnitInfo {
+                runs: h.runs,
+                cost_mcu: h.cost.value_at_quantile(0.5),
+                wall_ms: h.wall_ms.value_at_quantile(0.5),
+                mem_kb: h.mem_kb.value_at_quantile(0.9),
+            };
+            (key, info)
         })
     }
 
@@ -162,8 +186,9 @@ impl Stats {
                 r.read_exact(&mut key)?;
                 let key = ArcStr::from(String::from_utf8(key).context("unit key")?);
                 let mut hist = || de.deserialize(&mut r).map_err(|e| anyhow!("{e:?}"));
-                let h = Hists { cost: hist()?, wall_ms: hist()?, mem_kb: hist()? };
-                map.insert(key, h);
+                let (cost, wall_ms, mem_kb) = (hist()?, hist()?, hist()?);
+                let runs = [read_u64(&mut r)?, read_u64(&mut r)?, read_u64(&mut r)?];
+                map.insert(key, Hists { cost, wall_ms, mem_kb, runs });
             }
         }
         stats.rebuild_global();
@@ -188,6 +213,9 @@ impl Stats {
                 for hist in [&h.cost, &h.wall_ms, &h.mem_kb] {
                     ser.serialize(hist, &mut w).map_err(|e| anyhow!("{e:?}"))?;
                 }
+                for n in h.runs {
+                    w.write_all(&n.to_be_bytes())?;
+                }
             }
         }
         w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
@@ -203,6 +231,12 @@ fn read_u32(r: &mut impl Read) -> Result<u32> {
     Ok(u32::from_be_bytes(b))
 }
 
+fn read_u64(r: &mut impl Read) -> Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_be_bytes(b))
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -216,13 +250,14 @@ mod test {
     }
 
     fn sample(cost_mcu: u64) -> Sample {
-        Sample { cost_mcu, wall_ms: cost_mcu / 10, mem_kb: 1000 }
+        Sample { cost_mcu, wall_ms: cost_mcu / 10, mem_kb: 1000, origin: Origin::Here }
     }
 
     #[test]
     fn predicts_from_exact_then_coarse_then_global() {
         let mut s = Stats::new();
         assert_eq!(predict(&s, &unit("a:1", "a")).cost_mcu, UNKNOWN_COST_MCU);
+        assert!(!predict(&s, &unit("a:1", "a")).known);
         for _ in 0..10 {
             s.record(&unit("heavy:1", "heavy"), sample(50_000));
             s.record(&unit("light:1", "light"), sample(20));
@@ -231,7 +266,9 @@ mod test {
         assert!((49_000..=51_000).contains(&heavy.cost_mcu), "{}", heavy.cost_mcu);
         let other_profile = predict(&s, &unit("heavy:2", "heavy"));
         assert_eq!(other_profile.cost_mcu, heavy.cost_mcu);
-        assert!(predict(&s, &unit("new:1", "new")).cost_mcu > 0);
+        assert!(heavy.known && other_profile.known);
+        let new = predict(&s, &unit("new:1", "new"));
+        assert!(new.cost_mcu > 0 && !new.known);
     }
 
     #[test]
@@ -255,12 +292,15 @@ mod test {
         let path = dir.join("jobs.hdr");
         let mut s = Stats::new();
         s.record(&unit("a:1", "a"), sample(1234));
+        s.record(&unit("a:1", "a"), Sample { origin: Origin::Served, ..sample(1234) });
         s.record(&unit("b:1", "b"), sample(99));
         s.save(&path)?;
         assert!(!s.dirty);
         let t = Stats::load(&path)?;
         assert_eq!(predict(&t, &unit("a:1", "a")).cost_mcu, predict(&s, &unit("a:1", "a")).cost_mcu);
-        assert_eq!(t.global.cost.len(), 2);
+        assert_eq!(t.global.cost.len(), 3);
+        let (_, a) = t.units().find(|(k, _)| k.as_str() == "a:1").unwrap();
+        assert_eq!(a.runs, [1, 0, 1]);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

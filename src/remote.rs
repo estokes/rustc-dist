@@ -43,8 +43,10 @@ pub enum ToServer {
 
 #[derive(Debug, Pack)]
 pub enum FromServer {
-    Accepted,
-    Busy,
+    /// `version` is the first version of the server's published state
+    /// that reflects the answer.
+    Accepted { version: u64 },
+    Busy { version: u64 },
     /// The blobs the server lacks.
     Need(Vec<Hash>),
     Stdout(Bytes),
@@ -238,6 +240,8 @@ pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
 }
 
 pub enum Event {
+    /// The server took the job.
+    Accepted { version: u64 },
     /// An artifact line, sent once the file it names is in place.
     Artifact(Bytes),
     Stderr(Bytes),
@@ -245,7 +249,7 @@ pub enum Event {
 }
 
 pub enum Outcome {
-    Busy,
+    Busy { version: u64 },
     Exit { code: i32, cpu_us: u64, wall_us: u64, maxrss_kb: u64 },
 }
 
@@ -265,8 +269,8 @@ pub async fn run(
     con.send_one(&offer)?;
     con.flush().await?;
     match con.recv_one::<FromServer>().await? {
-        FromServer::Accepted => (),
-        FromServer::Busy => return Ok(Outcome::Busy),
+        FromServer::Accepted { version } => sink(Event::Accepted { version })?,
+        FromServer::Busy { version } => return Ok(Outcome::Busy { version }),
         FromServer::Failed(why) => bail!("{jobs}: {why}"),
         m => bail!("{jobs}: unexpected {m:?}"),
     }

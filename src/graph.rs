@@ -201,7 +201,7 @@ impl Graph {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::stats::Sample;
+    use crate::stats::{Origin, Sample};
 
     fn unit(id: &str, deps: &[&str]) -> Unit {
         Unit {
@@ -218,7 +218,7 @@ mod test {
     fn stats(costs: &[(&str, u64)]) -> Stats {
         let mut s = Stats::new();
         for &(id, cost_mcu) in costs {
-            s.record(&unit(id, &[]), Sample { cost_mcu, wall_ms: 1, mem_kb: 1 });
+            s.record(&unit(id, &[]), Sample { cost_mcu, wall_ms: 1, mem_kb: 1, origin: Origin::Here });
         }
         s
     }

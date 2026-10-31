@@ -22,6 +22,7 @@ mod e2e_test;
 use anyhow::{Result, bail};
 use bytes::BytesMut;
 use clap::{Args, Parser};
+use compact_str::{CompactString, format_compact};
 use classes::Profile;
 use protocol::{Ask, Reply, Switching};
 use std::{
@@ -138,9 +139,17 @@ fn status() -> Result<()> {
         )?,
         Switching::Calibrating(to) => writeln!(out, "profile {}, calibrating {to}", st.profile)?,
     }
-    writeln!(out, "\nclass  cpus  calibration  running")?;
+    writeln!(out, "\nclass  cpus  calibration  running  serving  free")?;
     for (k, c) in st.classes.iter().enumerate() {
-        writeln!(out, "{k:5}  {:4}  {:8.1} ms  {:7}", c.cpus, c.calib_us as f64 / 1000., c.running)?;
+        writeln!(
+            out,
+            "{k:5}  {:4}  {:8.1} ms  {:7}  {:7}  {:4}",
+            c.cpus,
+            c.calib_us as f64 / 1000.,
+            c.running,
+            c.serving,
+            c.free
+        )?;
     }
     if st.finishing > 0 {
         writeln!(out, "{} jobs finishing under the previous profile", st.finishing)?;
@@ -155,33 +164,44 @@ fn status() -> Result<()> {
     )?;
     for b in &st.boxes {
         let cpus: u32 = b.classes.iter().map(|c| c.cpus).sum();
-        let running: u32 = b.classes.iter().map(|c| c.running).sum();
+        let free: u32 = b.classes.iter().map(|c| c.free).sum();
         let fastest = b.classes.iter().map(|c| c.calib_us).min().unwrap_or(0) as f64 / 1000.;
         let note = if b.compatible { "" } else { ", other version" };
         writeln!(
             out,
-            "box {}: profile {}, {running} of {cpus} cpus busy, fastest {fastest:.1} ms, {} from here{note}",
+            "box {}: profile {}, {free} of {cpus} cpus free, fastest {fastest:.1} ms, {} from here{note}",
             b.name, b.profile, b.sent
         )?;
     }
     if st.units.is_empty() {
         return Ok(());
     }
-    writeln!(out, "{} units in the build graph, by work waiting on them", st.graph_nodes)?;
     writeln!(
         out,
-        "\n{:>9}  {:>9}  {:>8}  {:>8}  {:>5}  unit",
-        "rank (cu)", "cost (cu)", "wall (s)", "mem (MB)", "runs"
+        "\n{} units run, by work waiting on them ({} in the build graph). Runs: here and sent for \
+         this box's builds, served for other boxes'.",
+        st.units.len(),
+        st.graph_nodes
+    )?;
+    writeln!(
+        out,
+        "\n{:>9}  {:>9}  {:>8}  {:>8}  {:>5}  {:>5}  {:>6}  unit",
+        "rank (cu)", "cost (cu)", "wall (s)", "mem (MB)", "here", "sent", "served"
     )?;
     for u in &st.units {
+        let rank: CompactString = match u.rank_mcu {
+            Some(r) => format_compact!("{:9.3}", r as f64 / 1000.),
+            None => format_compact!("{:>9}", "-"),
+        };
         writeln!(
             out,
-            "{:9.3}  {:9.3}  {:8.1}  {:8}  {:5}  {}",
-            u.rank_mcu as f64 / 1000.,
+            "{rank}  {:9.3}  {:8.1}  {:8}  {:5}  {:5}  {:6}  {}",
             u.cost_mcu as f64 / 1000.,
             u.wall_ms as f64 / 1000.,
             u.mem_kb / 1024,
-            u.runs,
+            u.here,
+            u.sent,
+            u.served,
             u.key
         )?;
     }
