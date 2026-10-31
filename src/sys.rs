@@ -35,6 +35,39 @@ pub fn allowed_cpus() -> Result<Vec<u32>> {
     Ok(cpus)
 }
 
+/// The CPUs among `cpus` grouped by the core they share, each group sorted
+/// and the groups in order of their first CPU. A CPU whose siblings can't
+/// be read is a core of its own.
+pub fn cores(cpus: &[u32]) -> Vec<Vec<u32>> {
+    let mut cores: Vec<Vec<u32>> = Vec::new();
+    for &cpu in cpus {
+        if cores.iter().any(|core| core.contains(&cpu)) {
+            continue;
+        }
+        let path = format_compact!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list");
+        let siblings = fs::read_to_string(path.as_str()).ok().and_then(|s| cpu_list(s.trim()).ok());
+        let mut core: Vec<u32> = match siblings {
+            Some(s) if s.contains(&cpu) => s.into_iter().filter(|c| cpus.contains(c)).collect(),
+            _ => vec![cpu],
+        };
+        core.sort_unstable();
+        cores.push(core);
+    }
+    cores
+}
+
+/// A kernel CPU list such as `0-3,8,10-11`.
+fn cpu_list(s: &str) -> Result<Vec<u32>> {
+    let mut cpus = Vec::new();
+    for part in s.split(',') {
+        match part.split_once('-') {
+            Some((lo, hi)) => cpus.extend(lo.parse::<u32>()?..=hi.parse::<u32>()?),
+            None => cpus.push(part.parse()?),
+        }
+    }
+    Ok(cpus)
+}
+
 /// CPU time the calling thread has used. Unlike wall time, it doesn't
 /// grow while the thread waits for a CPU that other work holds.
 pub fn thread_cpu_us() -> u64 {
@@ -205,6 +238,22 @@ pub fn children_usage() -> Usage {
 mod test {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn cpu_lists_and_cores() -> Result<()> {
+        assert_eq!(cpu_list("0-3,8,10-11")?, vec![0, 1, 2, 3, 8, 10, 11]);
+        assert_eq!(cpu_list("0,18")?, vec![0, 18]);
+        assert!(cpu_list("0-x").is_err());
+        // Every allowed cpu is in exactly one core, the first of each core
+        // first.
+        let allowed = allowed_cpus()?;
+        let cores = cores(&allowed);
+        let mut all: Vec<u32> = cores.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, allowed);
+        assert!(cores.windows(2).all(|w| w[0][0] < w[1][0]));
+        Ok(())
+    }
 
     #[test]
     fn memory_counts_compressed_swap_uncompressed() -> Result<()> {

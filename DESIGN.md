@@ -167,12 +167,16 @@ Every box runs the same code from the same binary, so results compare across
 boxes with no graphix checkout, no recorded job and no blob fetch. The run
 takes seconds.
 
-Calibration runs the load on every logical CPU at once, one thread pinned to each,
-SMT siblings included. Both threads of a core run loaded, so they measure the
-same and land in the same class. Their time already reflects sharing the core,
-which is how they will run under a full farm. The
-whole box is under load, so the numbers are sustained speed with shared caches,
-memory bandwidth and SMT siblings all under contention, not single-core turbo.
+Calibration runs the load on every core at once, one thread pinned to each
+core's first CPU, with its SMT siblings idle. A core's other CPUs join its
+class at its rate. Two threads sharing a core run slower than one alone, and
+the more cache a load wants the slower: on aieka (i9-10980XE) the load ran at
+2.29 G instructions/s per core with one thread each and 0.56 per thread with
+two, a box's total halved. That loss depends on the load, so calibration
+leaves it, like rustc's IPC differing from the load's, to the rates classes
+learn from real jobs. The whole box is under load, so the numbers are
+sustained speed with shared caches and memory bandwidth under contention,
+not single-core turbo.
 The load repeats for about a minute so laptops drop out of their short boost
 window. Each run is timed by its thread's CPU time, not wall time, so time
 spent waiting for a CPU that other work holds doesn't count. Each CPU's time

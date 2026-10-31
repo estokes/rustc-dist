@@ -186,22 +186,39 @@ fn group(mut speeds: Vec<(u32, Speed)>) -> Vec<Class> {
     classes
 }
 
-/// Calibrate the classes of whatever profile the box is in now.
+/// Calibrate the classes of whatever profile the box is in now: one
+/// thread on each core, on its first CPU, which takes the core's other
+/// CPUs into its class.
 pub fn run(cpus: &[u32], seconds: u64) -> Result<Vec<Class>> {
-    Ok(group(measure(cpus, seconds)?))
+    let cores = sys::cores(cpus);
+    let firsts: Vec<u32> = cores.iter().map(|core| core[0]).collect();
+    Ok(with_siblings(group(measure(&firsts, seconds)?), &cores))
+}
+
+/// Each class with the other CPUs of its members' cores.
+fn with_siblings(classes: Vec<Class>, cores: &[Vec<u32>]) -> Vec<Class> {
+    classes
+        .into_iter()
+        .map(|c| {
+            let mut cpus: Vec<u32> = cores.iter().filter(|core| c.cpus.contains(&core[0])).flatten().copied().collect();
+            cpus.sort_unstable();
+            Class { cpus, ..c }
+        })
+        .collect()
 }
 
 /// Measure and print this box's classes without saving them.
 pub fn print(seconds: u64) -> Result<()> {
-    let cpus = sys::allowed_cpus()?;
-    eprintln!("calibrating {} cpus for {seconds}s", cpus.len());
-    let speeds = measure(&cpus, seconds)?;
-    for &(cpu, s) in &speeds {
+    let cores = sys::cores(&sys::allowed_cpus()?);
+    let firsts: Vec<u32> = cores.iter().map(|core| core[0]).collect();
+    eprintln!("calibrating {} cores for {seconds}s", cores.len());
+    let speeds = measure(&firsts, seconds)?;
+    for (core, (_, s)) in cores.iter().zip(&speeds) {
         let (ms, g) = (s.time_us as f64 / 1000., s.rate as f64 / 1000.);
-        eprintln!("  cpu {cpu:3}: {ms:.1} ms, {g:.2} G instructions/s");
+        eprintln!("  cpus {core:?}: {ms:.1} ms, {g:.2} G instructions/s");
     }
     let mut out = io::stdout().lock();
-    for (k, c) in group(speeds).iter().enumerate() {
+    for (k, c) in with_siblings(group(speeds), &cores).iter().enumerate() {
         writeln!(out, "class {k}: {:.2} G instructions/s, cpus {:?}", c.rate as f64 / 1000., c.cpus)?;
     }
     Ok(())
@@ -246,6 +263,15 @@ fn systemctl(args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn siblings_join_their_cores_class() {
+        let cores = [vec![0, 18], vec![1, 19], vec![2]];
+        let classes = vec![Class { rate: 9, cpus: vec![0, 2] }, Class { rate: 5, cpus: vec![1] }];
+        let classes = with_siblings(classes, &cores);
+        assert_eq!(classes[0], Class { rate: 9, cpus: vec![0, 2, 18] });
+        assert_eq!(classes[1], Class { rate: 5, cpus: vec![1, 19] });
+    }
 
     #[test]
     fn groups_split_at_gaps() {
