@@ -7,6 +7,7 @@ mod config;
 mod daemon;
 mod farm;
 mod graph;
+mod link;
 mod perf;
 mod protocol;
 mod remote;
@@ -41,9 +42,11 @@ compiler:
     jobs = 256    # at least the slot count; the daemon does the limiting
 
 Every rustc asks the daemon on its box for a slot and waits until one is
-free. The daemon runs it pinned to a core class, with a jobserver holding
-one token per CPU of that class, and records how long each unit takes so
-heavy units go to fast cores.
+free. The daemon runs a job measured to use about one thread pinned to a
+core class, and any other job on every core, with jobserver tokens lent
+from the classes. It records each unit's work so the jobs the most work
+waits on get fast cores, and in a farm it sends jobs to other boxes when
+they finish sooner there.
 
 Run `rustc-dist install` to enable the systemd user service. On a laptop,
 have the desktop run `rustc-dist profile NAME` when the power profile
@@ -191,14 +194,15 @@ fn status() -> Result<()> {
         out,
         "\n{} units run, by work waiting on them ({} in the build graph). Work is in G instructions; \
          front is the single-threaded share, width the threads busy after it. Runs: here and sent \
-         for this box's builds, served for other boxes'.",
+         for this box's builds, served for other boxes'. Copy is the time a sent run spent on its \
+         files rather than compiling, and MB what it sent (medians).",
         st.units.len(),
         st.graph_nodes
     )?;
     writeln!(
         out,
-        "\n{:>8}  {:>8}  {:>5}  {:>5}  {:>8}  {:>8}  {:>5}  {:>5}  {:>6}  unit",
-        "rank", "work", "front", "width", "wall (s)", "mem (MB)", "here", "sent", "served"
+        "\n{:>8}  {:>8}  {:>5}  {:>5}  {:>8}  {:>8}  {:>5}  {:>5}  {:>6}  {:>8}  {:>7}  unit",
+        "rank", "work", "front", "width", "wall (s)", "mem (MB)", "here", "sent", "served", "copy (s)", "MB sent"
     )?;
     for u in &st.units {
         let rank: CompactString = match u.rank_mi {
@@ -209,9 +213,13 @@ fn status() -> Result<()> {
             Some(f) => format_compact!("{:4}%", f * 100 / u.cost_mi.max(1)),
             None => format_compact!("{:>5}", "-"),
         };
+        let (copy, sent): (CompactString, CompactString) = match (u.copy_ms, u.sent_kb) {
+            (Some(ms), Some(kb)) => (format_compact!("{:8.2}", ms as f64 / 1000.), format_compact!("{:7.1}", kb as f64 / 1024.)),
+            _ => (format_compact!("{:>8}", "-"), format_compact!("{:>7}", "-")),
+        };
         writeln!(
             out,
-            "{rank}  {:8.2}  {front}  {:5.1}  {:8.1}  {:8}  {:5}  {:5}  {:6}  {}",
+            "{rank}  {:8.2}  {front}  {:5.1}  {:8.1}  {:8}  {:5}  {:5}  {:6}  {copy}  {sent}  {}",
             u.cost_mi as f64 / 1000.,
             u.width_c as f64 / 100.,
             u.wall_ms as f64 / 1000.,

@@ -125,8 +125,9 @@ impl Graph {
 
     /// The crate files a job with `deps` reads: its own and, through the
     /// graph, those of every crate below it, since rustc loads the metadata
-    /// of indirect dependencies too. None if a crate below it was never
-    /// seen compiling, so its dependencies are unknown.
+    /// of indirect dependencies too. A proc macro's dependencies are linked
+    /// into its `.so`, and rustc never loads them. None if a crate below it
+    /// was never seen compiling, so its dependencies are unknown.
     pub fn inputs(&self, deps: &[Dep]) -> Option<Vec<ArcStr>> {
         let mut files = Vec::new();
         let mut seen: LPooled<HashMap<ArcStr, ()>> = LPooled::take();
@@ -138,7 +139,9 @@ impl Graph {
                 continue;
             }
             files.push(file.clone());
-            stack.extend(&self.nodes.get(&dep.id)?.deps);
+            if !file.ends_with(".so") {
+                stack.extend(&self.nodes.get(&dep.id)?.deps);
+            }
         }
         Some(files)
     }
@@ -203,15 +206,17 @@ mod test {
     use super::*;
     use crate::stats::{Origin, Sample};
 
+    /// A dep named `*_macro` is a proc macro.
     fn unit(id: &str, deps: &[&str]) -> Unit {
+        let file = |d: &str| {
+            let ext = if d.ends_with("_macro") { "so" } else { "rmeta" };
+            format_compact!("/t/lib{d}.{ext}").as_str().into()
+        };
         Unit {
             exact: ArcStr::from(id),
             coarse: ArcStr::from(id),
             id: ArcStr::from(id),
-            deps: deps
-                .iter()
-                .map(|d| Dep { id: ArcStr::from(*d), file: Some(format_compact!("/t/lib{d}.rmeta").as_str().into()) })
-                .collect(),
+            deps: deps.iter().map(|d| Dep { id: ArcStr::from(*d), file: Some(file(d)) }).collect(),
             codegen_units: 16,
         }
     }
@@ -271,6 +276,16 @@ mod test {
         assert_eq!(files, ["/t/libitoa.rmeta", "/t/liblibc.rmeta", "/t/libregex.rmeta", "/t/libregex_syntax.rmeta"]);
         let unknown = unit("x", &["never_built"]);
         assert!(g.inputs(&unknown.deps).is_none());
+    }
+
+    #[test]
+    fn inputs_stop_at_proc_macros() {
+        let mut g = build();
+        g.record(&unit("derive_macro", &["regex", "never_built"]));
+        g.record(&unit("model", &["derive_macro", "itoa"]));
+        let mut files = g.inputs(&unit("app", &["model"]).deps).unwrap();
+        files.sort();
+        assert_eq!(files, ["/t/libderive_macro.so", "/t/libitoa.rmeta", "/t/liblibc.rmeta", "/t/libmodel.rmeta"]);
     }
 
     #[test]

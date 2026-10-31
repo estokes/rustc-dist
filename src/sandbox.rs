@@ -1,8 +1,9 @@
 use crate::{
     blobs::{self, Hash, Store, Upload},
+    link::{self, Gate},
     perf,
     protocol::{self, Front, Ran},
-    remote::{CHUNK, FileEntry, FromServer, SYSTEM, ToServer},
+    remote::{CHUNK, FileEntry, FromServer, Late, Rlib, SYSTEM, ToServer},
     sched::{Answer, Msg, Slot},
     sys,
     toolchain::Installed,
@@ -11,12 +12,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use bytes::Bytes;
 use compact_str::format_compact;
+use futures::future::OptionFuture;
 use log::debug;
 use netidx_protocols::pack_channel::server::Connection;
 use serde::Deserialize;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
     fs::{self, File},
+    future::Future,
     io::{self, BufRead, BufReader, Read},
     mem,
     os::{
@@ -27,6 +30,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
+    pin::pin,
     process::{Command, ExitStatus, Stdio},
     sync::{
         Arc,
@@ -47,6 +51,8 @@ pub struct Server {
     pub jobs_dir: PathBuf,
     pub toolchains: Vec<Installed>,
     pub tx: mpsc::UnboundedSender<Msg>,
+    /// The stand-in linker, which waits for late rlibs.
+    stand_in: PathBuf,
     next_job: AtomicU64,
 }
 
@@ -54,7 +60,9 @@ impl Server {
     pub fn new(store: Store, jobs_dir: PathBuf, toolchains: Vec<Installed>, tx: mpsc::UnboundedSender<Msg>) -> Result<Self> {
         let _ = fs::remove_dir_all(&jobs_dir);
         fs::create_dir_all(&jobs_dir).with_context(|| format_compact!("creating {}", jobs_dir.display()))?;
-        Ok(Self { store, jobs_dir, toolchains, tx, next_job: AtomicU64::new(0) })
+        let stand_in = jobs_dir.join("linker");
+        link::write_stand_in_linker(&stand_in)?;
+        Ok(Self { store, jobs_dir, toolchains, tx, stand_in, next_job: AtomicU64::new(0) })
     }
 }
 
@@ -90,19 +98,76 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
 
 /// The Ran of a successful compile.
 async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> Result<Option<Ran>> {
-    let ToServer::Manifest { files, dirs } = con.recv_one().await? else {
+    let ToServer::Manifest { files, dirs, late } = con.recv_one().await? else {
         bail!("expected a manifest");
     };
-    for path in files.iter().map(|f| &f.path).chain(&dirs) {
+    let rlibs = late.as_ref().map_or(&[][..], |l| &l.rlibs);
+    for path in files.iter().map(|f| &f.path).chain(rlibs.iter().map(|r| &r.path)).chain(&dirs) {
         check(path)?;
     }
-    let mut need: HashSet<Hash> = HashSet::new();
-    for f in &files {
-        if !server.store.has(&f.hash) {
-            need.insert(f.hash);
+    if let Some(Late { linker, .. }) = &late {
+        check_program(linker)?;
+    }
+    let store = &server.store;
+    let mut now: HashSet<Hash> = files.iter().map(|f| f.hash).filter(|h| !store.has(h)).collect();
+    let mut later = HashSet::new();
+    for r in rlibs.iter().filter(|r| !store.has(&r.hash)) {
+        later.insert(r.hash);
+        if !store.has(&r.meta) {
+            now.insert(r.meta);
         }
     }
-    con.send_one(&FromServer::Need(need.iter().copied().collect())).await?;
+    later.retain(|h| !now.contains(h));
+    let need = FromServer::Need { now: now.iter().copied().collect(), later: later.iter().copied().collect() };
+    con.send_one(&need).await?;
+    receive(con, store, now, |_| Ok(())).await?;
+    let ToServer::Run { args, env, cwd } = con.recv_one().await? else {
+        bail!("expected run");
+    };
+    check(&cwd)?;
+    store.evict();
+    let n = server.next_job.fetch_add(1, Ordering::Relaxed);
+    let root = JobDir(server.jobs_dir.join(format_compact!("{n}").as_str()));
+    root.build(store, &files, rlibs, &later, &dirs, &cwd)?;
+    let tops: BTreeSet<&str> = files
+        .iter()
+        .map(|f| &f.path)
+        .chain(rlibs.iter().map(|r| &r.path))
+        .chain(&dirs)
+        .chain([&cwd])
+        .filter_map(|p| p.split('/').nth(1))
+        .collect();
+    let linker = late.as_ref().map(|l| &l.linker).filter(|_| !later.is_empty());
+    let mut cmd = sandbox(&root.0, &tops, tc, &slot.grant.jobserver, &env, &cwd)?;
+    if let Some(linker) = linker {
+        cmd.arg("--ro-bind").arg(&server.stand_in).arg(format_compact!("{}/{linker}", link::BIN).as_str());
+        let path = format_compact!("{}:{PATH}", link::BIN);
+        cmd.args(["--setenv", "PATH", path.as_str()]);
+    }
+    cmd.arg("--").arg(tc.rustc()).args(args.iter().map(|a| a.as_str()));
+    let late = match linker {
+        None => None,
+        Some(_) => {
+            let arrive = receive(con, store, later, |hash| {
+                for r in rlibs.iter().filter(|r| r.hash == hash) {
+                    blobs::replace(store, &hash, &root.at(&r.path))?;
+                }
+                Ok(())
+            });
+            Some((Gate::new()?, arrive))
+        }
+    };
+    run(con, store, cmd, &root.0, slot, late).await
+}
+
+/// Receive chunks until every blob in `need` is stored, telling `stored`
+/// of each as it is.
+async fn receive(
+    con: &Connection,
+    store: &Store,
+    mut need: HashSet<Hash>,
+    mut stored: impl FnMut(Hash) -> Result<()>,
+) -> Result<()> {
     let mut uploads: HashMap<Hash, Upload> = HashMap::new();
     while !need.is_empty() {
         let ToServer::Chunk { hash, data, last } = con.recv_one().await? else {
@@ -112,33 +177,25 @@ async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> 
             bail!("unrequested blob {hash}");
         }
         let up = match uploads.entry(hash) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => e.insert(server.store.upload(hash)?),
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(store.upload(hash)?),
         };
         up.write(&data)?;
         if last {
-            uploads.remove(&hash).expect("present").finish(&server.store)?;
+            uploads.remove(&hash).expect("present").finish(store)?;
             need.remove(&hash);
+            stored(hash)?;
         }
     }
-    let ToServer::Run { args, env, cwd } = con.recv_one().await? else {
-        bail!("expected run");
-    };
-    check(&cwd)?;
-    server.store.evict();
-    let n = server.next_job.fetch_add(1, Ordering::Relaxed);
-    let root = JobDir(server.jobs_dir.join(format_compact!("{n}").as_str()));
-    root.build(&server.store, &files, &dirs, &cwd)?;
-    let tops: BTreeSet<&str> = files
-        .iter()
-        .map(|f| &f.path)
-        .chain(&dirs)
-        .chain([&cwd])
-        .filter_map(|p| p.split('/').nth(1))
-        .collect();
-    let mut cmd = sandbox(&root.0, &tops, tc, &slot.grant.jobserver, &env, &cwd)?;
-    cmd.args(args.iter().map(|a| a.as_str()));
-    run(con, cmd, &root.0, slot).await
+    Ok(())
+}
+
+/// A program name the stand-in linker may take: a file name.
+fn check_program(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        bail!("refusing linker {name}");
+    }
+    Ok(())
 }
 
 /// A path the client may send: absolute, normalized, utf-8, and not in a
@@ -163,16 +220,29 @@ impl JobDir {
         self.0.join(&path[1..])
     }
 
-    fn build(&self, store: &Store, files: &[FileEntry], dirs: &[ArcStr], cwd: &str) -> Result<()> {
+    /// Rlibs still to come get stand-ins made from their metadata.
+    fn build(
+        &self,
+        store: &Store,
+        files: &[FileEntry],
+        rlibs: &[Rlib],
+        later: &HashSet<Hash>,
+        dirs: &[ArcStr],
+        cwd: &str,
+    ) -> Result<()> {
         for d in dirs.iter().map(|d| d.as_str()).chain([cwd]) {
             fs::create_dir_all(self.at(d))?;
         }
-        for f in files {
-            let dest = self.at(&f.path);
+        let rlibs = rlibs.iter().map(|r| (&r.path, r.hash, later.contains(&r.hash).then_some(r.meta)));
+        for (path, hash, stand_in) in files.iter().map(|f| (&f.path, f.hash, None)).chain(rlibs) {
+            let dest = self.at(path);
             if let Some(dir) = dest.parent() {
                 fs::create_dir_all(dir)?;
             }
-            blobs::place(store, &f.hash, &dest)?;
+            match stand_in {
+                Some(meta) => link::write_stand_in_rlib(&store.path(&meta), &dest)?,
+                None => blobs::place(store, &hash, &dest)?,
+            }
         }
         Ok(())
     }
@@ -184,8 +254,12 @@ impl Drop for JobDir {
     }
 }
 
+/// What the sandbox puts on `PATH`.
+const PATH: &str = "/usr/bin:/bin";
+
 /// bwrap with no network, the host's system directories read only, the
 /// job's tree at the client's paths, the toolchain, and the jobserver.
+/// Its command follows `--`.
 fn sandbox(
     root: &Path,
     tops: &BTreeSet<&str>,
@@ -225,9 +299,8 @@ fn sandbox(
             cmd.args(["--setenv", k.as_str(), v.as_str()]);
         }
     }
-    cmd.args(["--setenv", "PATH", "/usr/bin:/bin", "--setenv", "TMPDIR", "/tmp", "--setenv", "CARGO_MAKEFLAGS"]);
+    cmd.args(["--setenv", "PATH", PATH, "--setenv", "TMPDIR", "/tmp", "--setenv", "CARGO_MAKEFLAGS"]);
     cmd.arg(format_compact!("-j --jobserver-auth=fifo:{jobserver}").as_str());
-    cmd.arg("--").arg(tc.rustc());
     Ok(cmd)
 }
 
@@ -254,11 +327,25 @@ impl Drop for Kill {
     }
 }
 
-async fn run(con: &Connection, mut cmd: Command, root: &Path, slot: &Slot) -> Result<Option<Ran>> {
+/// With `late`, a future stores late rlibs, and the gate holds the
+/// linker until it has.
+async fn run(
+    con: &Connection,
+    store: &Store,
+    mut cmd: Command,
+    root: &Path,
+    slot: &Slot,
+    late: Option<(Gate, impl Future<Output = Result<()>>)>,
+) -> Result<Option<Ran>> {
+    let (mut gate, arrive) = late.unzip();
     let cpus = slot.grant.cpus.clone();
+    let gate_fd = gate.as_ref().map(Gate::fd);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     unsafe {
-        cmd.pre_exec(move || sys::pin(&cpus).map_err(io::Error::other));
+        cmd.pre_exec(move || {
+            sys::pin(&cpus).map_err(io::Error::other)?;
+            gate_fd.map_or(Ok(()), Gate::inherit)
+        });
     }
     let start = Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -313,21 +400,34 @@ async fn run(con: &Connection, mut cmd: Command, root: &Path, slot: &Slot) -> Re
     let mut eofs = 0;
     let mut exit = None;
     let mut front = None;
+    let mut arriving = arrive.is_some();
+    let mut arrive = pin!(OptionFuture::from(arrive));
     while eofs < 2 || exit.is_none() {
-        match rx.recv().await.context("sandbox threads stopped")? {
-            Ev::Stderr(line) => {
-                if protocol::is_artifact_line(&line) {
-                    if front.is_none() && protocol::is_metadata_line(&line) {
-                        let wall_us = start.elapsed().as_micros() as u64;
-                        front = Some(Front { wall_us, cpu_us: sys::tree_cpu_us(pid as u32) });
+        tokio::select! {
+            ev = rx.recv() => match ev.context("sandbox threads stopped")? {
+                Ev::Stderr(line) => {
+                    if protocol::is_artifact_line(&line) {
+                        if front.is_none() && protocol::is_metadata_line(&line) {
+                            let wall_us = start.elapsed().as_micros() as u64;
+                            front = Some(Front { wall_us, cpu_us: sys::tree_cpu_us(pid as u32) });
+                        }
+                        send_artifact(con, store, root, &line).await?;
                     }
-                    send_artifact(con, root, &line).await?;
+                    con.send_one(&FromServer::Stderr(line)).await?;
                 }
-                con.send_one(&FromServer::Stderr(line)).await?;
+                Ev::Stdout(data) => con.send_one(&FromServer::Stdout(data)).await?,
+                Ev::Eof => eofs += 1,
+                Ev::Exit(status, ru, instructions) => exit = Some((status, ru, instructions)),
+            },
+            arrived = &mut arrive, if arriving => {
+                arrived.context("guarded")??;
+                arriving = false;
+                if let Some(g) = &mut gate {
+                    g.open().await?;
+                }
             }
-            Ev::Stdout(data) => con.send_one(&FromServer::Stdout(data)).await?,
-            Ev::Eof => eofs += 1,
-            Ev::Exit(status, ru, instructions) => exit = Some((status, ru, instructions)),
+            asked = async { gate.as_mut().expect("guarded").ask().await },
+                if gate.as_ref().is_some_and(Gate::listening) => asked?,
         }
     }
     kill.0 = None;
@@ -342,7 +442,8 @@ async fn run(con: &Connection, mut cmd: Command, root: &Path, slot: &Slot) -> Re
     };
     let code = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     debug!("sandbox exited {code}");
-    con.send_one(&FromServer::Exit { code, ran }).await?;
+    let linker_waited_us = gate.map_or(0, |g| g.waited_us());
+    con.send_one(&FromServer::Exit { code, ran, linker_waited_us }).await?;
     Ok((code == 0).then_some(ran))
 }
 
@@ -351,24 +452,31 @@ struct Artifact {
     artifact: String,
 }
 
-/// Send the file an artifact line names, before the line.
-async fn send_artifact(con: &Connection, root: &Path, line: &[u8]) -> Result<()> {
+/// Send the file an artifact line names, before the line. A crate file
+/// stays in the store for jobs that read it later.
+async fn send_artifact(con: &Connection, store: &Store, root: &Path, line: &[u8]) -> Result<()> {
     let a: Artifact = serde_json::from_slice(line).context("artifact line")?;
     check(&a.artifact)?;
     let host = root.join(&a.artifact[1..]);
     let mut file = File::open(&host).with_context(|| format_compact!("opening {}", host.display()))?;
     let mode = file.metadata()?.permissions().mode() & 0o777;
     let path: ArcStr = a.artifact.as_str().into();
+    let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; CHUNK];
     loop {
         let n = file.read(&mut buf)?;
         let last = n < buf.len();
+        hasher.update(&buf[..n]);
         let data = Bytes::copy_from_slice(&buf[..n]);
         con.send_one(&FromServer::Output { path: path.clone(), mode, data, last }).await?;
         if last {
-            return Ok(());
+            break;
         }
     }
+    if [".rlib", ".rmeta", ".so"].iter().any(|ext| path.ends_with(ext)) {
+        store.adopt(&host, &Hash(*hasher.finalize().as_bytes()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

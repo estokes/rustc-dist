@@ -3,10 +3,11 @@ use crate::{
     classes::{self, Profile},
     config::{self, Config},
     farm::{self, Load, Member},
-    protocol::{self, Ask, Job, PROTOCOL, Ran, Reply, Unit},
-    remote::{self, Event, Outcome, ToServer},
+    protocol::{self, Ask, Job, PROTOCOL, Ran, Reads, Reply, Unit},
+    remote::{self, Event, Moved, Outcome, ToServer},
     sandbox::{self, Server},
     sched::{Admission, Msg, RemoteOutcome, RemoteSlot, Sched, Setup, Want},
+    stats::Transfer,
     sys,
     toolchain::{self, Keys},
 };
@@ -28,7 +29,7 @@ use std::{
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -46,6 +47,7 @@ struct Ctx {
     hashes: Hashes,
     /// Present when this box is part of a farm.
     subscriber: Option<Subscriber>,
+    remote_links: bool,
 }
 
 pub async fn run() -> Result<()> {
@@ -96,6 +98,7 @@ pub async fn run() -> Result<()> {
         keys: Keys::default(),
         hashes: Hashes::default(),
         subscriber,
+        remote_links: cfg.remote_links,
     });
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -289,7 +292,7 @@ async fn compile(
     job: Option<Job>,
 ) -> Result<()> {
     let mut want = match (&job, &ctx.subscriber) {
-        (Some(job), Some(_)) => {
+        (Some(job), Some(_)) if job.reads == Reads::Metadata || ctx.remote_links => {
             let keys = &ctx.keys;
             let rustc = PathBuf::from(job.rustc.as_str());
             match task::block_in_place(|| keys.key(&rustc)) {
@@ -372,10 +375,11 @@ async fn run_remote(
     r: RemoteSlot,
 ) -> Result<Remote> {
     let subscriber = ctx.subscriber.as_ref().context("not in a farm")?;
+    let start = Instant::now();
     let staged = task::block_in_place(|| remote::stage(job, &r.crates, &ctx.hashes))?;
     let offer = ToServer::Offer { unit: r.unit().clone(), key: r.key.clone(), target: r.target.clone(), class: r.class };
     let (etx, mut events) = mpsc::unbounded_channel();
-    let running = remote::run(subscriber, r.jobs.clone(), offer, job, &staged, |ev| {
+    let running = remote::run(subscriber, r.jobs.clone(), offer, job, &staged, &ctx.hashes, |ev| {
         etx.send(ev).map_err(|_| anyhow!("daemon connection gone"))
     });
     tokio::pin!(running);
@@ -414,12 +418,23 @@ async fn run_remote(
     }
     drop(handle);
     match outcome {
-        Ok(Outcome::Exit { code: 0, ran }) => {
+        Ok(Outcome::Exit { code: 0, ran, moved: Moved { bytes, linker_waited_us } }) => {
             for (stderr, data) in held {
                 protocol::send_async(sock, buf, &Reply::Output { stderr, data }).await?;
             }
             protocol::send_async(sock, buf, &Reply::Exit(0)).await?;
-            r.finish(RemoteOutcome::Done(ran));
+            let copy_us = (start.elapsed().as_micros() as u64).saturating_sub(ran.wall_us) + linker_waited_us;
+            let transfer = Transfer { sent_kb: bytes / 1024, copy_ms: copy_us / 1000 };
+            info!(
+                "{} on {}: compiled in {} ms, moving files took {} ms ({} kB sent, linker waited {} ms)",
+                r.unit().exact,
+                r.jobs,
+                ran.wall_us / 1000,
+                transfer.copy_ms,
+                transfer.sent_kb,
+                linker_waited_us / 1000
+            );
+            r.finish(RemoteOutcome::Done(ran, transfer));
             Ok(Remote::Done)
         }
         Ok(Outcome::Busy { version }) => {

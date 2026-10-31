@@ -7,7 +7,7 @@ use crate::{
         BoxStatus, ClassStatus, PROTOCOL, Ran, Reply, SpreadStatus, Status, Switching, Unit, UnitStatus,
         frame,
     },
-    stats::{Origin, Prediction, Sample, Stats},
+    stats::{Origin, Prediction, Sample, Stats, Transfer},
     sys::{self, BoxMemory},
 };
 use anyhow::{Context, Result};
@@ -156,7 +156,7 @@ pub struct Answer {
 }
 
 pub enum RemoteOutcome {
-    Done(Ran),
+    Done(Ran, Transfer),
     /// The box had no room, as its state at `version` will show.
     Busy { version: u64 },
     Failed,
@@ -930,9 +930,9 @@ impl Sched {
         let Some(r) = self.take_running(job) else { return };
         let Place::Remote { remote, .. } = r.place else { return };
         match outcome {
-            RemoteOutcome::Done(ran) => {
+            RemoteOutcome::Done(ran, transfer) => {
                 self.mismatches.remove(&unit.exact);
-                self.record(unit, &ran, r.rate, 0, Origin::Sent);
+                self.record(unit, &ran, r.rate, 0, Origin::Sent(transfer));
             }
             RemoteOutcome::Busy { version } => {
                 let rb = &mut self.remotes[remote];
@@ -1534,6 +1534,8 @@ impl Sched {
                     width_c: info.width_c,
                     wall_ms: info.wall_ms,
                     mem_kb: info.mem_kb,
+                    copy_ms: info.copy_ms,
+                    sent_kb: info.sent_kb,
                     rank_mi: ranks.get(key).copied(),
                 }
             })
@@ -2479,15 +2481,20 @@ mod test {
         let Admission::Remote(r) = admitted(h.submit_with("big", want())).await? else {
             bail!("not sent remote");
         };
-        r.finish(RemoteOutcome::Done(ran()));
+        r.finish(RemoteOutcome::Done(ran(), Transfer { sent_kb: 300, copy_ms: 40 }));
         let st = h.status().await;
+        let unit = |key: &str| st.units.iter().find(|u| u.key == key).unwrap();
         let runs = |key: &str| {
-            let u = st.units.iter().find(|u| u.key == key).unwrap();
+            let u = unit(key);
             (u.here, u.sent, u.served, u.rank_mi.is_some())
         };
         assert_eq!(runs("theirs"), (0, 0, 1, false), "not in this box's graph");
         assert_eq!(runs("mine"), (1, 0, 0, true));
         assert_eq!(runs("big"), (5, 1, 0, true));
+        // Histograms keep two significant figures.
+        assert_eq!(unit("big").copy_ms, Some(40));
+        assert!(unit("big").sent_kb.is_some_and(|kb| (297..=303).contains(&kb)), "{:?}", unit("big").sent_kb);
+        assert_eq!(unit("mine").copy_ms, None);
         Ok(())
     }
 

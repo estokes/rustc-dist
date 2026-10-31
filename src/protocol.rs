@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 6;
+pub const PROTOCOL: u32 = 7;
 const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under
@@ -46,6 +46,20 @@ pub struct Job {
     pub cwd: ArcStr,
     pub target: Option<ArcStr>,
     pub paths: JobPaths,
+    pub reads: Reads,
+}
+
+/// What a job reads of the crates below it.
+#[derive(Debug, Clone, PartialEq, Eq, Pack)]
+pub enum Reads {
+    /// Their metadata: the job builds a library.
+    Metadata,
+    /// Their metadata, and their rlibs once rustc runs `linker`, a program
+    /// it finds on `PATH`.
+    RlibsToLink { linker: ArcStr },
+    /// Their rlibs from the start: LTO, static libraries, dylibs, or a
+    /// linker named by its path.
+    Rlibs,
 }
 
 /// Paths as they appear in the arguments, possibly relative to `cwd`.
@@ -208,6 +222,10 @@ pub struct UnitStatus {
     pub width_c: u64,
     pub wall_ms: u64,
     pub mem_kb: u64,
+    /// Medians of sent runs: time spent moving files rather than
+    /// compiling, and inputs sent.
+    pub copy_ms: Option<u64>,
+    pub sent_kb: Option<u64>,
     /// Its cost plus the costliest chain of jobs that depend on it, if it
     /// is in this box's build graph.
     pub rank_mi: Option<u64>,

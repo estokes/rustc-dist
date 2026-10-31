@@ -1,6 +1,6 @@
 use crate::{
     blobs::{Hash, Hashes},
-    protocol::{self, Job, Ran, Unit},
+    protocol::{self, Job, Ran, Reads, Unit},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
@@ -16,6 +16,8 @@ use std::{
     io::{Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
+    pin::pin,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use tokio::time;
@@ -32,12 +34,30 @@ pub struct FileEntry {
     pub hash: Hash,
 }
 
+/// An rlib a job reads only once rustc runs its linker. Until then a
+/// stand-in holding just its metadata, the blob `meta`, takes its place.
+#[derive(Debug, Clone, Pack)]
+pub struct Rlib {
+    pub path: ArcStr,
+    pub hash: Hash,
+    pub meta: Hash,
+}
+
+/// Rlibs that may arrive while rustc runs, and the linker, a program on
+/// `PATH`, that waits for them.
+#[derive(Debug, Clone, Pack)]
+pub struct Late {
+    pub linker: ArcStr,
+    pub rlibs: Vec<Rlib>,
+}
+
 #[derive(Debug, Pack)]
 pub enum ToServer {
     /// Run `unit` with the toolchain `key`, pinned to `class`, or with
     /// none on every CPU.
     Offer { unit: Unit, key: ArcStr, target: Option<ArcStr>, class: Option<u32> },
-    Manifest { files: Vec<FileEntry>, dirs: Vec<ArcStr> },
+    /// `files` are in place before rustc starts; `late` rlibs may follow.
+    Manifest { files: Vec<FileEntry>, dirs: Vec<ArcStr>, late: Option<Late> },
     Chunk { hash: Hash, data: Bytes, last: bool },
     Run { args: Vec<ArcStr>, env: Vec<(ArcStr, ArcStr)>, cwd: ArcStr },
 }
@@ -48,15 +68,17 @@ pub enum FromServer {
     /// that reflects the answer.
     Accepted { version: u64 },
     Busy { version: u64 },
-    /// The blobs the server lacks.
-    Need(Vec<Hash>),
+    /// The blobs the server lacks: those to send before `Run`, and late
+    /// rlibs to send after it.
+    Need { now: Vec<Hash>, later: Vec<Hash> },
     Stdout(Bytes),
     /// One line of rustc's stderr. An artifact line comes after the file
     /// it names.
     Stderr(Bytes),
     Output { path: ArcStr, mode: u32, data: Bytes, last: bool },
-    /// `ran` is the server's measurement, whatever the code.
-    Exit { code: i32, ran: Ran },
+    /// `ran` is the server's measurement, whatever the code, and
+    /// `linker_waited_us` how long its linker waited for late rlibs.
+    Exit { code: i32, ran: Ran, linker_waited_us: u64 },
     Failed(ArcStr),
 }
 
@@ -65,7 +87,10 @@ pub enum FromServer {
 pub struct Staged {
     pub files: Vec<FileEntry>,
     pub dirs: Vec<ArcStr>,
+    pub late: Option<Late>,
     pub outputs: Vec<PathBuf>,
+    /// Where to read each blob the server may ask for.
+    blobs: HashMap<Hash, ArcStr>,
 }
 
 /// `p` made absolute against `cwd`, with `.` and `..` resolved.
@@ -120,23 +145,74 @@ fn system(path: &Path) -> bool {
     path.components().nth(1).is_some_and(|c| SYSTEM.iter().any(|s| c.as_os_str() == *s))
 }
 
+fn utf8(path: &Path) -> Result<ArcStr> {
+    path.to_str().map(ArcStr::from).with_context(|| format_compact!("{} is not utf-8", path.display()))
+}
+
 struct Collect<'a> {
     hashes: &'a Hashes,
     files: Vec<FileEntry>,
+    rlibs: Vec<Rlib>,
+    blobs: HashMap<Hash, ArcStr>,
     dirs: HashSet<PathBuf>,
     seen: HashSet<PathBuf>,
     walked: u64,
 }
 
-impl Collect<'_> {
+impl<'a> Collect<'a> {
+    fn new(hashes: &'a Hashes) -> Self {
+        Self {
+            hashes,
+            files: Vec::new(),
+            rlibs: Vec::new(),
+            blobs: HashMap::new(),
+            dirs: HashSet::new(),
+            seen: HashSet::new(),
+            walked: 0,
+        }
+    }
+
+    fn blob(&mut self, path: &Path) -> Result<(ArcStr, Hash)> {
+        let s = utf8(path)?;
+        let (hash, _) = self.hashes.get(path)?;
+        self.blobs.insert(hash, s.clone());
+        Ok((s, hash))
+    }
+
     fn file(&mut self, path: PathBuf) -> Result<()> {
         if system(&path) || !self.seen.insert(path.clone()) {
             return Ok(());
         }
-        let s = path.to_str().with_context(|| format_compact!("{} is not utf-8", path.display()))?;
-        let (hash, _) = self.hashes.get(&path)?;
-        self.files.push(FileEntry { path: ArcStr::from(s), hash });
+        let (path, hash) = self.blob(&path)?;
+        self.files.push(FileEntry { path, hash });
         Ok(())
+    }
+
+    /// A crate below the job, named by its `.rmeta`, `.rlib` or `.so`. A
+    /// job that links reads the rlib, which may come late if there is
+    /// metadata to stand in for it.
+    fn krate(&mut self, path: PathBuf, reads: &Reads) -> Result<()> {
+        let rlib = match path.extension() {
+            Some(e) if e == "rmeta" || e == "rlib" => path.with_extension("rlib"),
+            _ => return self.file(path),
+        };
+        match reads {
+            Reads::Metadata => self.file(path),
+            Reads::Rlibs => self.file(rlib),
+            Reads::RlibsToLink { .. } => {
+                let meta = rlib.with_extension("rmeta");
+                if !meta.is_file() {
+                    return self.file(rlib);
+                }
+                if !self.seen.insert(rlib.clone()) {
+                    return Ok(());
+                }
+                let (_, meta) = self.blob(&meta)?;
+                let (path, hash) = self.blob(&rlib)?;
+                self.rlibs.push(Rlib { path, hash, meta });
+                Ok(())
+            }
+        }
     }
 
     fn dir(&mut self, path: PathBuf) {
@@ -184,7 +260,7 @@ impl Collect<'_> {
 pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
     let cwd = PathBuf::from(job.cwd.as_str());
     let at = |p: &str| absolute(&cwd, p);
-    let mut c = Collect { hashes, files: Vec::new(), dirs: HashSet::new(), seen: HashSet::new(), walked: 0 };
+    let mut c = Collect::new(hashes);
     c.dir(cwd.clone());
     let manifest = env(job, "CARGO_MANIFEST_DIR").map(at);
     match fs::read_to_string(at(&job.paths.dep_info)) {
@@ -218,7 +294,7 @@ pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
         c.walk(&at(dir), false)?;
     }
     for file in crates {
-        c.file(at(file))?;
+        c.krate(at(file), &job.reads)?;
     }
     let out_dir = at(&job.paths.out_dir);
     let mut outputs = vec![out_dir.clone()];
@@ -233,12 +309,12 @@ pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
     if let Some(m) = manifest {
         c.dir(m);
     }
-    let dirs = c
-        .dirs
-        .into_iter()
-        .map(|d| d.to_str().map(ArcStr::from).with_context(|| format_compact!("{} is not utf-8", d.display())))
-        .collect::<Result<_>>()?;
-    Ok(Staged { files: c.files, dirs, outputs })
+    let dirs = c.dirs.iter().map(|d| utf8(d)).collect::<Result<_>>()?;
+    let late = match &job.reads {
+        Reads::RlibsToLink { linker } if !c.rlibs.is_empty() => Some(Late { linker: linker.clone(), rlibs: c.rlibs }),
+        _ => None,
+    };
+    Ok(Staged { files: c.files, dirs, late, outputs, blobs: c.blobs })
 }
 
 pub enum Event {
@@ -252,17 +328,26 @@ pub enum Event {
 
 pub enum Outcome {
     Busy { version: u64 },
-    Exit { code: i32, ran: Ran },
+    Exit { code: i32, ran: Ran, moved: Moved },
+}
+
+/// What moving a job's files took that compiling didn't.
+pub struct Moved {
+    /// Of inputs sent.
+    pub bytes: u64,
+    /// How long the linker waited for rlibs still on their way.
+    pub linker_waited_us: u64,
 }
 
 /// Run a staged job on the box listening at `jobs`. `sink` gets rustc's
-/// output as it arrives.
+/// output as it arrives. The hashes of the outputs go in `hashes`.
 pub async fn run(
     subscriber: &Subscriber,
     jobs: NPath,
     offer: ToServer,
     job: &Job,
     staged: &Staged,
+    hashes: &Hashes,
     mut sink: impl FnMut(Event) -> Result<()>,
 ) -> Result<Outcome> {
     let con = time::timeout(Duration::from_secs(10), Connection::connect(subscriber, jobs.clone()))
@@ -276,31 +361,76 @@ pub async fn run(
         FromServer::Failed(why) => bail!("{jobs}: {why}"),
         m => bail!("{jobs}: unexpected {m:?}"),
     }
-    con.send_one(&ToServer::Manifest { files: staged.files.clone(), dirs: staged.dirs.clone() })?;
+    let manifest =
+        ToServer::Manifest { files: staged.files.clone(), dirs: staged.dirs.clone(), late: staged.late.clone() };
+    con.send_one(&manifest)?;
     con.flush().await?;
-    let need = match con.recv_one::<FromServer>().await? {
-        FromServer::Need(need) => need,
+    let (now, later) = match con.recv_one::<FromServer>().await? {
+        FromServer::Need { now, later } => (now, later),
         FromServer::Failed(why) => bail!("{jobs}: {why}"),
         m => bail!("{jobs}: unexpected {m:?}"),
     };
-    let by_hash: HashMap<Hash, &ArcStr> = staged.files.iter().map(|f| (f.hash, &f.path)).collect();
+    let sent = AtomicU64::new(0);
     let mut buf = vec![0u8; CHUNK];
-    for hash in need {
-        let path = by_hash.get(&hash).with_context(|| format_compact!("server asked for unknown {hash}"))?;
-        let mut file = File::open(path.as_str()).with_context(|| format_compact!("opening {path}"))?;
-        loop {
-            let n = file.read(&mut buf)?;
-            let last = n < buf.len();
-            con.send_one(&ToServer::Chunk { hash, data: Bytes::copy_from_slice(&buf[..n]), last })?;
-            con.flush().await?;
-            if last {
-                break;
-            }
-        }
+    for hash in now {
+        send_blob(&con, staged, hash, &mut buf, &sent).await?;
     }
     con.send_one(&ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
     con.flush().await?;
-    let mut writing: Option<(PathBuf, PathBuf, File)> = None;
+    let mut sending = pin!(async {
+        for hash in later {
+            send_blob(&con, staged, hash, &mut buf, &sent).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let mut receiving = pin!(receive(&con, &jobs, staged, hashes, &mut sink));
+    let mut sending_done = false;
+    let (code, ran, linker_waited_us) = loop {
+        tokio::select! {
+            exit = &mut receiving => break exit?,
+            r = &mut sending, if !sending_done => {
+                r?;
+                sending_done = true;
+            }
+        }
+    };
+    Ok(Outcome::Exit { code, ran, moved: Moved { bytes: sent.load(Ordering::Relaxed), linker_waited_us } })
+}
+
+/// Send the blob `hash`, adding its size to `sent`.
+pub async fn send_blob(con: &Connection, staged: &Staged, hash: Hash, buf: &mut [u8], sent: &AtomicU64) -> Result<()> {
+    let path = staged.blobs.get(&hash).with_context(|| format_compact!("server asked for unknown {hash}"))?;
+    let mut file = File::open(path.as_str()).with_context(|| format_compact!("opening {path}"))?;
+    loop {
+        let n = file.read(buf)?;
+        let last = n < buf.len();
+        con.send_one(&ToServer::Chunk { hash, data: Bytes::copy_from_slice(&buf[..n]), last })?;
+        con.flush().await?;
+        sent.fetch_add(n as u64, Ordering::Relaxed);
+        if last {
+            return Ok(());
+        }
+    }
+}
+
+/// An output arriving in chunks, written beside its destination.
+struct Writing {
+    dest: PathBuf,
+    tmp: PathBuf,
+    file: File,
+    hasher: blake3::Hasher,
+}
+
+/// rustc's output until it exits: its code, the server's measurement and
+/// how long its linker waited.
+async fn receive(
+    con: &Connection,
+    jobs: &NPath,
+    staged: &Staged,
+    hashes: &Hashes,
+    sink: &mut impl FnMut(Event) -> Result<()>,
+) -> Result<(i32, Ran, u64)> {
+    let mut writing: Option<Writing> = None;
     loop {
         match con.recv_one::<FromServer>().await? {
             FromServer::Output { path, mode, data, last } => {
@@ -311,14 +441,16 @@ pub async fn run(
                     }
                     let tmp = dest.with_extension(format_compact!("rustc-dist-{}", std::process::id()).as_str());
                     let file = File::create(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?;
-                    writing = Some((dest, tmp, file));
+                    writing = Some(Writing { dest, tmp, file, hasher: blake3::Hasher::new() });
                 }
-                let (dest, tmp, file) = writing.as_mut().ok_or_else(|| anyhow!("no output open"))?;
-                file.write_all(&data)?;
+                let w = writing.as_mut().ok_or_else(|| anyhow!("no output open"))?;
+                w.file.write_all(&data)?;
+                w.hasher.update(&data);
                 if last {
-                    file.set_permissions(fs::Permissions::from_mode(mode))?;
-                    fs::rename(&*tmp, &*dest).with_context(|| format_compact!("writing {}", dest.display()))?;
-                    writing = None;
+                    let w = writing.take().expect("open");
+                    w.file.set_permissions(fs::Permissions::from_mode(mode))?;
+                    fs::rename(&w.tmp, &w.dest).with_context(|| format_compact!("writing {}", w.dest.display()))?;
+                    hashes.insert(&w.dest, Hash(*w.hasher.finalize().as_bytes()))?;
                 }
             }
             FromServer::Stderr(line) => {
@@ -326,13 +458,12 @@ pub async fn run(
                 sink(if artifact { Event::Artifact(line) } else { Event::Stderr(line) })?;
             }
             FromServer::Stdout(data) => sink(Event::Stdout(data))?,
-            FromServer::Exit { code, ran } => return Ok(Outcome::Exit { code, ran }),
+            FromServer::Exit { code, ran, linker_waited_us } => return Ok((code, ran, linker_waited_us)),
             FromServer::Failed(why) => bail!("{jobs}: {why}"),
             m => bail!("{jobs}: unexpected {m:?}"),
         }
     }
 }
-
 
 #[cfg(test)]
 mod test {
@@ -356,12 +487,45 @@ mod test {
             fs::write(dir.join(f), "x")?;
         }
         let hashes = Hashes::default();
-        let mut c = Collect { hashes: &hashes, files: Vec::new(), dirs: HashSet::new(), seen: HashSet::new(), walked: 0 };
+        let mut c = Collect::new(&hashes);
         c.walk(&dir, true)?;
         let mut got: Vec<String> =
             c.files.iter().map(|f| f.path.trim_start_matches(dir.to_str().unwrap()).to_string()).collect();
         got.sort();
         assert_eq!(got, ["/src/lib.rs", "/src/target/apple.rs"]);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn crates_a_job_links_come_late_when_metadata_can_stand_in() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-krate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        for f in ["libx.rlib", "libx.rmeta", "liby.rlib", "libz.so"] {
+            fs::write(dir.join(f), f)?;
+        }
+        let hashes = Hashes::default();
+        let stage = |reads: &Reads| -> Result<Collect<'_>> {
+            let mut c = Collect::new(&hashes);
+            for f in ["libx.rmeta", "liby.rlib", "libz.so"] {
+                c.krate(dir.join(f), reads)?;
+            }
+            Ok(c)
+        };
+        let names = |c: &Collect| -> Vec<String> {
+            c.files.iter().map(|f| f.path.rsplit('/').next().unwrap().to_string()).collect()
+        };
+        let link = stage(&Reads::RlibsToLink { linker: "cc".into() })?;
+        assert_eq!(names(&link), ["liby.rlib", "libz.so"], "y has no metadata to stand in for it");
+        let [x] = &link.rlibs[..] else { panic!("{:?}", link.rlibs) };
+        assert!(x.path.ends_with("/libx.rlib"));
+        assert_eq!(x.meta, hashes.get(&dir.join("libx.rmeta"))?.0);
+        assert_eq!(link.blobs[&x.meta].as_str(), dir.join("libx.rmeta").to_str().unwrap(), "meta is sent from its file");
+        let rlibs = stage(&Reads::Rlibs)?;
+        assert_eq!(names(&rlibs), ["libx.rlib", "liby.rlib", "libz.so"]);
+        assert!(rlibs.rlibs.is_empty());
+        assert_eq!(names(&stage(&Reads::Metadata)?), ["libx.rmeta", "liby.rlib", "libz.so"]);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

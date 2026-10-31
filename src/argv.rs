@@ -1,5 +1,5 @@
-use crate::protocol::{Dep, JobPaths, Unit};
-use arcstr::ArcStr;
+use crate::protocol::{Dep, JobPaths, Reads, Unit};
+use arcstr::{ArcStr, literal};
 use compact_str::format_compact;
 use std::{ffi::OsStr, path::Path};
 
@@ -11,11 +11,16 @@ pub enum Invocation {
 pub struct Compile {
     pub name: ArcStr,
     pub unit: Unit,
-    /// Present when the job builds only lib or rlib crates with plain
-    /// rustc, without incremental state or host-specific codegen, so
-    /// another box with the same toolchain produces the same output.
-    pub portable: Option<JobPaths>,
+    /// Present when the job runs plain rustc without incremental state or
+    /// host-specific codegen, so another box with the same toolchain
+    /// produces the same output.
+    pub portable: Option<Portable>,
     pub target: Option<ArcStr>,
+}
+
+pub struct Portable {
+    pub paths: JobPaths,
+    pub reads: Reads,
 }
 
 /// `args[0]` is the compiler cargo asked for: rustc, or clippy-driver
@@ -30,15 +35,10 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     let mut test = false;
     let mut out_dir_arg = None;
     let mut target = None;
-    let mut linkless = true;
-    let mut typed = false;
+    let mut types = CrateTypes::default();
     let mut argfile = false;
     let mut deps = Vec::new();
     let mut paths = JobPaths::default();
-    let mut crate_type = |t: &str, linkless: &mut bool| {
-        typed = true;
-        *linkless &= t.split(',').all(|t| t == "lib" || t == "rlib");
-    };
     let mut args = args[1..].iter().filter_map(|a| a.as_ref().to_str());
     while let Some(arg) = args.next() {
         match arg {
@@ -46,7 +46,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
             _ if arg.starts_with("--print") => return Invocation::Probe,
             "--test" => test = true,
             "--crate-name" => crate_name = args.next(),
-            "--crate-type" => crate_type(args.next().unwrap_or("bin"), &mut linkless),
+            "--crate-type" => types.add(args.next().unwrap_or("bin")),
             "--emit" => emit = args.next().unwrap_or(""),
             "--out-dir" => out_dir_arg = args.next(),
             "--target" => target = args.next(),
@@ -68,7 +68,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
                 } else if let Some(v) = arg.strip_prefix("--crate-name=") {
                     crate_name = Some(v);
                 } else if let Some(v) = arg.strip_prefix("--crate-type=") {
-                    crate_type(v, &mut linkless);
+                    types.add(v);
                 } else if let Some(v) = arg.strip_prefix("--emit=") {
                     emit = v;
                 } else if let Some(v) = arg.strip_prefix("--out-dir=") {
@@ -99,13 +99,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     if let Some(dir) = out_dir.and_then(|d| Path::new(d).parent()) {
         deps.extend(build_group(dir).map(|id| Dep { id, file: None }));
     }
-    let portable = driver == "rustc"
-        && typed
-        && linkless
-        && !test
-        && !argfile
-        && !cg.incremental
-        && !cg.native_cpu;
+    let portable = driver == "rustc" && !argfile && !cg.incremental && !cg.native_cpu && !cg.split_debuginfo;
     let portable = match out_dir_arg {
         Some(out_dir) if portable => {
             paths.dep_info = format_compact!("{out_dir}/{name}{}.d", cg.extra).as_str().into();
@@ -113,7 +107,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
             paths.outputs.extend(
                 emit.split(',').filter_map(|e| e.split_once('=')).map(|(_, p)| ArcStr::from(p)),
             );
-            Some(paths)
+            Some(Portable { paths, reads: types.reads(test, &cg, target) })
         }
         _ => None,
     };
@@ -131,14 +125,58 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     })
 }
 
+/// The crate types a job builds. None given means a binary.
+#[derive(Default)]
+struct CrateTypes {
+    given: bool,
+    /// An executable or proc macro, which links the rlibs below it.
+    links: bool,
+    /// A dylib or static library, which reads the rlibs' object code
+    /// before linking.
+    reads_objects: bool,
+}
+
+impl CrateTypes {
+    fn add(&mut self, types: &str) {
+        self.given = true;
+        for t in types.split(',') {
+            match t {
+                "lib" | "rlib" => (),
+                "bin" | "proc-macro" => self.links = true,
+                _ => self.reads_objects = true,
+            }
+        }
+    }
+
+    /// The default linker is found on `PATH` as `cc` for GNU targets.
+    fn reads(&self, test: bool, cg: &Codegen, target: Option<&str>) -> Reads {
+        let links = self.links || test || !self.given;
+        if self.reads_objects || links && cg.lto {
+            return Reads::Rlibs;
+        }
+        if !links {
+            return Reads::Metadata;
+        }
+        match cg.linker {
+            Some(l) if !l.contains('/') => Reads::RlibsToLink { linker: ArcStr::from(l) },
+            None if target.is_none_or(|t| t.ends_with("-linux-gnu")) => Reads::RlibsToLink { linker: literal!("cc") },
+            _ => Reads::Rlibs,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Codegen<'a> {
     metadata: &'a str,
     extra: &'a str,
     opt: &'a str,
     units: Option<u32>,
+    linker: Option<&'a str>,
+    lto: bool,
     incremental: bool,
     native_cpu: bool,
+    /// Debug info left in files rustc doesn't report as artifacts.
+    split_debuginfo: bool,
 }
 
 impl<'a> Codegen<'a> {
@@ -151,6 +189,14 @@ impl<'a> Codegen<'a> {
             self.opt = v;
         } else if let Some(v) = arg.strip_prefix("codegen-units=") {
             self.units = v.parse().ok();
+        } else if let Some(v) = arg.strip_prefix("linker=") {
+            self.linker = Some(v);
+        } else if arg == "lto" {
+            self.lto = true;
+        } else if let Some(v) = arg.strip_prefix("lto=") {
+            self.lto = !matches!(v, "off" | "no" | "n" | "false");
+        } else if let Some(v) = arg.strip_prefix("split-debuginfo=") {
+            self.split_debuginfo = v != "off";
         } else if arg == "incremental" || arg.starts_with("incremental=") {
             self.incremental = true;
         } else if arg == "target-cpu=native" {
@@ -285,32 +331,55 @@ mod test {
         assert_eq!(lib.deps, vec![Dep { id: script.id, file: None }]);
     }
 
+    fn reads(args: &[&str]) -> Option<Reads> {
+        compile(args, None).portable.map(|p| p.reads)
+    }
+
     #[test]
-    fn only_portable_lib_builds_may_go_remote() {
+    fn what_portable_jobs_read() {
         let lib = [
             "rustc", "--crate-name", "a", "--crate-type", "lib", "--emit=dep-info,metadata,link",
             "-C", "extra-filename=-77", "--out-dir", "/t/deps",
         ];
-        assert!(compile(&lib, None).portable.is_some());
         let with = |extra: &[&str]| {
             let mut args = lib.to_vec();
             args.extend_from_slice(extra);
-            compile(&args, None)
+            reads(&args)
         };
-        assert!(with(&["-C", "incremental=/t/inc"]).portable.is_none());
-        assert!(with(&["-Ctarget-cpu=native"]).portable.is_none());
-        assert!(with(&["--test"]).portable.is_none());
-        assert!(with(&["--crate-type", "proc-macro"]).portable.is_none());
-        assert!(with(&["@/tmp/args"]).portable.is_none());
-        assert!(with(&["--crate-type=rlib"]).portable.is_some());
-        assert_eq!(
-            with(&["--target", "aarch64-unknown-linux-gnu"]).target.as_deref(),
-            Some("aarch64-unknown-linux-gnu")
-        );
-        let no_type = ["rustc", "--crate-name", "b", "src/main.rs", "--out-dir", "/t"];
-        assert!(compile(&no_type, None).portable.is_none(), "no crate type means bin");
+        let cc = Some(Reads::RlibsToLink { linker: literal!("cc") });
+        assert_eq!(reads(&lib), Some(Reads::Metadata));
+        assert_eq!(with(&["--crate-type=rlib"]), Some(Reads::Metadata));
+        assert_eq!(with(&["--test"]), cc);
+        assert_eq!(with(&["--crate-type", "proc-macro"]), cc);
+        assert_eq!(with(&["--crate-type", "bin", "-C", "lto=off"]), cc);
+        let bin = ["rustc", "--crate-name", "b", "src/main.rs", "--out-dir", "/t"];
+        assert_eq!(reads(&bin), cc, "no crate type means bin");
+        let clang = Some(Reads::RlibsToLink { linker: literal!("clang") });
+        assert_eq!(with(&["--crate-type", "bin", "-C", "linker=clang"]), clang);
+        for rlibs in [
+            &["--crate-type", "bin", "-C", "lto"][..],
+            &["--crate-type", "bin", "-Clto=thin"],
+            &["--crate-type", "bin", "-C", "linker=/usr/bin/clang"],
+            &["--crate-type", "bin", "--target", "wasm32-unknown-unknown"],
+            &["--crate-type", "staticlib"],
+            &["--crate-type", "cdylib"],
+        ] {
+            assert_eq!(with(rlibs), Some(Reads::Rlibs), "{rlibs:?}");
+        }
+        assert_eq!(with(&["--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu"]), cc);
+        for local in [
+            &["-C", "incremental=/t/inc"][..],
+            &["-Ctarget-cpu=native"],
+            &["@/tmp/args"],
+            &["-C", "split-debuginfo=unpacked"],
+        ] {
+            assert_eq!(with(local), None, "{local:?}");
+        }
+        assert_eq!(with(&["-C", "split-debuginfo=off"]), Some(Reads::Metadata));
+        let cross = ["rustc", "--crate-name", "a", "--target", "aarch64-unknown-linux-gnu", "--out-dir", "/t"];
+        assert_eq!(compile(&cross, None).target.as_deref(), Some("aarch64-unknown-linux-gnu"));
         let clippy = ["clippy-driver", "rustc", "--crate-name", "a", "--crate-type", "lib", "--out-dir", "/t"];
-        assert!(compile(&clippy, None).portable.is_none());
+        assert_eq!(reads(&clippy), None);
     }
 
     #[test]
@@ -323,7 +392,7 @@ mod test {
             ],
             None,
         );
-        let p = c.portable.unwrap();
+        let p = c.portable.unwrap().paths;
         assert_eq!(p.out_dir.as_str(), "/t/deps");
         assert_eq!(p.dep_info.as_str(), "/t/deps/a-77.d");
         assert_eq!(p.sources, ["a/src/lib.rs"]);

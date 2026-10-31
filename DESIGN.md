@@ -8,8 +8,9 @@
 - Produce the same output a local build would: paths, `env!()`, pipelining.
 - Per-project control over what stays local.
 
-Non-goals: caching compile results, distributing link steps, boxes shared by
-several users (see open questions).
+Non-goals: caching compile results (a server keeps the crate files it builds
+only so later jobs needn't send them), boxes shared by several users (see open
+questions).
 
 ## Process model
 
@@ -316,8 +317,10 @@ A job is local-only if:
 - it is named in `local`, or the cost table has learned to keep it local
   (remote-pinned);
 - argv[0] is not a rustc (e.g. `clippy-driver`);
-- its crate type links (bin, test, dylib, cdylib, proc-macro, staticlib);
-- it uses `-C target-cpu=native`; or
+- it links and `remote_links` is off;
+- it uses `-C target-cpu=native`;
+- it splits debug info (`-C split-debuginfo` other than `off`) into files
+  rustc doesn't report as artifacts, so they wouldn't come back; or
 - no server has a matching toolchain.
 
 ### History
@@ -372,8 +375,9 @@ for memory.
 
 `status` lists every unit the box has run, with runs split three ways: this
 box's builds run here, this box's builds run elsewhere, and other boxes'
-builds run here. Units outside this box's build graph have no rank. Each class
-shows this box's jobs, other boxes' jobs and free tokens.
+builds run here. Units outside this box's build graph have no rank. Units sent
+elsewhere also show the median time their sent runs spent on files and the MB
+they sent. Each class shows this box's jobs, other boxes' jobs and free tokens.
 
 ### Inputs
 
@@ -390,8 +394,12 @@ Inputs are addressed by content. The client daemon caches
   libraries get bundled into rlibs.
 - Crates: the `--extern` files plus, through the build graph, those of every
   crate below them, since rustc loads the metadata of indirect dependencies.
-  If a crate below was never seen compiling, its dependencies are unknown and
-  the job stays local.
+  The walk stops at proc macros: their dependencies are linked into the
+  `.so`, and rustc never loads them (checked on this box, for a library using
+  a proc macro and a binary linking that library). If a crate below was never
+  seen compiling, its dependencies are unknown and the job stays local. A job
+  that links reads every crate's rlib rather than its `.rmeta`; see "Linking"
+  below.
 - Nothing under `/usr`, `/etc`, `/lib*`, `/bin`, `/sbin`, `/proc`, `/dev`,
   `/sys` or `/run`. The sandbox mounts the server's own, and a server needs its
   own system libraries anyway.
@@ -424,6 +432,41 @@ Because the paths are the client's, nothing is rewritten. Argv, env
 (`env!("CARGO_MANIFEST_DIR")`), diagnostics, dep-info, debuginfo and panic
 locations all name client paths.
 
+### Linking
+
+Binaries, tests, proc macros and build scripts link the rlibs below them, so
+another box needs every one of them. Until it links, though, rustc reads only
+each rlib's metadata (its `lib.rmeta` member), and rustc and the linker `mmap`
+their inputs, so they can't read from pipes. So the copy overlaps the compile:
+
+- For each rlib whose `.rmeta` is beside it on the client, the manifest lists
+  the rlib with the hash of that `.rmeta`. A server that lacks the rlib asks
+  for the `.rmeta` before rustc starts and the rlib after, and until it comes
+  puts a stand-in at the rlib's path: an archive holding just the `.rmeta`
+  as its `lib.rmeta` member. Rustc accepts raw metadata there.
+- The sandbox puts a stand-in linker, a short shell script, first on `PATH`
+  (`/run/rustc-dist/bin`), named for the linker rustc will run: `-C linker`,
+  or `cc`. It inherits one end of a socket pair as fd 9, writes a byte to say
+  it is waiting, and reads until the server shuts its end, which the server
+  does once every late rlib has replaced its stand-in (by rename, so a reader
+  sees one file or the other). Then it runs the next program of that name on
+  `PATH`. Rustc puts its sysroot directories first on the linker's `PATH`,
+  which hold no `cc`.
+- The client sends the late rlibs while it receives rustc's output.
+
+Without LTO, rustc passes rlibs to the linker by path and reads none of
+their object code itself. LTO, static libraries and dylibs do read it, as
+does a linker named by its path (it can't be put behind the stand-in) or a
+non-GNU target, whose default linker isn't `cc`: those jobs receive every
+rlib before rustc starts. So does an rlib with no `.rmeta` beside it. An rlib
+the server already has is placed at once.
+
+Each sent run records the bytes it sent and the time it spent other than
+compiling: staging, sending inputs before rustc starts, the linker waiting at
+the gate, and receiving the last outputs. `status` shows their medians per
+unit next to its wall time, so it shows whether sending a link job pays off.
+Linking on other boxes can be turned off with `remote_links = false`.
+
 ### Outputs and pipelining
 
 Cargo pipelines builds. It passes `--emit=dep-info,metadata,link
@@ -433,9 +476,14 @@ dep-info, the rmeta and the rlib.
 
 The server reads rustc's stderr line by line. On an artifact line it sends the
 file, then the line. The client writes the file (temp plus rename, keeping the
-server's mode) and forwards the line to the wrapper at once. All other output
-is held until rustc exits. The client accepts outputs only directly in
-`--out-dir` and explicit `--emit`/`-o` directories.
+server's mode), records its hash so staging a later job needn't read it, and
+forwards the line to the wrapper at once. All other output is held until rustc
+exits. The client accepts outputs only directly in `--out-dir` and explicit
+`--emit`/`-o` directories.
+
+The server keeps every `.rlib`, `.rmeta` and `.so` it builds in its blob
+store, hard linked from the job's tree. A job whose dependencies built on the
+same box has little to send: on a warm box, a binary sends its own sources.
 
 ### Failure
 
@@ -453,7 +501,8 @@ Config is real TOML (`toml` + serde), parsed into two separate structs.
 
 - User, `~/.config/rustc-dist.toml`: `compressed_swap_share`, `tokens_per_cpu`,
   `calibration_seconds`, and for a farm `base` (the netidx path every box
-  publishes under), `name` (the host name by default) and `blob_cache_gb`.
+  publishes under), `name` (the host name by default), `blob_cache_gb` and
+  `remote_links` (on by default).
   Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit
   those to override them. The netidx config is netidx's own (`NETIDX_CFG` or
   its default paths).
@@ -468,7 +517,8 @@ Config is real TOML (`toml` + serde), parsed into two separate structs.
 Anyone who can open a job channel can run code as the server user, because
 proc macros are client-supplied `.so` files. Three things limit that: netidx
 permissions on `BASE`, a bwrap sandbox with no network and no server home, and
-the client-side check on output paths.
+the client-side check on output paths. The client names the program the
+stand-in linker stands in for; the server accepts only a plain file name.
 
 ## Incremental builds
 
@@ -539,29 +589,20 @@ libraries and linker, kept so by the sysadmin.
   the most free capacity, else waits here.
 - Light jobs choose among classes by slack, as before.
 
-### Stage 3: binaries on other boxes, artifacts cached
+### Stage 3: binaries on other boxes, artifacts cached (built 2026-10-31)
 
-- Binaries, tests and proc macros become portable. They need every rlib
-  below them, which the build graph lists, and the server's linker, which
-  is the same as the client's by assumption.
-- A server keeps the outputs it builds in its blob store, so a binary
-  linked on the box that built its dependencies has little to receive.
-- The copy can overlap the compile. Rustc and the linker `mmap` their
-  inputs, so they can't read from pipes, and rustc maps every dependency
-  when it starts. But until the link, rustc reads only a dependency's
-  metadata. Checked on this box: a binary built against rlibs holding only
-  the dependency's `.rmeta` (as an archive's `lib.rmeta` member), with a
-  stand-in linker that swaps in the full rlibs before running the real one,
-  links and runs, including a dependency that links zlib (rustc still passed
-  `-lz`, which it reads from the metadata). So a server starts rustc once
-  sources and metadata are in place, receives the object code during
-  codegen, and the stand-in linker waits for it. The full rlib's second
-  member, `lib.rmeta-link`, was missing from the test rlibs without effect;
-  real projects need to confirm that. LTO, staticlibs and dylibs read the
-  object code earlier and wait for the full copy.
-- Whether the copy pays off is to be measured: each remote job records the
-  bytes it sent and the time spent sending them, next to the compile time.
-  Remote binaries have their own switch.
+- Binaries, tests, proc macros and build scripts go to other boxes like
+  libraries. They need every rlib below them, which the build graph lists,
+  and the server's linker, which is the same as the client's by assumption.
+- A server keeps the crate files it builds in its blob store.
+- The copy overlaps the compile, behind stand-in rlibs and a stand-in linker
+  (see "Linking" above). Checked by the end-to-end test: a binary built
+  against a stand-in for a dependency's rlib that the client sends two
+  seconds late links once it arrives, and runs. A stand-in has no code, so
+  linking it fails; that is how the test knows the linker waited.
+- Each sent run records the bytes it sent and the time it spent other than
+  compiling; `status` shows them. Whether sending link jobs pays off is to be
+  measured on the real network. `remote_links` turns them off.
 
 ### Stage 4: placement by capacity
 
@@ -611,6 +652,11 @@ Known gaps:
 - Memory isn't published, so a box can still refuse an offer for memory. A
   job run on another box is recorded with that box's `maxrss`, which misses
   swapped pages.
+- The input walk doesn't descend below a `.so`, which is right for proc
+  macros. A Rust dylib's dependencies aren't sent either, so a job using one
+  fails remotely and builds here.
+- An rlib's `lib.rmeta-link` member, which real rlibs have, is missing from
+  stand-ins. Rustc hasn't needed it in tests so far.
 
 ## Guesses to test on the quiet cluster
 

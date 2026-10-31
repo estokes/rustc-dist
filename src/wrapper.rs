@@ -66,7 +66,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
 
 /// What another box needs to run this compile, unless it must stay here.
 fn job(args: &[OsString], c: &Compile, build: u32) -> Option<Job> {
-    let paths = c.portable.clone()?;
+    let portable = c.portable.as_ref()?;
     let cargo_cwd = fs::read_link(format_compact!("/proc/{build}/cwd").as_str()).ok()?;
     match config::project(&cargo_cwd) {
         Ok(p) if p.keeps_local(&c.name) => return None,
@@ -84,7 +84,8 @@ fn job(args: &[OsString], c: &Compile, build: u32) -> Option<Job> {
         .filter(|(k, _)| !LOCAL_ENV.contains(&k.as_str()) && !k.starts_with("LD_"))
         .collect();
     let cwd = env::current_dir().ok()?.to_str().map(ArcStr::from)?;
-    Some(Job { rustc, args, env, cwd, target: c.target.clone(), paths })
+    let (paths, reads) = (portable.paths.clone(), portable.reads.clone());
+    Some(Job { rustc, args, env, cwd, target: c.target.clone(), paths, reads })
 }
 
 fn exec(args: &[OsString]) -> Error {

@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     fmt,
-    fs::{self, File},
+    fs::{self, File, Metadata},
     io::{self, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -69,6 +69,12 @@ struct Stamp {
     ino: u64,
 }
 
+impl Stamp {
+    fn of(meta: &Metadata) -> Self {
+        Self { len: meta.len(), mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(), ino: meta.ino() }
+    }
+}
+
 /// Hashes of the files jobs read, each kept until its file changes.
 #[derive(Default)]
 pub struct Hashes(Mutex<HashMap<PathBuf, (Stamp, Hash)>>);
@@ -79,11 +85,7 @@ impl Hashes {
         if !meta.is_file() {
             bail!("{} is not a file", path.display());
         }
-        let stamp = Stamp {
-            len: meta.len(),
-            mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
-            ino: meta.ino(),
-        };
+        let stamp = Stamp::of(&meta);
         if let Some((s, h)) = self.0.lock().get(path)
             && *s == stamp
         {
@@ -92,6 +94,13 @@ impl Hashes {
         let hash = hash_file(path)?;
         self.0.lock().insert(path.to_path_buf(), (stamp, hash));
         Ok((hash, stamp.len))
+    }
+
+    /// The hash of a file just written, so it needn't be read again.
+    pub fn insert(&self, path: &Path, hash: Hash) -> Result<()> {
+        let meta = fs::metadata(path).with_context(|| format_compact!("stat {}", path.display()))?;
+        self.0.lock().insert(path.to_path_buf(), (Stamp::of(&meta), hash));
+        Ok(())
     }
 }
 
@@ -133,11 +142,40 @@ impl Store {
         }
     }
 
-    pub fn upload(&self, want: Hash) -> Result<Upload> {
+    fn tmp(&self) -> PathBuf {
         let n = self.next_tmp.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.dir.join("tmp").join(format_compact!("{}-{n}", std::process::id()).as_str());
+        self.dir.join("tmp").join(format_compact!("{}-{n}", std::process::id()).as_str())
+    }
+
+    pub fn upload(&self, want: Hash) -> Result<Upload> {
+        let tmp = self.tmp();
         let file = File::create(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?;
         Ok(Upload { file, tmp, want, hasher: blake3::Hasher::new(), len: 0 })
+    }
+
+    /// Keep a file a job wrote, whose hash is `h`, for later jobs that
+    /// read it. The file becomes read only.
+    pub fn adopt(&self, path: &Path, h: &Hash) -> Result<()> {
+        if self.has(h) {
+            return Ok(());
+        }
+        let tmp = self.tmp();
+        if fs::hard_link(path, &tmp).is_err() {
+            fs::copy(path, &tmp).with_context(|| format_compact!("copying {}", path.display()))?;
+        }
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444))?;
+        let len = fs::metadata(&tmp)?.len();
+        self.insert(&tmp, h)?;
+        self.used.fetch_add(len, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn insert(&self, tmp: &Path, h: &Hash) -> Result<()> {
+        let dest = self.path(h);
+        if let Some(dir) = dest.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::rename(tmp, &dest).with_context(|| format_compact!("storing {}", dest.display()))
     }
 
     /// Delete the least recently used blobs until the store is under 90%
@@ -203,11 +241,7 @@ impl Upload {
             bail!("blob {} arrived with hash {got}", self.want);
         }
         self.file.set_permissions(fs::Permissions::from_mode(0o444))?;
-        let dest = store.path(&self.want);
-        if let Some(dir) = dest.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        fs::rename(&self.tmp, &dest).with_context(|| format_compact!("storing {}", dest.display()))?;
+        store.insert(&self.tmp, &self.want)?;
         store.used.fetch_add(self.len, Ordering::Relaxed);
         Ok(())
     }
@@ -230,6 +264,15 @@ pub fn place(store: &Store, h: &Hash, dest: &Path) -> Result<()> {
         return Err(e).with_context(|| format_compact!("placing {}", dest.display()));
     }
     Ok(())
+}
+
+/// Put a blob at `dest` in place of the file there, so a reader opens
+/// either the old file or the blob.
+pub fn replace(store: &Store, h: &Hash, dest: &Path) -> Result<()> {
+    let tmp = dest.with_extension("rustc-dist-new");
+    let _ = fs::remove_file(&tmp);
+    place(store, h, &tmp)?;
+    fs::rename(&tmp, dest).with_context(|| format_compact!("replacing {}", dest.display()))
 }
 
 #[cfg(test)]

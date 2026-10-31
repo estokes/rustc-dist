@@ -19,7 +19,7 @@ const HALVE_AT: u64 = 256;
 /// Predicted cost, in millions of instructions, of a job when nothing at
 /// all has been recorded.
 const UNKNOWN_COST_MI: u64 = 1000;
-const MAGIC: &[u8; 8] = b"rdstats3";
+const MAGIC: &[u8; 8] = b"rdstats4";
 
 /// Whose build a run was for and where it ran.
 #[derive(Clone, Copy)]
@@ -27,9 +27,28 @@ pub enum Origin {
     /// This box's build, run here.
     Here,
     /// This box's build, run on another box.
-    Sent,
+    Sent(Transfer),
     /// Another box's build, run here.
     Served,
+}
+
+impl Origin {
+    fn index(self) -> usize {
+        match self {
+            Origin::Here => 0,
+            Origin::Sent(_) => 1,
+            Origin::Served => 2,
+        }
+    }
+}
+
+/// What moving a sent run's files cost.
+#[derive(Clone, Copy)]
+pub struct Transfer {
+    pub sent_kb: u64,
+    /// The time it spent other than compiling: staging and sending inputs,
+    /// its linker waiting for rlibs, receiving the last outputs.
+    pub copy_ms: u64,
 }
 
 pub struct Sample {
@@ -50,6 +69,9 @@ struct Hists {
     width_c: Histogram<u32>,
     wall_ms: Histogram<u32>,
     mem_kb: Histogram<u32>,
+    /// Of sent runs.
+    copy_ms: Histogram<u32>,
+    sent_kb: Histogram<u32>,
     /// Runs by `Origin`, never halved.
     runs: [u64; 3],
 }
@@ -63,12 +85,26 @@ impl Hists {
             width_c: h(100_000),
             wall_ms: h(36_000_000),
             mem_kb: h(1 << 30),
+            copy_ms: h(36_000_000),
+            sent_kb: h(1 << 30),
             runs: [0; 3],
         }
     }
 
-    fn all(&mut self) -> [&mut Histogram<u32>; 5] {
-        [&mut self.cost_mi, &mut self.front_mi, &mut self.width_c, &mut self.wall_ms, &mut self.mem_kb]
+    fn each(&self) -> [&Histogram<u32>; 7] {
+        [&self.cost_mi, &self.front_mi, &self.width_c, &self.wall_ms, &self.mem_kb, &self.copy_ms, &self.sent_kb]
+    }
+
+    fn all(&mut self) -> [&mut Histogram<u32>; 7] {
+        [
+            &mut self.cost_mi,
+            &mut self.front_mi,
+            &mut self.width_c,
+            &mut self.wall_ms,
+            &mut self.mem_kb,
+            &mut self.copy_ms,
+            &mut self.sent_kb,
+        ]
     }
 
     fn record(&mut self, s: &Sample) {
@@ -79,7 +115,11 @@ impl Hists {
         self.width_c.saturating_record(s.width_c.max(1));
         self.wall_ms.saturating_record(s.wall_ms.max(1));
         self.mem_kb.saturating_record(s.mem_kb.max(1));
-        self.runs[s.origin as usize] += 1;
+        if let Origin::Sent(t) = s.origin {
+            self.copy_ms.saturating_record(t.copy_ms.max(1));
+            self.sent_kb.saturating_record(t.sent_kb.max(1));
+        }
+        self.runs[s.origin.index()] += 1;
     }
 
     fn halve(&mut self) {
@@ -96,8 +136,7 @@ impl Hists {
     }
 
     fn add(&mut self, other: &Hists) {
-        let theirs = [&other.cost_mi, &other.front_mi, &other.width_c, &other.wall_ms, &other.mem_kb];
-        for (h, o) in self.all().into_iter().zip(theirs) {
+        for (h, o) in self.all().into_iter().zip(other.each()) {
             h.add(o).expect("same bounds");
         }
         for (r, o) in self.runs.iter_mut().zip(other.runs) {
@@ -126,6 +165,9 @@ pub struct UnitInfo {
     pub width_c: u64,
     pub wall_ms: u64,
     pub mem_kb: u64,
+    /// Medians of sent runs.
+    pub copy_ms: Option<u64>,
+    pub sent_kb: Option<u64>,
 }
 
 fn median(h: &Histogram<u32>) -> Option<u64> {
@@ -175,6 +217,8 @@ impl Stats {
                 width_c: h.width_c.value_at_quantile(0.5),
                 wall_ms: h.wall_ms.value_at_quantile(0.5),
                 mem_kb: h.mem_kb.value_at_quantile(0.9),
+                copy_ms: median(&h.copy_ms),
+                sent_kb: median(&h.sent_kb),
             };
             (key, info)
         })
@@ -222,11 +266,14 @@ impl Stats {
                 let mut key = vec![0u8; read_u32(&mut r)? as usize];
                 r.read_exact(&mut key)?;
                 let key = ArcStr::from(String::from_utf8(key).context("unit key")?);
-                let mut hist = || de.deserialize(&mut r).map_err(|e| anyhow!("{e:?}"));
-                let (cost_mi, front_mi, width_c) = (hist()?, hist()?, hist()?);
-                let (wall_ms, mem_kb) = (hist()?, hist()?);
-                let runs = [read_u64(&mut r)?, read_u64(&mut r)?, read_u64(&mut r)?];
-                map.insert(key, Hists { cost_mi, front_mi, width_c, wall_ms, mem_kb, runs });
+                let mut h = Hists::new();
+                for hist in h.all() {
+                    *hist = de.deserialize(&mut r).map_err(|e| anyhow!("{e:?}"))?;
+                }
+                for n in &mut h.runs {
+                    *n = read_u64(&mut r)?;
+                }
+                map.insert(key, h);
             }
         }
         stats.rebuild_global();
@@ -248,7 +295,7 @@ impl Stats {
             for (key, h) in map {
                 w.write_all(&(key.len() as u32).to_be_bytes())?;
                 w.write_all(key.as_bytes())?;
-                for hist in [&h.cost_mi, &h.front_mi, &h.width_c, &h.wall_ms, &h.mem_kb] {
+                for hist in h.each() {
                     ser.serialize(hist, &mut w).map_err(|e| anyhow!("{e:?}"))?;
                 }
                 for n in h.runs {
@@ -335,17 +382,22 @@ mod test {
         s.record(&unit("a:1", "a"), sample(1234));
         s.record(&unit("a:1", "a"), Sample { origin: Origin::Served, ..sample(1234) });
         s.record(&unit("b:1", "b"), Sample { front_mi: Some(30), width_c: 400, ..sample(99) });
+        let sent = Origin::Sent(Transfer { sent_kb: 2048, copy_ms: 70 });
+        s.record(&unit("b:1", "b"), Sample { origin: sent, front_mi: Some(30), width_c: 400, ..sample(99) });
         s.save(&path)?;
         assert!(!s.dirty);
         let t = Stats::load(&path)?;
         assert_eq!(predict(&t, &unit("a:1", "a")).cost_mi, predict(&s, &unit("a:1", "a")).cost_mi);
-        assert_eq!(t.global.cost_mi.len(), 3);
+        assert_eq!(t.global.cost_mi.len(), 4);
         let (_, a) = t.units().find(|(k, _)| k.as_str() == "a:1").unwrap();
         assert_eq!(a.runs, [1, 0, 1]);
+        assert_eq!((a.copy_ms, a.sent_kb), (None, None));
         let (_, b) = t.units().find(|(k, _)| k.as_str() == "b:1").unwrap();
+        assert_eq!(b.runs, [1, 1, 0]);
         // Histograms keep two significant digits.
         assert_eq!(b.front_mi, Some(30));
-        assert!((396..=404).contains(&b.width_c), "{}", b.width_c);
+        assert_eq!(b.copy_ms, Some(70));
+        assert!(b.sent_kb.is_some_and(|kb| (2030..=2066).contains(&kb)), "{:?}", b.sent_kb);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

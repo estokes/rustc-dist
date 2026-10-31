@@ -26,6 +26,9 @@ pub struct Config {
     pub name: Option<String>,
     /// How much disk other boxes' inputs may use here.
     pub blob_cache_gb: u64,
+    /// Send jobs that link (binaries, tests, proc macros) to other boxes
+    /// too, which means sending every rlib below them.
+    pub remote_links: bool,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             base: None,
             name: None,
             blob_cache_gb: 20,
+            remote_links: true,
         }
     }
 }
