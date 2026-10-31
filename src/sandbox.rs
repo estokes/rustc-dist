@@ -109,6 +109,7 @@ async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> 
         check_program(linker)?;
     }
     let store = &server.store;
+    let _pins = store.pin(files.iter().map(|f| f.hash).chain(rlibs.iter().flat_map(|r| [r.hash, r.meta])));
     let mut now: HashSet<Hash> = files.iter().map(|f| f.hash).filter(|h| !store.has(h)).collect();
     let mut later = HashSet::new();
     for r in rlibs.iter().filter(|r| !store.has(&r.hash)) {

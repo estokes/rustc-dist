@@ -152,9 +152,9 @@ async fn join(
         info!("serving toolchain {} at {}", t.toolchain.key, t.sysroot.display());
     }
     let toolchains = installed.iter().map(|t| t.toolchain.clone()).collect();
-    let cache = config::cache_dir();
-    let store = Store::open(cache.join("blobs"), cfg.blob_cache_gb << 30)?;
-    let server = Arc::new(Server::new(store, cache.join("jobs"), installed, tx.clone())?);
+    config::make_private_dir(&cfg.cache_dir)?;
+    let store = Store::open(cfg.cache_dir.join("blobs"), cfg.cache_gb << 30)?;
+    let server = Arc::new(Server::new(store, cfg.cache_dir.join("jobs"), installed, tx.clone())?);
     let mut jobs = Listener::new(&publisher, None, farm::jobs_path(&base, &name)).await?;
     tokio::spawn(async move {
         loop {

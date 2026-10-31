@@ -30,8 +30,13 @@ pub struct Config {
     /// is often loopback only.
     #[serde(deserialize_with = "bind_cfg")]
     pub bind: Option<BindCfg>,
-    /// How much disk other boxes' inputs may use here.
-    pub blob_cache_gb: u64,
+    /// Where other boxes' inputs, and the jobs built from them, live. Jobs
+    /// are hard links into it, so it should be one file system; a tmpfs
+    /// keeps it in memory.
+    pub cache_dir: PathBuf,
+    /// How many GB the inputs and outputs kept in `cache_dir` may use. The
+    /// least recently used go first beyond it.
+    pub cache_gb: u64,
     /// Send jobs that link (binaries, tests, proc macros) to other boxes
     /// too, which means sending every rlib below them.
     pub remote_links: bool,
@@ -46,7 +51,8 @@ impl Default for Config {
             base: None,
             name: None,
             bind: None,
-            blob_cache_gb: 20,
+            cache_dir: xdg("XDG_CACHE_HOME", ".cache").join("rustc-dist"),
+            cache_gb: 20,
             remote_links: true,
         }
     }
@@ -105,6 +111,12 @@ pub fn load() -> Result<Config> {
     if cfg.calibration_seconds < 4 {
         bail!("{}: calibration_seconds must be at least 4", path.display());
     }
+    if !cfg.cache_dir.is_absolute() {
+        bail!("{}: cache_dir must be absolute", path.display());
+    }
+    if cfg.cache_gb == 0 {
+        bail!("{}: cache_gb must be at least 1", path.display());
+    }
     Ok(cfg)
 }
 
@@ -113,11 +125,6 @@ fn xdg(var: &str, home_rel: &str) -> PathBuf {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(home_rel),
     }
-}
-
-/// Other boxes' inputs and the jobs built from them.
-pub fn cache_dir() -> PathBuf {
-    xdg("XDG_CACHE_HOME", ".cache").join("rustc-dist")
 }
 
 pub fn systemd_unit_dir() -> PathBuf {

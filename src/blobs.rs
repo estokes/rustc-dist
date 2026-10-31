@@ -5,14 +5,14 @@ use log::{info, warn};
 use netidx_core::pack::{Pack, PackError};
 use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     fmt,
     fs::{self, File, Metadata},
-    io::{self, Write},
+    io::{self, ErrorKind, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 /// A file's blake3 hash, the name of its content on every box.
@@ -111,11 +111,9 @@ pub struct Store {
     cap_bytes: u64,
     used: AtomicU64,
     next_tmp: AtomicU64,
+    /// Blobs running jobs read, with how many jobs read each.
+    pinned: Mutex<HashMap<Hash, u32>>,
 }
-
-/// A blob used this recently is never evicted, so it can't disappear
-/// between telling a client it is present and linking it into a job.
-const IN_USE: Duration = Duration::from_secs(600);
 
 impl Store {
     pub fn open(dir: PathBuf, cap_bytes: u64) -> Result<Self> {
@@ -123,7 +121,24 @@ impl Store {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?;
         let used = blobs(&dir).iter().map(|(_, len, _)| len).sum();
-        Ok(Self { dir, cap_bytes, used: AtomicU64::new(used), next_tmp: AtomicU64::new(0) })
+        Ok(Self {
+            dir,
+            cap_bytes,
+            used: AtomicU64::new(used),
+            next_tmp: AtomicU64::new(0),
+            pinned: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Keep `hashes` from eviction until the guard drops, so a blob can't
+    /// disappear between telling a client it is present and linking it
+    /// into the job.
+    pub fn pin<I: Iterator<Item = Hash> + Clone>(&self, hashes: I) -> Pins<'_, I> {
+        let mut pinned = self.pinned.lock();
+        for h in hashes.clone() {
+            *pinned.entry(h).or_default() += 1;
+        }
+        Pins { store: self, hashes }
     }
 
     pub fn path(&self, h: &Hash) -> PathBuf {
@@ -165,21 +180,30 @@ impl Store {
         }
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444))?;
         let len = fs::metadata(&tmp)?.len();
-        self.insert(&tmp, h)?;
-        self.used.fetch_add(len, Ordering::Relaxed);
-        Ok(())
+        self.insert(&tmp, h, len)
     }
 
-    fn insert(&self, tmp: &Path, h: &Hash) -> Result<()> {
+    /// Move `tmp`, `len` bytes, into the store as `h`, unless another job
+    /// stored it first.
+    fn insert(&self, tmp: &Path, h: &Hash, len: u64) -> Result<()> {
         let dest = self.path(h);
         if let Some(dir) = dest.parent() {
             fs::create_dir_all(dir)?;
         }
-        fs::rename(tmp, &dest).with_context(|| format_compact!("storing {}", dest.display()))
+        let linked = fs::hard_link(tmp, &dest);
+        let _ = fs::remove_file(tmp);
+        match linked {
+            Ok(()) => {
+                self.used.fetch_add(len, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e).with_context(|| format_compact!("storing {}", dest.display())),
+        }
     }
 
-    /// Delete the least recently used blobs until the store is under 90%
-    /// of its cap.
+    /// Delete the least recently used blobs no job is reading until the
+    /// store is under 90% of its cap.
     pub fn evict(&self) {
         if self.used.load(Ordering::Relaxed) <= self.cap_bytes {
             return;
@@ -187,13 +211,13 @@ impl Store {
         let mut all = blobs(&self.dir);
         all.sort_by_key(|(_, _, mtime)| *mtime);
         let keep = self.cap_bytes / 10 * 9;
-        let fresh = SystemTime::now() - IN_USE;
         let mut freed = 0;
-        for (path, len, mtime) in all {
-            if self.used.load(Ordering::Relaxed) <= keep || mtime > fresh {
+        for (h, len, _) in all {
+            if self.used.load(Ordering::Relaxed) <= keep {
                 break;
             }
-            if fs::remove_file(&path).is_ok() {
+            let pinned = self.pinned.lock();
+            if !pinned.contains_key(&h) && fs::remove_file(self.path(&h)).is_ok() {
                 self.used.fetch_sub(len, Ordering::Relaxed);
                 freed += len;
             }
@@ -202,15 +226,36 @@ impl Store {
     }
 }
 
+/// Blobs kept from eviction. See [`Store::pin`].
+pub struct Pins<'a, I: Iterator<Item = Hash> + Clone> {
+    store: &'a Store,
+    hashes: I,
+}
+
+impl<I: Iterator<Item = Hash> + Clone> Drop for Pins<'_, I> {
+    fn drop(&mut self) {
+        let mut pinned = self.store.pinned.lock();
+        for h in self.hashes.clone() {
+            if let Entry::Occupied(mut e) = pinned.entry(h) {
+                *e.get_mut() -= 1;
+                if *e.get() == 0 {
+                    e.remove();
+                }
+            }
+        }
+    }
+}
+
 /// Every blob with its length and last use.
-fn blobs(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+fn blobs(dir: &Path) -> Vec<(Hash, u64, SystemTime)> {
     let mut out = Vec::new();
     let Ok(prefixes) = fs::read_dir(dir) else { return out };
     for prefix in prefixes.flatten().filter(|p| p.file_name().len() == 2) {
         let Ok(entries) = fs::read_dir(prefix.path()) else { continue };
         for e in entries.flatten() {
+            let Ok(h) = blake3::Hash::from_hex(e.file_name().as_encoded_bytes()) else { continue };
             if let Ok(meta) = e.metadata() {
-                out.push((e.path(), meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+                out.push((Hash(*h.as_bytes()), meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
             }
         }
     }
@@ -241,9 +286,7 @@ impl Upload {
             bail!("blob {} arrived with hash {got}", self.want);
         }
         self.file.set_permissions(fs::Permissions::from_mode(0o444))?;
-        store.insert(&self.tmp, &self.want)?;
-        store.used.fetch_add(self.len, Ordering::Relaxed);
-        Ok(())
+        store.insert(&self.tmp, &self.want, self.len)
     }
 }
 
@@ -278,6 +321,7 @@ pub fn replace(store: &Store, h: &Hash, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::time::Duration;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rustc-dist-blobs-{name}-{}", std::process::id()));
@@ -306,6 +350,41 @@ mod test {
         assert!(bad.finish(&store).is_err());
         place(&store, &h, &dir.join("linked"))?;
         assert_eq!(fs::read(dir.join("linked"))?, b"some crate metadata");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn eviction_takes_the_least_recently_used_unpinned_blobs() -> Result<()> {
+        let dir = scratch("evict");
+        let store = Store::open(dir.join("store"), 35)?;
+        let hashes = Hashes::default();
+        let mut stored = Vec::new();
+        for (i, content) in [b"blob zero", b"blob one!", b"blob two!", b"blob 3333"].iter().enumerate() {
+            let src = dir.join(format!("src{i}"));
+            fs::write(&src, content)?;
+            let (h, _) = hashes.get(&src)?;
+            store.adopt(&src, &h)?;
+            store.adopt(&src, &h)?;
+            let mut up = store.upload(h)?;
+            up.write(*content)?;
+            up.finish(&store)?;
+            File::open(store.path(&h))?.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(i as u64))?;
+            stored.push(h);
+        }
+        assert_eq!(store.used.load(Ordering::Relaxed), 36);
+        let pins = store.pin([stored[0]].into_iter());
+        store.evict();
+        assert_eq!(stored.iter().map(|h| store.path(h).exists()).collect::<Vec<_>>(), [true, false, true, true]);
+        assert_eq!(store.used.load(Ordering::Relaxed), 27);
+        drop(pins);
+        let mut up = store.upload(stored[1])?;
+        up.write(b"blob one!")?;
+        up.finish(&store)?;
+        store.evict();
+        assert_eq!(stored.iter().map(|h| store.path(h).exists()).collect::<Vec<_>>(), [false, true, true, true]);
+        assert_eq!(store.used.load(Ordering::Relaxed), 27);
+        assert!(store.pinned.lock().is_empty());
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

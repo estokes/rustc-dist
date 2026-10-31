@@ -408,9 +408,10 @@ Inputs are addressed by content. The client daemon caches
   `/sys` or `/run`. The sandbox mounts the server's own, and a server needs its
   own system libraries anyway.
 
-Each server keeps a read-only blob store under `~/.cache/rustc-dist`, evicting
-the least recently used past `blob_cache_gb` but never anything used in the
-last 10 minutes. The client sends a manifest of paths and hashes; the server
+Each server keeps a read-only blob store in `cache_dir` (`~/.cache/rustc-dist`
+by default; a tmpfs keeps it in memory), evicting the least recently used past
+`cache_gb` down to 90% of it, except blobs a running job reads, which are
+pinned from its manifest until it ends. The client sends a manifest of paths and hashes; the server
 answers with the hashes it lacks; the client sends those in 1 MB chunks and
 the server checks each blob's hash before storing it. Once a server is warm a
 job sends a manifest and whatever sources changed.
@@ -507,7 +508,7 @@ Config is real TOML (`toml` + serde), parsed into two separate structs.
   `calibration_seconds`, and for a farm `base` (the netidx path every box
   publishes under), `name` (the host name by default), `bind` (where other
   boxes reach this one, in netidx's syntax, since netidx's default is often
-  loopback only), `blob_cache_gb` and `remote_links` (on by default).
+  loopback only), `cache_dir`, `cache_gb` and `remote_links` (on by default).
   Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit
   those to override them. Their learned rates live in `rates/` beside it. The netidx config is netidx's own (`NETIDX_CFG` or
   its default paths).
@@ -691,7 +692,7 @@ Every number below is a guess. None has been tested on an idle box.
 | a job is light below this many threads busy | 1.5 | `src/sched.rs` `LIGHT_WIDTH_C` |
 | a heavy job's spare is taken: lend it | twice what it holds | `src/sched.rs` `Layout::lend` |
 | keep a unit local after remote-fail, local-pass | 2 times | `src/sched.rs` `PIN_AFTER` |
-| blob cache | 20 GB | `src/config.rs` |
+| cache size | 20 GB | `src/config.rs` `cache_gb` |
 
 Experiments, roughly in order:
 
