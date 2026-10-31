@@ -759,12 +759,7 @@ What the test found:
   longer than the 1 s cutoff.
 - A restarted daemon was listed twice in the resolver for about seven
   minutes, because dropping the publisher at exit didn't finish clearing it.
-  The daemon now shuts its publisher down before exiting, but that still
-  leaves its paths behind on these boxes: netidx sends the clear only to the
-  default resolver (the workstation's own, serving `/local`), not to the
-  domain resolver `/build` is referred to, so a stopped box stays listed
-  until that resolver's writer ttl, about five minutes. Recorded in netidx
-  as CR `resolver-clear-01` on `ResolverWrite::clear`.
+  The daemon now shuts its publisher down before exiting.
 - Publishers on these workstations listen on loopback by default. `bind` in
   the config sets where other boxes reach a box.
 - Slack held short jobs for the LPE class while P and E sat idle. In a build
