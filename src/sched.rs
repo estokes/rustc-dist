@@ -1602,6 +1602,7 @@ impl Sched {
     }
 
     fn status(&mut self) -> Status {
+        self.measure_if_stale(Instant::now());
         let mut ranks: LPooled<HashMap<ArcStr, u64>> = LPooled::take();
         for (key, rank) in self.graph.ranked(&self.stats) {
             let r = ranks.entry(key).or_default();
@@ -2180,6 +2181,13 @@ mod test {
         assert_eq!(h.load.borrow().classes[0].frees_in_ms, None, "its own waiting job comes first");
         drop(served);
         slot(local).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_measures_memory_before_any_job_runs() -> Result<()> {
+        let h = Harness::start("status-mem", vec![class(1000, &[0])], 1000, &[], &[])?;
+        assert_eq!(h.status().await.mem_capacity_kb, 1000);
         Ok(())
     }
 
