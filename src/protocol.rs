@@ -107,8 +107,12 @@ pub struct Status {
     /// Jobs still running under an earlier profile's layout.
     pub finishing: u32,
     pub waiting: u32,
-    pub mem_limit_kb: u64,
-    pub mem_running_kb: u64,
+    /// RAM plus the allowed share of compressed swap.
+    pub mem_capacity_kb: u64,
+    /// What the box holds, swapped pages at their uncompressed size.
+    pub mem_used_kb: u64,
+    /// What running jobs are predicted to add.
+    pub mem_growth_kb: u64,
     pub graph_nodes: u32,
     pub units: Vec<UnitStatus>,
     pub boxes: Vec<BoxStatus>,

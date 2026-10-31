@@ -13,7 +13,7 @@ use crate::{
     sys,
     toolchain,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use arcstr::ArcStr;
 use netidx::{path::Path as NPath, InternalOnly};
 use netidx_protocols::pack_channel::server::Listener;
@@ -23,9 +23,9 @@ use std::{
     process::Command,
     sync::Arc,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
-struct Box {
+struct ServerBox {
     _net: InternalOnly,
     subscriber: netidx::subscriber::Subscriber,
     jobs: NPath,
@@ -33,13 +33,13 @@ struct Box {
     store_dir: PathBuf,
 }
 
-impl Drop for Box {
+impl Drop for ServerBox {
     fn drop(&mut self) {
         let _ = self.tx.send(Msg::Drain);
     }
 }
 
-async fn server(dir: &Path) -> Result<Box> {
+async fn server(dir: &Path) -> Result<ServerBox> {
     let net = InternalOnly::new().await?;
     let state = dir.join("state");
     let allowed = sys::allowed_cpus()?;
@@ -48,7 +48,7 @@ async fn server(dir: &Path) -> Result<Box> {
         state_dir: state,
         fifo_dir: dir.to_path_buf(),
         allowed,
-        mem_limit_kb: u64::MAX,
+        memory: Box::new(|| sys::box_memory(0.5)),
         calibration_seconds: 4,
     };
     let (tx, rx) = mpsc::unbounded_channel();
@@ -69,7 +69,7 @@ async fn server(dir: &Path) -> Result<Box> {
             });
         }
     });
-    Ok(Box { subscriber: net.subscriber().clone(), _net: net, jobs, tx, store_dir })
+    Ok(ServerBox { subscriber: net.subscriber().clone(), _net: net, jobs, tx, store_dir })
 }
 
 fn rustc() -> PathBuf {
@@ -125,7 +125,7 @@ fn project(dir: &Path) -> Result<(Job, Unit)> {
     Ok((job, c.unit))
 }
 
-async fn send(b: &Box, job: &Job, unit: &Unit, hashes: &Hashes) -> Result<(Outcome, Vec<Event>)> {
+async fn send(b: &ServerBox, job: &Job, unit: &Unit, hashes: &Hashes) -> Result<(Outcome, Vec<Event>)> {
     let crates: Vec<ArcStr> = unit.deps.iter().filter_map(|d| d.file.clone()).collect();
     let staged = remote::stage(job, &crates, hashes)?;
     let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
@@ -180,6 +180,13 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     let (outcome, _) = send(&b, &job, &unit, &hashes).await?;
     assert!(matches!(outcome, Outcome::Exit { code: 0, .. }));
     assert_eq!(blob_count(&b.store_dir), blobs);
+    // The server recorded both runs as served, with their memory.
+    let (reply, status) = oneshot::channel();
+    b.tx.send(Msg::Status { reply })?;
+    let status = status.await?;
+    let served = status.units.iter().find(|u| u.key == unit.exact).context("no unit")?;
+    assert_eq!((served.here, served.served), (0, 2));
+    assert!(served.mem_kb > 10_000, "{} kB", served.mem_kb);
     // A compile error comes back as an exit code, with no outputs.
     for f in ["libapp-a1.rlib", "libapp-a1.rmeta"] {
         fs::remove_file(deps.join(f))?;

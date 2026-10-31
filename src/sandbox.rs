@@ -137,7 +137,7 @@ async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> 
         .collect();
     let mut cmd = sandbox(&root.0, &tops, tc, &slot.grant.jobserver, &env, &cwd)?;
     cmd.args(args.iter().map(|a| a.as_str()));
-    run(con, cmd, &root.0, &slot.grant.cpus).await
+    run(con, cmd, &root.0, slot).await
 }
 
 /// A path the client may send: absolute, normalized, utf-8, and not in a
@@ -252,8 +252,8 @@ impl Drop for Kill {
     }
 }
 
-async fn run(con: &Connection, mut cmd: Command, root: &Path, cpus: &[u32]) -> Result<Option<Ran>> {
-    let cpus = cpus.to_vec();
+async fn run(con: &Connection, mut cmd: Command, root: &Path, slot: &Slot) -> Result<Option<Ran>> {
+    let cpus = slot.grant.cpus.clone();
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     unsafe {
         cmd.pre_exec(move || sys::pin(&cpus).map_err(io::Error::other));
@@ -261,6 +261,7 @@ async fn run(con: &Connection, mut cmd: Command, root: &Path, cpus: &[u32]) -> R
     let start = Instant::now();
     let mut child = cmd.spawn().context("starting bwrap")?;
     let pid = child.id() as libc::pid_t;
+    slot.started(child.id());
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     let mut kill = Kill((pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as i32) }));
     let (tx, mut rx) = mpsc::unbounded_channel();

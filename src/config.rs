@@ -11,8 +11,9 @@ use std::{
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
-    /// Share of MemTotal that the predicted peak memory of running jobs may use.
-    pub memory_fraction: f64,
+    /// Share of compressed swap (zram, zswap) that jobs' predicted peak
+    /// memory may fill beyond RAM.
+    pub compressed_swap_share: f64,
     /// How long the daemon runs the calibration load for a new profile.
     pub calibration_seconds: u64,
     /// The netidx path every box of the farm publishes under. Without it
@@ -26,7 +27,13 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { memory_fraction: 0.8, calibration_seconds: 60, base: None, name: None, blob_cache_gb: 20 }
+        Self {
+            compressed_swap_share: 0.5,
+            calibration_seconds: 60,
+            base: None,
+            name: None,
+            blob_cache_gb: 20,
+        }
     }
 }
 
@@ -69,8 +76,8 @@ pub fn load() -> Result<Config> {
         Err(e) if e.kind() == ErrorKind::NotFound => Config::default(),
         Err(e) => return Err(e).with_context(|| format_compact!("reading {}", path.display())),
     };
-    if !(cfg.memory_fraction > 0. && cfg.memory_fraction <= 1.) {
-        bail!("{}: memory_fraction must be in (0, 1]", path.display());
+    if !(0. ..=1.).contains(&cfg.compressed_swap_share) {
+        bail!("{}: compressed_swap_share must be in [0, 1]", path.display());
     }
     if cfg.calibration_seconds < 4 {
         bail!("{}: calibration_seconds must be at least 4", path.display());

@@ -68,7 +68,10 @@ pub async fn run() -> Result<()> {
         state_dir,
         fifo_dir: dir,
         allowed: sys::allowed_cpus()?,
-        mem_limit_kb: (sys::mem_total_kb()? as f64 * cfg.memory_fraction) as u64,
+        memory: {
+            let share = cfg.compressed_swap_share;
+            Box::new(move || sys::box_memory(share))
+        },
         calibration_seconds: cfg.calibration_seconds,
     };
     let (tx, rx) = mpsc::unbounded_channel();
@@ -309,6 +312,9 @@ async fn compile(
                 return protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await;
             }
             Admission::Slot(slot) => {
+                if let Some(pid) = sock.peer_cred().ok().and_then(|c| c.pid()) {
+                    slot.started(pid as u32);
+                }
                 if filter_metadata {
                     let reply = Reply::Slot {
                         cpus: slot.grant.cpus.clone(),

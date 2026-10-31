@@ -157,10 +157,11 @@ fn status() -> Result<()> {
     let gib = |kb: u64| kb as f64 / (1024. * 1024.);
     writeln!(
         out,
-        "\n{} waiting, predicted memory {:.1} of {:.1} GiB",
+        "\n{} waiting. Memory: {:.1} GiB in use, running jobs predicted to add {:.1}, capacity {:.1}",
         st.waiting,
-        gib(st.mem_running_kb),
-        gib(st.mem_limit_kb)
+        gib(st.mem_used_kb),
+        gib(st.mem_growth_kb),
+        gib(st.mem_capacity_kb)
     )?;
     for b in &st.boxes {
         let cpus: u32 = b.classes.iter().map(|c| c.cpus).sum();

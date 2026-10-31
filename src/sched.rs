@@ -7,6 +7,7 @@ use crate::{
         BoxStatus, ClassStatus, PROTOCOL, Ran, Reply, Status, Switching, Unit, UnitStatus, frame,
     },
     stats::{Origin, Prediction, Sample, Stats},
+    sys::{self, BoxMemory},
 };
 use anyhow::{Context, Result};
 use arcstr::ArcStr;
@@ -60,6 +61,9 @@ const SAMPLE: Duration = Duration::from_millis(100);
 /// A unit that failed remotely and then built locally this many times is
 /// kept local.
 const PIN_AFTER: u8 = 2;
+/// While jobs run here, sample the box's memory and their footprints this
+/// often. Placing a job samples again if the last sample is older.
+const MEASURE: Duration = Duration::from_millis(250);
 
 atomic_id!(LayoutId);
 atomic_id!(JobId);
@@ -73,6 +77,8 @@ pub struct Want {
 pub enum Msg {
     Submit { unit: Unit, build: u32, remote: Option<Want>, reply: oneshot::Sender<Admission> },
     Finished { job: JobId, unit: Unit, ran: Option<Ran> },
+    /// A job's processes are `pid` and its descendants.
+    Started { job: JobId, pid: u32 },
     /// Another box offers this one a job for `class`.
     Offer { unit: Unit, class: u32, reply: oneshot::Sender<Answer> },
     /// The box a job was sent to took it.
@@ -111,6 +117,11 @@ pub struct Slot {
 }
 
 impl Slot {
+    /// The job's processes are `pid` and its descendants.
+    pub fn started(&self, pid: u32) {
+        let _ = self.tx.send(Msg::Started { job: self.job, pid });
+    }
+
     pub fn finish(mut self, ran: Ran) {
         self.ran = Some(ran);
     }
@@ -322,7 +333,8 @@ pub struct Setup {
     pub state_dir: PathBuf,
     pub fifo_dir: PathBuf,
     pub allowed: Vec<u32>,
-    pub mem_limit_kb: u64,
+    /// Measures the box's memory.
+    pub memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
     pub calibration_seconds: u64,
 }
 
@@ -357,10 +369,16 @@ struct Running {
     build: Option<u32>,
     place: Place,
     calib_us: u64,
+    /// Predicted peak memory; none for a job on another box.
     mem_kb: u64,
     cost_mcu: u64,
     rank_mcu: u64,
     start: Instant,
+    /// The root of its processes, once it has started here.
+    pid: Option<u32>,
+    /// Its processes' RSS plus swap at the last sample, and the most seen.
+    foot_kb: u64,
+    peak_kb: u64,
 }
 
 impl Running {
@@ -414,7 +432,10 @@ pub struct Sched {
     retired: Vec<Layout>,
     switch: Switch,
     running: Vec<Running>,
-    mem_running_kb: u64,
+    /// The box's memory at the last sample, less the footprints of jobs
+    /// that finished since.
+    mem: BoxMemory,
+    measured: Option<Instant>,
     queue: Vec<Waiting>,
     /// Jobs wait for classes whose FIFOs were empty at the last dispatch.
     empty: Vec<bool>,
@@ -467,7 +488,8 @@ impl Sched {
             retired: Vec::new(),
             switch,
             running: Vec::new(),
-            mem_running_kb: 0,
+            mem: BoxMemory::default(),
+            measured: None,
             queue: Vec::new(),
             starved: false,
             gathering: None,
@@ -487,6 +509,7 @@ impl Sched {
         enum Event {
             Msg(Option<Msg>),
             Recheck,
+            Measure,
             Save,
         }
         let mut save = time::interval(SAVE_EVERY);
@@ -494,16 +517,20 @@ impl Sched {
         recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut sample = time::interval(SAMPLE);
         sample.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut measure = time::interval(MEASURE);
+        measure.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             self.advance();
             let starved = self.starved;
             let gathering = self.gathering;
             let watched = !self.layout.idle() && !self.load.is_closed();
+            let measuring = self.runs_here();
             let event = tokio::select! {
                 msg = rx.recv() => Event::Msg(msg),
                 _ = std::future::poll_fn(|cx| self.poll_tokens(cx)), if starved => Event::Recheck,
                 _ = recheck.tick(), if starved => Event::Recheck,
                 _ = sample.tick(), if watched => Event::Recheck,
+                _ = measure.tick(), if measuring => Event::Measure,
                 _ = time::sleep_until(gathering.unwrap_or_else(Instant::now).into()), if gathering.is_some() => {
                     Event::Recheck
                 }
@@ -520,6 +547,7 @@ impl Sched {
                     }
                 },
                 Event::Recheck => (),
+                Event::Measure => self.measure(Instant::now()),
                 Event::Save => self.save(),
             }
             self.dispatch();
@@ -553,6 +581,11 @@ impl Sched {
         match msg {
             Msg::Submit { unit, build, remote, reply } => self.submit(unit, build, remote, reply),
             Msg::Finished { job, unit, ran } => self.finished(job, &unit, ran),
+            Msg::Started { job, pid } => {
+                if let Some(r) = self.running.iter_mut().find(|r| r.job == job) {
+                    r.pid = Some(pid);
+                }
+            }
             Msg::Offer { unit, class, reply } => {
                 let slot = self.offer(unit, class as usize);
                 // The loop publishes once after each message, and the
@@ -614,7 +647,7 @@ impl Sched {
         self.retired.retain(|l| !l.idle());
         if let Some(ran) = ran {
             let origin = if r.build.is_some() { Origin::Here } else { Origin::Served };
-            self.record(unit, &ran, r.calib_us, origin);
+            self.record(unit, &ran, r.calib_us, r.peak_kb, origin);
         }
     }
 
@@ -624,16 +657,18 @@ impl Sched {
             return None;
         };
         let r = self.running.swap_remove(i);
-        self.mem_running_kb -= r.mem_kb;
+        self.mem.used_kb = self.mem.used_kb.saturating_sub(r.foot_kb);
         Some(r)
     }
 
-    fn record(&mut self, unit: &Unit, ran: &Ran, calib_us: u64, origin: Origin) {
+    /// `peak_kb` is the most RSS plus swap seen while it ran here, which
+    /// `maxrss_kb` misses when its pages were swapped out.
+    fn record(&mut self, unit: &Unit, ran: &Ran, calib_us: u64, peak_kb: u64, origin: Origin) {
         debug!("{} used {} ms cpu in {} ms", unit.exact, ran.cpu_us / 1000, ran.wall_us / 1000);
         let sample = Sample {
             cost_mcu: ran.cpu_us * 1000 / calib_us,
             wall_ms: ran.wall_us / 1000,
-            mem_kb: ran.maxrss_kb,
+            mem_kb: ran.maxrss_kb.max(peak_kb),
             origin,
         };
         self.stats.record(unit, sample);
@@ -645,7 +680,7 @@ impl Sched {
         match outcome {
             RemoteOutcome::Done(ran) => {
                 self.mismatches.remove(&unit.exact);
-                self.record(unit, &ran, r.calib_us, Origin::Sent);
+                self.record(unit, &ran, r.calib_us, 0, Origin::Sent);
             }
             RemoteOutcome::Busy { version } => {
                 let rb = &mut self.remotes[remote];
@@ -711,14 +746,16 @@ impl Sched {
         }
         let class = class.min(self.layout.classes.len() - 1);
         let pred = self.stats.predict(&unit.exact, &unit.coarse);
-        if !self.running.is_empty() && self.mem_running_kb + pred.mem_kb > self.setup.mem_limit_kb {
+        let now = Instant::now();
+        self.measure_if_stale(now);
+        if self.runs_here() && pred.mem_kb > self.mem_free_kb() {
             return refuse("no memory");
         }
         if self.layout.fifos[class].take(1) == 0 {
             return refuse("no token");
         }
         let rank_mcu = pred.cost_mcu;
-        Some(self.admit(unit, None, pred, rank_mcu, class, Instant::now()))
+        Some(self.admit(unit, None, pred, rank_mcu, class, now))
     }
 
     fn switch_to(&mut self, to: Profile, recalibrate: bool) -> Result<()> {
@@ -812,6 +849,43 @@ impl Sched {
         self.running.iter().filter(|r| r.place == here).map(|r| r.left_us(now)).min()
     }
 
+    /// Whether any job runs on this box, its own or another box's.
+    fn runs_here(&self) -> bool {
+        self.running.iter().any(|r| matches!(r.place, Place::Local { .. }))
+    }
+
+    /// Sample the box's memory and the footprint of each job running here.
+    fn measure(&mut self, now: Instant) {
+        match (self.setup.memory)() {
+            Ok(mem) => self.mem = mem,
+            Err(e) => warn!("measuring memory: {e:#}"),
+        }
+        for r in &mut self.running {
+            if let Some(pid) = r.pid {
+                r.foot_kb = sys::tree_footprint_kb(pid);
+                r.peak_kb = r.peak_kb.max(r.foot_kb);
+            }
+        }
+        self.measured = Some(now);
+    }
+
+    fn measure_if_stale(&mut self, now: Instant) {
+        if self.measured.is_none_or(|t| now.duration_since(t) >= MEASURE) {
+            self.measure(now);
+        }
+    }
+
+    /// What running jobs are predicted to add to their footprints.
+    fn mem_growth_kb(&self) -> u64 {
+        self.running.iter().map(|r| r.mem_kb.saturating_sub(r.foot_kb)).sum()
+    }
+
+    /// Memory a new job here may take: the box's capacity less what it holds
+    /// and what running jobs are predicted to add.
+    fn mem_free_kb(&self) -> u64 {
+        self.mem.capacity_kb.saturating_sub(self.mem.used_kb + self.mem_growth_kb())
+    }
+
     fn dispatch(&mut self) {
         self.starved = false;
         self.gathering = None;
@@ -826,23 +900,12 @@ impl Sched {
             w.rank_mcu as f64 * (now.duration_since(w.since).as_secs_f64() / AGING_S).exp2()
         };
         self.queue.sort_by(|a, b| prio(b).total_cmp(&prio(a)));
-        let idle = self.running.is_empty();
-        let mut mem = self.mem_running_kb;
         let mut admissible: LPooled<Vec<usize>> = LPooled::take();
-        // Stop at the first job that doesn't fit, so a big job at the front
-        // is not starved by smaller ones behind it.
-        for (i, w) in self.queue.iter().enumerate() {
-            if mem + w.pred.mem_kb > self.setup.mem_limit_kb && !(idle && admissible.is_empty()) {
-                break;
-            }
-            mem += w.pred.mem_kb;
-            if !young(w) {
-                admissible.push(i);
-            }
-        }
+        admissible.extend((0..self.queue.len()).filter(|&i| !young(&self.queue[i])));
         if admissible.is_empty() {
             return;
         }
+        self.measure_if_stale(now);
         // The work left in each build: the largest rank among its jobs,
         // counting the ones too young to place.
         let mut horizon: LPooled<HashMap<u32, u64>> = LPooled::take();
@@ -869,12 +932,21 @@ impl Sched {
         placed_us.resize(held.len(), u64::MAX);
         self.count_unseen();
         let fastest = self.layout.classes[0].calib_us;
+        let mut mem_free = self.mem_free_kb();
+        // With nothing running here, one job runs whatever its memory, so
+        // the box can't sit idle behind a job bigger than it.
+        let mut first_here = !self.runs_here();
+        // Set once a job can neither fit here nor go to another box. Later
+        // jobs don't run here either, so smaller ones can't starve it.
+        let mut mem_blocked = false;
         let mut cands: LPooled<Vec<Cand>> = LPooled::take();
         let mut granted: LPooled<Vec<(usize, Place)>> = LPooled::take();
         for &i in admissible.iter() {
             let w = &self.queue[i];
+            let fits = !mem_blocked && (first_here || w.pred.mem_kb <= mem_free);
+            let local = if fits { self.layout.classes.len() } else { 0 };
             cands.clear();
-            cands.extend(self.layout.classes.iter().enumerate().map(|(k, c)| Cand {
+            cands.extend(self.layout.classes[..local].iter().enumerate().map(|(k, c)| Cand {
                 calib_us: c.calib_us,
                 frees_in_us: frees_in[k],
                 overhead_us: 0,
@@ -897,14 +969,24 @@ impl Sched {
                     }
                 }
             }
-            let local = self.layout.classes.len();
+            if cands.is_empty() {
+                mem_blocked = true;
+                self.starved = true;
+                continue;
+            }
             let pick = if w.pred.known {
                 let slack_mcu = horizon[&w.build].saturating_sub(w.rank_mcu);
                 choose(&cands, local, w.pred.cost_mcu, slack_mcu, fastest)
             } else {
-                anywhere_free(&cands, &held)
+                anywhere_free(&cands, &held[..local])
             };
             let cand = &cands[pick];
+            if let Place::Local { .. } = cand.place {
+                // Memory is kept for a job waiting for a token too, so it
+                // fits when one frees.
+                mem_free = mem_free.saturating_sub(w.pred.mem_kb);
+                first_here = false;
+            }
             match cand.place {
                 Place::Remote { remote, class, .. } => {
                     self.remotes[remote].unseen[class] += 1;
@@ -973,7 +1055,6 @@ impl Sched {
     ) -> Slot {
         let job = JobId::new();
         self.layout.running[class] += 1;
-        self.mem_running_kb += pred.mem_kb;
         self.running.push(Running {
             job,
             build,
@@ -983,6 +1064,9 @@ impl Sched {
             cost_mcu: pred.cost_mcu,
             rank_mcu,
             start: now,
+            pid: None,
+            foot_kb: 0,
+            peak_kb: 0,
         });
         Slot { grant: self.layout.grants[class].clone(), job, unit, ran: None, tx: self.tx.clone() }
     }
@@ -1001,6 +1085,9 @@ impl Sched {
             cost_mcu: w.pred.cost_mcu,
             rank_mcu: w.rank_mcu,
             start: now,
+            pid: None,
+            foot_kb: 0,
+            peak_kb: 0,
         });
         let p = w.portable.expect("remote placement needs a portable job");
         let slot = RemoteSlot {
@@ -1110,8 +1197,9 @@ impl Sched {
                 .collect(),
             finishing: self.retired.iter().flat_map(|l| l.running.iter()).sum(),
             waiting: self.queue.len() as u32,
-            mem_limit_kb: self.setup.mem_limit_kb,
-            mem_running_kb: self.mem_running_kb,
+            mem_capacity_kb: self.mem.capacity_kb,
+            mem_used_kb: self.mem.used_kb,
+            mem_growth_kb: self.mem_growth_kb(),
             graph_nodes: self.graph.len() as u32,
             units,
             boxes,
@@ -1199,6 +1287,8 @@ mod test {
     use std::{
         fs::{File, OpenOptions},
         io::{Read, Write},
+        process::Command,
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     fn class(calib_us: u64, cpus: &[u32]) -> Class {
@@ -1261,7 +1351,7 @@ mod test {
     fn sched(
         dir: &Path,
         classes: Vec<Class>,
-        mem_limit_kb: u64,
+        memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
         costs: &[(&str, u64, u64)],
         edges: &[(&str, &[&str])],
     ) -> Result<(Sched, mpsc::UnboundedReceiver<Msg>, watch::Receiver<Load>)> {
@@ -1272,7 +1362,7 @@ mod test {
             state_dir: dir.to_path_buf(),
             fifo_dir: dir.to_path_buf(),
             allowed: (0..4).collect(),
-            mem_limit_kb,
+            memory,
             calibration_seconds: 4,
         };
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1296,16 +1386,31 @@ mod test {
         std::env::temp_dir().join(format!("rustc-dist-sched-{name}-{}", std::process::id()))
     }
 
+    /// A box with `capacity_kb` that nothing else uses.
+    fn idle_box(capacity_kb: u64) -> Box<dyn Fn() -> Result<BoxMemory> + Send + Sync> {
+        Box::new(move || Ok(BoxMemory { capacity_kb, used_kb: 0 }))
+    }
+
     impl Harness {
         fn start(
             name: &str,
             classes: Vec<Class>,
-            mem_limit_kb: u64,
+            capacity_kb: u64,
+            costs: &[(&str, u64, u64)],
+            edges: &[(&str, &[&str])],
+        ) -> Result<Self> {
+            Self::start_with(name, classes, idle_box(capacity_kb), costs, edges)
+        }
+
+        fn start_with(
+            name: &str,
+            classes: Vec<Class>,
+            memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
             costs: &[(&str, u64, u64)],
             edges: &[(&str, &[&str])],
         ) -> Result<Self> {
             let dir = scratch(name);
-            let (sched, rx, load) = sched(&dir, classes, mem_limit_kb, costs, edges)?;
+            let (sched, rx, load) = sched(&dir, classes, memory, costs, edges)?;
             let tx = sched.tx.clone();
             tokio::spawn(sched.run(rx));
             Ok(Self { tx, dir, load })
@@ -1552,6 +1657,81 @@ mod test {
     }
 
     #[tokio::test]
+    async fn memory_other_processes_use_holds_jobs_back() -> Result<()> {
+        let others = std::sync::Arc::new(AtomicU64::new(800));
+        let used = others.clone();
+        let memory =
+            Box::new(move || Ok(BoxMemory { capacity_kb: 1000, used_kb: used.load(Ordering::Relaxed) }));
+        let costs = [("small", 10, 100), ("big", 10, 600)];
+        let h = Harness::start_with("others", vec![class(1000, &[0, 1, 2, 3])], memory, &costs, &[])?;
+        let small = slot(h.submit("small")).await?;
+        let mut big = h.submit("big");
+        assert!(pending(&mut big).await, "800 used by others and 100 by small leave 100");
+        // Nothing here changes; the box is measured again while big waits.
+        others.store(0, Ordering::Relaxed);
+        slot(big).await?;
+        drop(small);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_memory_does_not_hold_back_a_job_that_can_go_elsewhere() -> Result<()> {
+        let costs = [("fat", 10, 900), ("big", 5_000_000, 400)];
+        let h = Harness::start("elsewhere", vec![class(1000, &[0, 1])], 1000, &costs, &[])?;
+        h.farm(remote_box(200, 4, 4, 1));
+        let fat = slot(h.submit("fat")).await?;
+        assert!(matches!(admitted(h.submit_with("big", want())).await?, Admission::Remote(_)));
+        let mut stays = h.submit("big");
+        assert!(pending(&mut stays).await, "it can't go elsewhere and doesn't fit here");
+        drop(fat);
+        slot(stays).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_records_the_most_memory_seen_while_it_ran() -> Result<()> {
+        let h = Harness::start("peak", vec![class(1000, &[0])], u64::MAX, &[], &[])?;
+        let mut child = Command::new("sleep").arg("10").spawn()?;
+        let job = slot(h.submit("a")).await?;
+        job.started(child.id());
+        time::sleep(MEASURE * 2).await;
+        let foot = sys::tree_footprint_kb(child.id());
+        // maxrss says 1 kB, as it would for a job swapped out at its peak.
+        job.finish(Ran { cpu_us: 1000, wall_us: 1000, maxrss_kb: 1 });
+        let st = h.status().await;
+        child.kill()?;
+        child.wait()?;
+        let a = st.units.iter().find(|u| u.key == "a").unwrap();
+        assert!(a.mem_kb >= foot / 2 && foot > 0, "recorded {} kB for {foot} kB", a.mem_kb);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn free_memory_counts_only_what_running_jobs_will_add() -> Result<()> {
+        let dir = scratch("free");
+        let costs = [("a", 10, 600)];
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], idle_box(10_000), &costs, &[])?;
+        s.measure(Instant::now());
+        let u = unit("a", &[]);
+        let pred = s.stats.predict(&u.exact, &u.coarse);
+        let p = pred.mem_kb;
+        let slot = s.admit(u.clone(), Some(1), pred, 10, 0, Instant::now());
+        assert_eq!(s.mem_free_kb(), 10_000 - p, "nothing sampled yet: all of it is to come");
+        // The box's use includes what the job holds, so only the rest is to come.
+        (s.running[0].foot_kb, s.mem.used_kb) = (p / 2, p / 2);
+        assert_eq!(s.mem_free_kb(), 10_000 - p);
+        (s.running[0].foot_kb, s.mem.used_kb) = (p + 300, p + 300);
+        assert_eq!(s.mem_free_kb(), 10_000 - p - 300, "past its prediction");
+        // Its footprint leaves the box's use with it, before the next sample.
+        let job = s.running[0].job;
+        s.finished(job, &u, None);
+        assert_eq!(s.mem_free_kb(), 10_000);
+        drop((slot, s));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn small_jobs_do_not_starve_a_big_one() -> Result<()> {
         let h = Harness::start(
             "starve",
@@ -1620,7 +1800,7 @@ mod test {
         // would wait 5 s for this box, so it goes to b.
         let dir = scratch("wave");
         let costs = [("big", 5_000_000, 1)];
-        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], u64::MAX, &costs, &[])?;
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], idle_box(u64::MAX), &costs, &[])?;
         let (jobs, state) = remote_box(1100, 4, 4, 1);
         s.farm("b".into(), Some((jobs, state)));
         let mut replies = [oneshot::channel(), oneshot::channel()].map(|(reply, rx)| {

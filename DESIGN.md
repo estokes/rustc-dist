@@ -85,9 +85,37 @@ caps how many wrappers wait. Set it at or above the farm's slot count.
 
 ### Memory
 
-A job is admitted only if the predicted maxrss of running jobs plus its own
-fits under a configured fraction of `MemTotal`. Predictions come from the cost
-table.
+Boxes overcommit RAM into compressed swap. Capacity is RAM plus half of
+compressed swap (`compressed_swap_share`). For zram, compressed swap is the
+size of its swap devices; for zswap, it is the pool limit times the compression
+ratio zswap is getting, or 3:1 until it has stored something, and never more
+than the swap behind it. Everything is counted as uncompressed data.
+
+The daemon measures the box rather than trusting its own bookkeeping, so other
+processes count. Use is what RAM holds (`MemTotal - MemAvailable`), less the
+RAM that compressed swap takes, plus all swapped data at its uncompressed size.
+Each job's footprint is the RSS plus swap of its processes: the wrapper and
+everything under it, or bwrap and everything under it for another box's job.
+The daemon walks every thread's children, since rustc starts the linker from
+its compiler thread.
+
+A job fits if the box's use, plus what running jobs are predicted to add
+(predicted peak less current footprint), plus its own predicted peak, is within
+capacity. Memory and footprints are sampled every 250 ms while jobs run, and
+again before placing a job if the last sample is older. A finished job's
+footprint leaves the box's use at once. With nothing running here, one job
+runs whatever its size, so the box can't sit idle behind a job bigger than it.
+
+A job that doesn't fit can still go to another box. If it can't, jobs after it
+don't run here either, so smaller jobs can't starve it, and the queue is looked
+at again every 250 ms, since other processes may free memory. A server refuses
+an offer that doesn't fit.
+
+Predictions come from the cost table: the 90th percentile of the unit's (or its
+crate's) recorded peaks, or the median of all jobs for a new crate. A recorded
+peak is the larger of rustc's `maxrss` and the most footprint seen while it ran
+here. `maxrss` counts only resident pages, so a job swapped out at its peak
+would otherwise be recorded small, and overcommit would grow on itself.
 
 ## Calibration
 
@@ -396,7 +424,7 @@ never sent. Real compile errors get compiled twice. They usually fail fast.
 
 Config is real TOML (`toml` + serde), parsed into two separate structs.
 
-- User, `~/.config/rustc-dist.toml`: `memory_fraction`,
+- User, `~/.config/rustc-dist.toml`: `compressed_swap_share`,
   `calibration_seconds`, and for a farm `base` (the netidx path every box
   publishes under), `name` (the host name by default) and `blob_cache_gb`.
   Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit
@@ -483,8 +511,9 @@ Known gaps:
 - A job stays local if the build graph doesn't know every crate below it,
   which happens when a project's target directory was built before the daemon
   first saw it.
-- The memory limit takes a prefix of the queue before placement, so local
-  memory holds back jobs that would have gone to another box.
+- Memory isn't published, so a box can still refuse an offer for memory. A
+  job run on another box is recorded with that box's `maxrss`, which misses
+  swapped pages.
 
 ## Guesses to test on the quiet cluster
 
@@ -501,7 +530,9 @@ Every number below is a guess. None has been tested on an idle box.
 | calibration keys per run (about 0.25 s on a P-core) | 2^15 | `src/calibrate.rs:20` |
 | halve a unit's history at | 256 runs | `src/stats.rs:18` |
 | cost of a job with no history at all | 1 cu | `src/stats.rs:20` |
-| share of RAM predicted peaks may use | 80% | `src/config.rs:22` |
+| share of compressed swap predicted peaks may use beyond RAM | 50% | `src/config.rs` `compressed_swap_share` |
+| zswap compression ratio before it has stored anything | 3:1 | `src/sys.rs` `ZSWAP_RATIO` |
+| sample memory and job footprints every | 250 ms | `src/sched.rs` `MEASURE` |
 | keep graph nodes unseen for | 60 days | `src/graph.rs:18` |
 | only send jobs predicted to take at least | 1 s | `src/sched.rs` `REMOTE_MIN_US` |
 | predicted cost of going remote | 200 ms | `src/sched.rs` `REMOTE_OVERHEAD_US` |
