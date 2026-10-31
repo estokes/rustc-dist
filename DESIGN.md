@@ -753,7 +753,9 @@ What the test found:
   CPU, 2.29 with one thread on each of 18 cores, and 0.56 with all 36
   threads, so SMT halves the box's throughput under it. The load's working
   set fits ryouko's large L3 and not aieka's. Instruction counting works
-  there, in bwrap too, with `perf_event_paranoid` at 2.
+  there, in bwrap too, with `perf_event_paranoid` at 2. Calibration now runs one
+  thread per core (see "Calibration"): aieka calibrates at 2.32 and ryouko at
+  5.96, close to the 1.89 and about 6.9 their classes had learned from rustc.
 - aieka can't learn its way out. A server spreads an offer with no class over
   every CPU, and spread jobs don't teach a class (`finished` in
   `src/sched.rs`). Light jobs go to aieka only if its class looks fastest,
