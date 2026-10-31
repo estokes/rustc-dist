@@ -726,6 +726,10 @@ What the test found:
   The daemon now shuts its publisher down before exiting.
 - Publishers on these workstations listen on loopback by default. `bind` in
   the config sets where other boxes reach a box.
+- Cargo holds about 4 open files per running job, so 256 jobs fail with "Too
+  many open files" under the usual soft limit of 1024 (this test's shell had
+  a higher one). 128 fits, still covers the farm's 126 slots, and builds as
+  fast; the help text recommends it.
 
 ## Guesses to test on the quiet cluster
 

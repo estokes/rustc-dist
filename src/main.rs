@@ -39,7 +39,8 @@ compiler:
   ~/.cargo/config.toml
     [build]
     rustc-wrapper = \"rustc-dist\"
-    jobs = 256    # at least the slot count; the daemon does the limiting
+    jobs = 128    # the daemon does the limiting; cargo holds about 4 open
+                  # files per job, and 128 fits the usual limit of 1024
 
 Every rustc asks the daemon on its box for a slot and waits until one is
 free. The daemon runs a job measured to use about one thread pinned to a
