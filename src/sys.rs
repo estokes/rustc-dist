@@ -20,6 +20,10 @@ pub fn pin(cpus: &[u32]) -> Result<()> {
     Ok(())
 }
 
+pub fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
 /// The logical CPUs this process may run on.
 pub fn allowed_cpus() -> Result<Vec<u32>> {
     let mut set: libc::cpu_set_t = unsafe { mem::zeroed() };

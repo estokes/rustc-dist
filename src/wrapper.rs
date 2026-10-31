@@ -31,7 +31,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     if args.is_empty() {
         bail!("cargo ran the wrapper without a compiler");
     }
-    if env::var_os("RUSTC_DIST").is_some_and(|v| v == "off") {
+    if env::var_os("RUSTC_DIST").is_some_and(|v| v == "off") || sys::running_as_root() {
         return Err(exec(&args));
     }
     let ask = match argv::classify(&args, env::var_os("OUT_DIR").as_deref()) {

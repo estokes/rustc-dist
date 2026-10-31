@@ -17,17 +17,27 @@ use std::{
 /// Send `ask` and return the daemon's reply, following the daemon
 /// through restarts. With `spawn`, start the daemon if none is running.
 pub fn request(ask: Ask, spawn: bool, buf: &mut BytesMut) -> Result<(UnixStream, Reply)> {
+    exchange(&ask, spawn, buf)?.context("the rustc-dist daemon is not running")
+}
+
+/// Send `ask` to the daemon if one is running, and return its reply.
+pub fn request_running(ask: Ask, buf: &mut BytesMut) -> Result<Option<Reply>> {
+    Ok(exchange(&ask, false, buf)?.map(|(_, reply)| reply))
+}
+
+/// None if no daemon is running and `spawn` is false.
+fn exchange(ask: &Ask, spawn: bool, buf: &mut BytesMut) -> Result<Option<(UnixStream, Reply)>> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let mut sock = connect(spawn)?;
+        let Some(mut sock) = connect(spawn)? else { return Ok(None) };
         // A daemon from another version closes without replying and restarts.
-        match open(&mut sock, buf, &ask) {
+        match open(&mut sock, buf, ask) {
             Ok(Reply::Restarting) | Err(_) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(50))
             }
             Ok(Reply::Restarting) => bail!("the rustc-dist daemon kept restarting"),
             Err(e) => return Err(e.context("talking to the rustc-dist daemon")),
-            Ok(reply) => return Ok((sock, reply)),
+            Ok(reply) => return Ok(Some((sock, reply))),
         }
     }
 }
@@ -38,31 +48,35 @@ fn open(sock: &mut UnixStream, buf: &mut BytesMut, ask: &Ask) -> Result<Reply> {
     protocol::recv(sock, buf)
 }
 
+/// A connection to the daemon, if one is running.
+fn running() -> Result<Option<UnixStream>> {
+    match UnixStream::connect(config::socket_path()) {
+        Ok(sock) => Ok(Some(sock)),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => Ok(None),
+        Err(e) => Err(e).context("connecting to the daemon"),
+    }
+}
+
 /// Ask a running daemon to exit. Returns false if none was running.
 pub fn shutdown() -> Result<bool> {
-    let mut sock = match UnixStream::connect(config::socket_path()) {
-        Ok(sock) => sock,
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
-            return Ok(false);
-        }
-        Err(e) => return Err(e).context("connecting to the daemon"),
-    };
+    let Some(mut sock) = running()? else { return Ok(false) };
     // Any daemon stops on this, even one from another version that can't reply.
     let _ = open(&mut sock, &mut BytesMut::new(), &Ask::Shutdown);
     Ok(true)
 }
 
-fn connect(spawn: bool) -> Result<UnixStream> {
-    let path = config::socket_path();
-    match UnixStream::connect(&path) {
-        Ok(sock) => return Ok(sock),
-        Err(_) if spawn => spawn_daemon()?,
-        Err(e) => return Err(e).context("the rustc-dist daemon is not running"),
+fn connect(spawn: bool) -> Result<Option<UnixStream>> {
+    if let Some(sock) = running()? {
+        return Ok(Some(sock));
     }
+    if !spawn {
+        return Ok(None);
+    }
+    spawn_daemon()?;
     for _ in 0..200 {
         thread::sleep(Duration::from_millis(25));
-        if let Ok(sock) = UnixStream::connect(&path) {
-            return Ok(sock);
+        if let Some(sock) = running()? {
+            return Ok(Some(sock));
         }
     }
     bail!("the rustc-dist daemon did not start, see {}", config::log_path().display())

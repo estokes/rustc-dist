@@ -52,6 +52,9 @@ struct Ctx {
 }
 
 pub async fn run() -> Result<()> {
+    if sys::running_as_root() {
+        bail!("rustc-dist won't run its daemon as root: it runs other boxes' proc macros");
+    }
     let cfg = config::load()?;
     let dir = config::runtime_dir();
     config::make_private_dir(&dir)?;

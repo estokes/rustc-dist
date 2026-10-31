@@ -115,13 +115,24 @@ cargo install rustc-dist
    - Incremental jobs always stay on the box that has the incremental cache.
      With incremental off, workspace crates can be sent to other boxes too.
 
-3. On a laptop, have your desktop environment run `rustc-dist profile NAME`
-   whenever the power profile changes. The daemon calibrates each new profile
-   name the first time it sees it, once running jobs finish. To calibrate a
-   profile ahead of time, on an idle box:
+3. Profiles are names you choose, switched with `rustc-dist profile NAME`:
+   for example from a script when a laptop's power profile changes, or when a
+   long-running load starts on the box. The daemon calibrates each new
+   profile name the first time it sees it, once running jobs finish, and
+   switches to a known one at once. If no daemon is running, the command
+   records the profile for the next start. To calibrate a profile ahead of
+   time, on an idle box:
 
    ```sh
    rustc-dist profile power-saver --recalibrate
+   ```
+
+   The command must run as the user the daemon runs as. From a root script,
+   for example:
+
+   ```sh
+   runuser -u alice -- env HOME=/home/alice XDG_RUNTIME_DIR=/run/user/1000 \
+       /home/alice/.cargo/bin/rustc-dist profile power-saver
    ```
 
 4. Build as usual. `rustc-dist status` shows what it's doing, and
@@ -214,7 +225,8 @@ A job runs only on the box that started it if it:
 ## Security
 
 Anyone who can open a job channel can run code as the server's user, because
-proc macros are client-supplied shared libraries. Three things limit that:
+proc macros are client-supplied shared libraries. The daemon won't run as
+root, and the wrapper runs rustc directly when cargo runs as root. Three things limit that:
 netidx permissions on the base path, a bubblewrap sandbox with no network
 and no home directory, and checks on every path a client sends. Only run a
 farm within a netidx domain whose members you trust.

@@ -118,15 +118,19 @@ fn dispatch() -> Result<()> {
 
 fn profile(name: &str, recalibrate: bool) -> Result<()> {
     let profile = Profile::new(name)?;
-    // A daemon this starts then begins in the new profile, instead of
-    // first calibrating the old one.
+    // A daemon started later begins in this profile, instead of first
+    // calibrating the old one.
     classes::set_current(&config::state_dir(), &profile)?;
     let ask = Ask::Profile { name: profile.name().clone(), recalibrate };
     let mut buf = BytesMut::new();
-    match client::request(ask, true, &mut buf)?.1 {
-        Reply::Done => Ok(()),
-        Reply::Refused(why) => bail!("{why}"),
-        _ => bail!("unexpected reply from the daemon"),
+    match client::request_running(ask, &mut buf)? {
+        None => {
+            eprintln!("no daemon is running; it will start in profile {}", profile.name());
+            Ok(())
+        }
+        Some(Reply::Done) => Ok(()),
+        Some(Reply::Refused(why)) => bail!("{why}"),
+        Some(_) => bail!("unexpected reply from the daemon"),
     }
 }
 
