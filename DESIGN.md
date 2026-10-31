@@ -355,9 +355,9 @@ netidx namespace:
 - `BASE/units/NAME/UNIT/COLUMN`: the units the box has run (see below).
 
 A box's state is eight columns of its status row, each its own value:
-protocol version, profile, a version number, its toolchains, and per class
-(as arrays) CPUs, G instructions/s, free tokens, and how many ms until its
-next token is predicted to free. A change updates the columns it touches in
+`protocol`, `profile`, `version` (a counter), `toolchains`, and per class (as
+arrays) `cpus`, `class GIPS` (G instructions/s), `free` tokens, and `frees in
+ms`, until its next token is predicted to free. A change updates the columns it touches in
 one batch, which subscribers get whole and in order, so no box sees half a
 state, and unchanged columns aren't sent. Free tokens
 are counted in the class's jobserver FIFO with `FIONREAD`, which doesn't take
@@ -404,8 +404,10 @@ they sent. Each class shows this box's jobs, other boxes' jobs and free tokens.
 
 In a farm each box also publishes what `status` shows, for the netidx browser.
 Beside its state columns, its status row has figures for people: jobs
-waiting, running and serving, CPUs, total G instructions/s, per class jobs
-running, serving and tokens lent, and memory. So `BASE/status` shows the
+`waiting`, `running` and `serving`, total `GIPS`, per class `class running`,
+`class serving` and tokens `lent`, `finishing` under the last profile, memory
+(`mem GiB`, `mem growth GiB` predicted from running jobs, `mem cap GiB`) and
+`graph units`. So `BASE/status` shows the
 whole farm at a glance. Its units go in a table of their own at
 `BASE/units/NAME`, with `status`'s columns. Values are typed numbers, so the
 browser sorts them. These refresh every 2 s and send only cells that

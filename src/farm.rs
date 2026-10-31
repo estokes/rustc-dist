@@ -34,16 +34,8 @@ const LIST_EVERY: Duration = Duration::from_secs(1);
 /// The status columns a box's state is published in. A change updates the
 /// columns it touches in one batch, which subscribers get whole, so a box
 /// never sees half of another's state.
-pub const STATE: [&str; 8] = [
-    "protocol",
-    "profile",
-    "version",
-    "toolchains",
-    "class cpus",
-    "class G instr per s",
-    "class free",
-    "class next free (ms)",
-];
+pub const STATE: [&str; 8] =
+    ["protocol", "profile", "version", "toolchains", "cpus", "class GIPS", "free", "frees in ms"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pack)]
 pub struct ClassState {

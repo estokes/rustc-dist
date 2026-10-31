@@ -23,9 +23,8 @@ use tokio::{
 /// Building a status costs the scheduler a few ms.
 const REFRESH: Duration = Duration::from_secs(2);
 
-const UNIT_COLUMNS: [&str; 11] = [
-    "rank", "work", "front (%)", "width", "wall (s)", "mem (MB)", "here", "sent", "served", "copy (s)", "MB sent",
-];
+const UNIT_COLUMNS: [&str; 11] =
+    ["rank", "work", "front %", "width", "wall s", "mem MB", "here", "sent", "served", "copy s", "sent MB"];
 
 /// Publish this box's figures in its status row at `row` and its units
 /// under `units` every couple of seconds, until the scheduler stops.
@@ -118,21 +117,20 @@ impl Board {
         let per_class =
             |f: fn(&ClassStatus) -> u32| Value::from(st.classes.iter().map(|c| i64::from(f(c))).collect::<Vec<_>>());
         let sum = |f: fn(&ClassStatus) -> u32| st.classes.iter().map(f).sum::<u32>();
-        let figures: [(&'static str, Value); 14] = [
-            ("switching profile", switching),
+        let figures: [(&'static str, Value); 13] = [
+            ("switching", switching),
             ("waiting", st.waiting.into()),
             ("running", (sum(|c| c.running) + st.spread.running).into()),
             ("serving", (sum(|c| c.serving) + st.spread.serving).into()),
-            ("cpus", sum(|c| c.cpus).into()),
-            ("G instr per s", round(st.classes.iter().map(|c| c.rate_g() * c.cpus as f64).sum(), 0).into()),
+            ("GIPS", round(st.classes.iter().map(|c| c.rate_g() * c.cpus as f64).sum(), 0).into()),
             ("class running", per_class(|c| c.running)),
             ("class serving", per_class(|c| c.serving)),
-            ("class lent", per_class(|c| c.lent)),
-            ("finishing under the last profile", st.finishing.into()),
-            ("memory in use (GiB)", round(gib(st.mem_used_kb), 1).into()),
-            ("memory running jobs will add (GiB)", round(gib(st.mem_growth_kb), 1).into()),
-            ("memory capacity (GiB)", round(gib(st.mem_capacity_kb), 1).into()),
-            ("units in the build graph", st.graph_nodes.into()),
+            ("lent", per_class(|c| c.lent)),
+            ("finishing", st.finishing.into()),
+            ("mem GiB", round(gib(st.mem_used_kb), 1).into()),
+            ("mem growth GiB", round(gib(st.mem_growth_kb), 1).into()),
+            ("mem cap GiB", round(gib(st.mem_capacity_kb), 1).into()),
+            ("graph units", st.graph_nodes.into()),
         ];
         for (name, v) in figures {
             match self.figures.get_mut(name) {
@@ -222,17 +220,17 @@ mod test {
         show(&mut board, &publisher, &status(both)).await?;
         assert_eq!(value(&net, "/farm/status/a/waiting").await?, Value::from(7u32));
         assert_eq!(value(&net, "/farm/status/a/running").await?, Value::from(2u32));
-        assert_eq!(value(&net, "/farm/status/a/G instr per s").await?, Value::from(38.0));
+        assert_eq!(value(&net, "/farm/status/a/GIPS").await?, Value::from(38.0));
         for column in net.subscriber().resolver().list(Path::from("/farm/status/a")).await?.iter() {
             let below = net.subscriber().resolver().list(column.clone()).await?;
             assert!(below.is_empty(), "{column} is a directory, not a column");
         }
         assert_eq!(value(&net, "/farm/status/a/class serving").await?, Value::from(vec![0i64, 2]));
         assert_eq!(value(&net, &format!("{serde}/work")).await?, Value::from(2.5));
-        assert_eq!(value(&net, &format!("{serde}/front (%)")).await?, Value::from(25u64));
-        assert_eq!(value(&net, &format!("{serde}/copy (s)")).await?, Value::from(1.5));
-        assert_eq!(value(&net, &format!("{serde}/MB sent")).await?, Value::from(3.0));
-        assert_eq!(value(&net, "/farm/units/a/rustc:syn:2:link/copy (s)").await?, Value::Null);
+        assert_eq!(value(&net, &format!("{serde}/front %")).await?, Value::from(25u64));
+        assert_eq!(value(&net, &format!("{serde}/copy s")).await?, Value::from(1.5));
+        assert_eq!(value(&net, &format!("{serde}/sent MB")).await?, Value::from(3.0));
+        assert_eq!(value(&net, "/farm/units/a/rustc:syn:2:link/copy s").await?, Value::Null);
         // A changed unit is updated, and one gone from the status is unpublished.
         show(&mut board, &publisher, &status(vec![unit("rustc:serde:1:link", 3000, Some((1500, 3072)))])).await?;
         assert_eq!(value(&net, &format!("{serde}/work")).await?, Value::from(3.0));
