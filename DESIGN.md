@@ -737,7 +737,15 @@ What the test found:
   was a short job off the long chain with hundreds of seconds of slack, and
   short jobs never left the box, being under the 1 s cutoff. Now a job takes
   a free class within its slack before waiting for a slower one, and a job
-  that would wait here may go to another box whatever its size.
+  that would wait here may go to another box whatever its size. Afterwards
+  the build took 1m 20s, against 1m 28s before and 1m 19s on ryouko alone.
+  It sent 384 jobs (292 to ryouko, 92 to aieka) instead of 141, and the
+  laptop spent 277 s of CPU instead of 377. All three classes were close to
+  100% busy for the first 11 s, with at most 12 jobs waiting, while ryouko
+  ran up to 35 of its jobs at once and aieka up to 47. Jobs waited with a
+  P or E slot free for about 2 s of the build, not 31.
+- Asking for `status` every 100 ms added about 13 s to a build (93 s
+  sampled against 80 s not), so the status reply slows the scheduler.
 - Cargo holds about 4 open files per running job, so 256 jobs fail with "Too
   many open files" under the usual soft limit of 1024 (this test's shell had
   a higher one). 128 fits, still covers the farm's 126 slots, and builds as
