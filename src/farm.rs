@@ -32,6 +32,10 @@ pub struct ClassState {
     /// Jobserver tokens an offer to this class would find now: none while
     /// the box switches profile or its own jobs wait.
     pub free: u32,
+    /// How many ms after this state was published a token is predicted to
+    /// free: 0 with one free. None when the box can't say, because it takes
+    /// no offers or nothing it runs holds the class.
+    pub frees_in_ms: Option<u32>,
 }
 
 /// What a box publishes at `BASE/NAME/state`.

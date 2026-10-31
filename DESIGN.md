@@ -347,9 +347,14 @@ work, so build times say nothing yet; placement is all that was checked.
 
 A daemon whose config has `base` joins the farm. It publishes one packed value
 at `BASE/NAME/state`: protocol version, profile, a version number, its
-toolchains, and each class's calibration, CPUs and free tokens. Free tokens
+toolchains, and each class's calibration, CPUs, free tokens, and how soon its
+next token is predicted to free. Free tokens
 are counted in the class's jobserver FIFO with `FIONREAD`, which doesn't take
-them, so they leave out the tokens rustc's codegen threads hold. A box
+them, so they leave out the tokens rustc's codegen threads hold. The
+prediction is the soonest predicted end of a job holding one of the class's
+tokens, this box's or another's: 0 with a token free, unknown while the box
+takes no offers. It changing alone doesn't republish; it goes out with the
+next change, and clients count it down from when the state arrived. A box
 publishes no free tokens while it switches profile or its own jobs wait. The
 scheduler counts after every event, and every 100 ms while jobs run, since
 codegen threads take and return tokens without telling it. A changed load is
@@ -591,7 +596,9 @@ libraries and linker, kept so by the sysadmin.
   Jobserver above). Class pools hold 1.5 tokens per CPU.
 - A heavy job's predicted time is its front end at the fastest class's rate
   plus the rest at the mean rate per CPU, over the threads it can get:
-  min(its width, the tokens free). Its width is as measured, or its codegen
+  min(its width, the box's CPUs). Its front end runs first, on one thread,
+  so the short jobs holding tokens when it starts are gone by the time its
+  codegen wants them. Its width is as measured, or its codegen
   units if never measured. It goes wherever it finishes first, this box or
   another, and on another box it runs on every CPU too; a server starts it
   holding a token from its fastest class and a spare. With no history to
@@ -616,9 +623,13 @@ libraries and linker, kept so by the sysadmin.
 
 ### Stage 4: placement by capacity
 
-- A heavy job goes where its predicted finish is soonest, counting each
-  box's free capacity and the predicted transfer time. The biggest jobs
-  land on the box with the most free capacity.
+- A heavy job with history also considers a box with no token free, starting
+  when that box predicts its next token frees, and waits for it if it
+  finishes there soonest (built 2026-10-31). It is offered once the box shows
+  a free token; until then no other job from here takes that box's tokens,
+  since none show free.
+- Still to do: count each job's predicted transfer time rather than a flat
+  200 ms.
 
 ## Farm test (2026-10-30)
 
@@ -744,6 +755,15 @@ What the test found:
   100% busy for the first 11 s, with at most 12 jobs waiting, while ryouko
   ran up to 35 of its jobs at once and aieka up to 47. Jobs waited with a
   P or E slot free for about 2 s of the build, not 31.
+- `graphix_types` sometimes went to aieka, taking 101 s instead of 60 s on
+  ryouko, and the build 1m 58s. With short jobs now going away, ryouko was
+  often full when it became ready. A box with no free token wasn't a
+  candidate, and a heavy job was predicted with as many threads as a box had
+  tokens free, so aieka, with dozens free, looked able to run all its
+  codegen threads at once while the laptop, nearly full, looked limited to
+  one. Now boxes publish when their next token frees, a heavy job may wait
+  for a busy box, and it is predicted with as many threads as a box has
+  CPUs.
 - Asking for `status` every 100 ms added about 13 s to a build (93 s
   sampled against 80 s not), so the status reply slows the scheduler.
 - Cargo holds about 4 open files per running job, so 256 jobs fail with "Too

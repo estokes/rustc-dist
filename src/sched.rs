@@ -637,9 +637,17 @@ struct RemoteBox {
     avail: Vec<u32>,
     /// It answered busy, so its state is stale until this version.
     busy_until: Option<u64>,
+    /// When its state arrived, which its predictions count from.
+    seen: Instant,
 }
 
 impl RemoteBox {
+    /// µs until its state predicts a token frees, if it can say.
+    fn frees_in_us(&self, now: Instant) -> Option<u64> {
+        let ms = self.state.as_ref()?.classes.iter().filter_map(|c| c.frees_in_ms).min()?;
+        Some((ms as u64 * 1000).saturating_sub(now.duration_since(self.seen).as_micros() as u64))
+    }
+
     fn usable(&self, p: &Portable) -> Option<&BoxState> {
         let state = self.state.as_ref()?;
         let ready = state.protocol == PROTOCOL
@@ -1006,6 +1014,7 @@ impl Sched {
                     state: None,
                     avail: Vec::new(),
                     busy_until: None,
+                    seen: Instant::now(),
                 });
                 self.remotes.len() - 1
             }
@@ -1019,6 +1028,7 @@ impl Sched {
                 }
                 rb.jobs = jobs;
                 rb.state = Some(state);
+                rb.seen = Instant::now();
             }
             None => {
                 rb.state = None;
@@ -1259,6 +1269,7 @@ impl Sched {
         rates.extend(self.layout.rates.iter().map(Rate::get));
         let fastest = rates.iter().copied().max().unwrap_or(1);
         let (_, spread_rate) = self.layout.spread_rates();
+        let local_cpus = self.layout.classes.iter().map(|c| c.cpus.len() as u64).sum::<u64>();
         let mut mem_free = self.mem_free_kb();
         // With nothing running here, one job runs whatever its memory, so
         // the box can't sit idle behind a job bigger than it.
@@ -1306,6 +1317,9 @@ impl Sched {
                     (c.place, run_us)
                 })
             } else {
+                // Its front end runs first, on one thread, so the short jobs
+                // holding tokens now are gone by the time its codegen wants
+                // them: a box can give it as many threads as it has CPUs.
                 let threads = width(&w.pred, &w.unit);
                 let tokens = held.iter().sum::<usize>() as u64;
                 wide.clear();
@@ -1319,7 +1333,7 @@ impl Sched {
                     };
                     wide.push(Wide {
                         start_us,
-                        run_us: spread_us(&w.pred, fastest, spread_rate, threads.min(tokens.max(1))),
+                        run_us: spread_us(&w.pred, fastest, spread_rate, threads.min(local_cpus)),
                         capacity: spread_rate * tokens,
                         place: Place::Spread { layout: self.layout.id, class },
                     });
@@ -1327,14 +1341,16 @@ impl Sched {
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Some(state) = away.and_then(|p| rb.usable(p)) else { continue };
                     let avail = rb.avail.iter().sum::<u32>() as u64;
-                    if avail > 0 {
-                        let (fast, rate) = state_rates(&state.classes);
-                        wide.push(Wide {
-                            start_us: 0,
-                            run_us: REMOTE_OVERHEAD_US + spread_us(&w.pred, fast, rate, threads.min(avail)),
-                            capacity: rate * avail,
-                            place: Place::Remote { remote: r, class: None, shown_in: None },
-                        });
+                    let (fast, rate) = state_rates(&state.classes);
+                    let cpus = state.classes.iter().map(|c| c.cpus as u64).sum::<u64>();
+                    let run_us = REMOTE_OVERHEAD_US + spread_us(&w.pred, fast, rate, threads.min(cpus));
+                    let place = Place::Remote { remote: r, class: None, shown_in: None };
+                    // A busy box is worth waiting for if it finishes the job
+                    // sooner than anywhere free; with no history to say so,
+                    // the job takes free capacity.
+                    let start_us = if avail > 0 { Some(0) } else { rb.frees_in_us(now).filter(|_| w.pred.known) };
+                    if let Some(start_us) = start_us {
+                        wide.push(Wide { start_us, run_us, capacity: rate * avail, place });
                     }
                 }
                 (!wide.is_empty()).then(|| {
@@ -1356,6 +1372,11 @@ impl Sched {
             match place {
                 Place::Remote { remote, class, .. } => {
                     let RemoteBox { state, avail, .. } = &mut self.remotes[remote];
+                    if class.is_none() && avail.iter().all(|&n| n == 0) {
+                        // It waits for a token there to free.
+                        self.starved = true;
+                        continue;
+                    }
                     match (class, state) {
                         (Some(k), _) => avail[k] -= 1,
                         (None, Some(state)) => take_fastest(avail, &state.classes, 2),
@@ -1547,16 +1568,29 @@ impl Sched {
     fn publish(&mut self) {
         let answered = mem::take(&mut self.answered);
         let closed = self.closed().is_some();
-        let (layout, profile) = (&self.layout, self.profile.name());
-        self.load.send_if_modified(|load| {
-            let mut changed =
-                answered || load.profile != *profile || load.classes.len() != layout.classes.len();
-            load.classes.resize(layout.classes.len(), ClassState { rate: 0, cpus: 0, free: 0 });
-            let classes = layout.classes.iter().zip(&layout.rates).zip(&layout.fifos);
-            for (l, ((c, rate), fifo)) in load.classes.iter_mut().zip(classes) {
+        let now = Instant::now();
+        let layout = &self.layout;
+        let mut classes: LPooled<Vec<ClassState>> = LPooled::take();
+        classes.extend(layout.classes.iter().zip(&layout.rates).zip(&layout.fifos).enumerate().map(
+            |(k, ((c, rate), fifo))| {
                 let free = if closed { 0 } else { fifo.free() };
-                let now = ClassState { rate: rate.get(), cpus: c.cpus.len() as u32, free };
-                changed |= *l != now;
+                let frees_in_ms = match (closed, free) {
+                    (true, _) => None,
+                    (false, 0) => self.frees_in_us(k, now).map(|us| (us / 1000).min(u32::MAX as u64) as u32),
+                    (false, _) => Some(0),
+                };
+                ClassState { rate: rate.get(), cpus: c.cpus.len() as u32, free, frees_in_ms }
+            },
+        ));
+        let profile = self.profile.name();
+        self.load.send_if_modified(|load| {
+            let mut changed = answered || load.profile != *profile || load.classes.len() != classes.len();
+            load.classes.resize(classes.len(), ClassState { rate: 0, cpus: 0, free: 0, frees_in_ms: None });
+            // A prediction alone changing doesn't republish: it goes out
+            // with the next change, and clients age it.
+            let key = |c: &ClassState| (c.rate, c.cpus, c.free);
+            for (l, now) in load.classes.iter_mut().zip(classes.drain(..)) {
+                changed |= key(l) != key(&now);
                 *l = now;
             }
             if changed {
@@ -2063,7 +2097,7 @@ mod test {
 
     fn remote_box(calib_us: u64, cpus: u32, free: u32, version: u64) -> (NPath, BoxState) {
         let toolchains = vec![Toolchain { key: "c h".into(), targets: vec!["h".into()] }];
-        let classes = vec![ClassState { rate: rate(calib_us), cpus, free }];
+        let classes = vec![ClassState { rate: rate(calib_us), cpus, free, frees_in_ms: (free > 0).then_some(0) }];
         let state = BoxState { protocol: PROTOCOL, profile: "default".into(), version, toolchains, classes };
         (NPath::from("/farm/b/jobs"), state)
     }
@@ -2137,11 +2171,13 @@ mod test {
         let shown = h.load.borrow().clone();
         assert_eq!(shown.version, answer.version, "the publish after the answer has its version");
         assert_eq!(shown.classes[0].free, 0);
+        assert!(shown.classes[0].frees_in_ms.is_some(), "it predicts when the served job ends");
         let mut local = h.submit("l");
         assert!(pending(&mut local).await);
         let refused = h.offer("r", Some(0)).await?;
         assert!(refused.slot.is_none(), "a local job is waiting");
         assert_eq!(refused.version, answer.version + 1, "a refusal is published too");
+        assert_eq!(h.load.borrow().classes[0].frees_in_ms, None, "its own waiting job comes first");
         drop(served);
         slot(local).await?;
         Ok(())
@@ -2431,6 +2467,55 @@ mod test {
         };
         assert_eq!(class(&mut rx[0]), Some(None), "on every cpu there");
         assert_eq!(class(&mut rx[1]), Some(Some(0)), "pinned to a class there");
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_heavy_job_waits_for_a_busy_box_that_finishes_it_sooner() -> Result<()> {
+        let dir = scratch("wait-for-box");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room(u64::MAX), &[], &[])?;
+        history(&mut s, "wide", 5_000_000, 400);
+        // b is five times as fast as this box but busy; c is free but slower.
+        let busy = |frees_in_ms, version| {
+            let (jobs, mut state) = remote_box(200, 32, 0, version);
+            state.classes[0].frees_in_ms = Some(frees_in_ms);
+            (jobs, state)
+        };
+        let (_, slow) = remote_box(5000, 36, 36, 1);
+        s.farm("c".into(), Some((NPath::from("/farm/c/jobs"), slow)));
+        // Here it takes 1.25 s on 4 cpus, which keep a token free after the
+        // first, on c 6.45 s, on b 0.45 s once a token frees.
+        s.farm("b".into(), Some(busy(10_000, 1)));
+        let mut late = place(&mut s, &["wide"], true);
+        assert!(matches!(late[0].try_recv(), Ok(Admission::Slot(_))), "b frees too late: here");
+        s.farm("b".into(), Some(busy(300, 2)));
+        let mut soon = place(&mut s, &["wide"], true);
+        assert!(soon[0].try_recv().is_err(), "it waits for b");
+        s.farm("b".into(), Some(remote_box(200, 32, 32, 3)));
+        s.dispatch();
+        match soon[0].try_recv() {
+            Ok(Admission::Remote(r)) => {
+                assert_eq!(r.jobs, NPath::from("/farm/b/jobs"));
+                r.finish(RemoteOutcome::Busy { version: 4 });
+            }
+            _ => bail!("not sent to b once it had a token"),
+        }
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_heavy_job_counts_a_box_by_its_cpus_not_its_free_tokens() -> Result<()> {
+        let dir = scratch("cpus-not-tokens");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1])], room(u64::MAX), &[], &[])?;
+        history(&mut s, "wide", 5_000_000, 400);
+        // b is as fast as this box and has one token free, but 32 cpus.
+        s.farm("b".into(), Some(remote_box(1000, 32, 1, 1)));
+        let mut rx = place(&mut s, &["wide"], true);
+        assert!(matches!(rx[0].try_recv(), Ok(Admission::Remote(_))), "4 threads there beat 2 here");
         drop(s);
         fs::remove_dir_all(&dir)?;
         Ok(())
