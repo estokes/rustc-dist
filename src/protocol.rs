@@ -231,6 +231,76 @@ pub struct UnitStatus {
     pub rank_mi: Option<u64>,
 }
 
+/// Millions as billions, or instructions per µs as G per second.
+fn g(n: u64) -> f64 {
+    n as f64 / 1000.
+}
+
+pub fn gib(kb: u64) -> f64 {
+    kb as f64 / (1024. * 1024.)
+}
+
+/// The figures `status` and the netidx browser show.
+impl UnitStatus {
+    /// G instructions waiting on it, if it is in this box's build graph.
+    pub fn rank_g(&self) -> Option<f64> {
+        self.rank_mi.map(g)
+    }
+
+    pub fn work_g(&self) -> f64 {
+        g(self.cost_mi)
+    }
+
+    /// The single-threaded front end's share of its work, in percent.
+    pub fn front_pct(&self) -> Option<u64> {
+        self.front_mi.map(|f| f * 100 / self.cost_mi.max(1))
+    }
+
+    /// Threads busy after the front end.
+    pub fn width(&self) -> f64 {
+        self.width_c as f64 / 100.
+    }
+
+    pub fn wall_s(&self) -> f64 {
+        self.wall_ms as f64 / 1000.
+    }
+
+    pub fn mem_mb(&self) -> u64 {
+        self.mem_kb / 1024
+    }
+
+    /// Medians of its sent runs: seconds spent on files, and MB sent.
+    pub fn copy(&self) -> Option<(f64, f64)> {
+        Some((self.copy_ms? as f64 / 1000., self.sent_kb? as f64 / 1024.))
+    }
+}
+
+impl ClassStatus {
+    pub fn rate_g(&self) -> f64 {
+        g(self.rate)
+    }
+}
+
+impl BoxStatus {
+    pub fn cpus(&self) -> u32 {
+        self.classes.iter().map(|c| c.cpus).sum()
+    }
+
+    pub fn free(&self) -> u32 {
+        self.classes.iter().map(|c| c.free).sum()
+    }
+
+    /// G instructions per second over all its CPUs.
+    pub fn capacity_g(&self) -> f64 {
+        g(self.classes.iter().map(|c| c.rate * c.cpus as u64).sum())
+    }
+
+    /// Seconds after its last state that a token was predicted to free.
+    pub fn frees_in_s(&self) -> Option<f64> {
+        self.classes.iter().filter_map(|c| c.frees_in_ms).min().map(|ms| ms as f64 / 1000.)
+    }
+}
+
 pub fn frame<T: Pack>(buf: &mut BytesMut, v: &T) -> Result<()> {
     let len = v.encoded_len();
     if len > MAX_MSG {

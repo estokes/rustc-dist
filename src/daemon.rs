@@ -1,5 +1,6 @@
 use crate::{
     blobs::{Hashes, Store},
+    browser,
     classes::{self, Profile},
     config::{self, Config},
     farm::{self, Load, Member},
@@ -178,6 +179,12 @@ async fn join(
                     break;
                 }
             }
+        }
+    });
+    let status = browser::run(publisher.clone(), base.append(&name).append("status"), tx.clone());
+    tokio::spawn(async move {
+        if let Err(e) = status.await {
+            error!("no longer publishing status: {e:#}");
         }
     });
     let member = Member { publisher: publisher.clone(), subscriber: subscriber.clone(), base, name, toolchains };

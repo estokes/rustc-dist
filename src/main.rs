@@ -1,5 +1,6 @@
 mod argv;
 mod blobs;
+mod browser;
 mod calibrate;
 mod classes;
 mod client;
@@ -26,7 +27,7 @@ use bytes::BytesMut;
 use clap::{Args, Parser};
 use compact_str::{CompactString, format_compact};
 use classes::Profile;
-use protocol::{Ask, Reply, Switching};
+use protocol::{Ask, Reply, Switching, gib};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -150,7 +151,7 @@ fn status() -> Result<()> {
             out,
             "{k:5}  {:4}  {:9.2}  {:7}  {:7}  {:4}  {:4}",
             c.cpus,
-            c.rate as f64 / 1000.,
+            c.rate_g(),
             c.running,
             c.serving,
             c.lent,
@@ -165,7 +166,6 @@ fn status() -> Result<()> {
     if st.finishing > 0 {
         writeln!(out, "{} jobs finishing under the previous profile", st.finishing)?;
     }
-    let gib = |kb: u64| kb as f64 / (1024. * 1024.);
     writeln!(
         out,
         "\n{} waiting. Memory: {:.1} GiB in use, running jobs predicted to add {:.1}, capacity {:.1}",
@@ -175,16 +175,15 @@ fn status() -> Result<()> {
         gib(st.mem_capacity_kb)
     )?;
     for b in &st.boxes {
-        let cpus: u32 = b.classes.iter().map(|c| c.cpus).sum();
-        let free: u32 = b.classes.iter().map(|c| c.free).sum();
-        let capacity: u64 = b.classes.iter().map(|c| c.rate * c.cpus as u64).sum();
         let note = if b.compatible { "" } else { ", other version" };
         writeln!(
             out,
-            "box {}: profile {}, {free} of {cpus} cpus free, {:.0} G instr/s, {} from here{note}",
+            "box {}: profile {}, {} of {} cpus free, {:.0} G instr/s, {} from here{note}",
             b.name,
             b.profile,
-            capacity as f64 / 1000.,
+            b.free(),
+            b.cpus(),
+            b.capacity_g(),
             b.sent
         )?;
     }
@@ -206,25 +205,25 @@ fn status() -> Result<()> {
         "rank", "work", "front", "width", "wall (s)", "mem (MB)", "here", "sent", "served", "copy (s)", "MB sent"
     )?;
     for u in &st.units {
-        let rank: CompactString = match u.rank_mi {
-            Some(r) => format_compact!("{:8.2}", r as f64 / 1000.),
+        let rank: CompactString = match u.rank_g() {
+            Some(r) => format_compact!("{r:8.2}"),
             None => format_compact!("{:>8}", "-"),
         };
-        let front: CompactString = match u.front_mi {
-            Some(f) => format_compact!("{:4}%", f * 100 / u.cost_mi.max(1)),
+        let front: CompactString = match u.front_pct() {
+            Some(f) => format_compact!("{f:4}%"),
             None => format_compact!("{:>5}", "-"),
         };
-        let (copy, sent): (CompactString, CompactString) = match (u.copy_ms, u.sent_kb) {
-            (Some(ms), Some(kb)) => (format_compact!("{:8.2}", ms as f64 / 1000.), format_compact!("{:7.1}", kb as f64 / 1024.)),
+        let (copy, sent): (CompactString, CompactString) = match u.copy() {
+            Some((s, mb)) => (format_compact!("{s:8.2}"), format_compact!("{mb:7.1}")),
             _ => (format_compact!("{:>8}", "-"), format_compact!("{:>7}", "-")),
         };
         writeln!(
             out,
             "{rank}  {:8.2}  {front}  {:5.1}  {:8.1}  {:8}  {:5}  {:5}  {:6}  {copy}  {sent}  {}",
-            u.cost_mi as f64 / 1000.,
-            u.width_c as f64 / 100.,
-            u.wall_ms as f64 / 1000.,
-            u.mem_kb / 1024,
+            u.work_g(),
+            u.width(),
+            u.wall_s(),
+            u.mem_mb(),
             u.here,
             u.sent,
             u.served,

@@ -392,6 +392,14 @@ builds run here. Units outside this box's build graph have no rank. Units sent
 elsewhere also show the median time their sent runs spent on files and the MB
 they sent. Each class shows this box's jobs, other boxes' jobs and free tokens.
 
+In a farm each box also publishes what `status` shows under `BASE/NAME/status`,
+for the netidx browser: figures about the box (profile, jobs waiting, memory)
+as values, and three tables, `classes/K`, `boxes/NAME` and `units/UNIT`, with
+`status`'s columns as typed numbers, so the browser sorts them. Another box's
+row also shows when its next token was predicted to free. It refreshes every
+2 s and sends only cells that changed. Building a status takes the scheduler a
+few ms, which is why it isn't faster.
+
 ### Inputs
 
 Inputs are addressed by content. The client daemon caches
