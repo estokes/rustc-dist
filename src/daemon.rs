@@ -19,7 +19,7 @@ use log::{debug, error, info, warn};
 use netidx::{
     config::Config as NetConfig,
     path::Path as NPath,
-    publisher::PublisherBuilder,
+    publisher::{Publisher, PublisherBuilder},
     subscriber::{Subscriber, SubscriberBuilder},
 };
 use netidx_protocols::pack_channel::server::Listener;
@@ -81,13 +81,13 @@ pub async fn run() -> Result<()> {
     let (load_tx, load) = watch::channel(Load::default());
     let sched = Sched::new(setup, profile, load_tx, tx.clone())?;
     let mut sched = tokio::spawn(sched.run(rx));
-    let subscriber = match &cfg.base {
-        None => None,
+    let (subscriber, publisher) = match &cfg.base {
+        None => (None, None),
         Some(base) => match join(&cfg, base, load, tx.clone()).await {
-            Ok(sub) => Some(sub),
+            Ok((sub, publisher)) => (Some(sub), Some(publisher)),
             Err(e) => {
                 error!("working alone, could not join the farm at {base}: {e:#}");
-                None
+                (None, None)
             }
         },
     };
@@ -127,6 +127,11 @@ pub async fn run() -> Result<()> {
     }
     info!("shutting down");
     drop(listener);
+    if let Some(publisher) = publisher
+        && time::timeout(Duration::from_secs(2), publisher.shutdown()).await.is_err()
+    {
+        warn!("leaving the farm timed out; other boxes may see this one until the resolver forgets it");
+    }
     let _ = fs::remove_file(&sock_path);
     let _ = tx.send(Msg::Drain);
     if !sched.is_finished() {
@@ -136,12 +141,13 @@ pub async fn run() -> Result<()> {
 }
 
 /// Publish this box under `base`, watch the others, and take their jobs.
+/// Shutting down the publisher leaves the farm.
 async fn join(
     cfg: &Config,
     base: &str,
     load: watch::Receiver<Load>,
     tx: mpsc::UnboundedSender<Msg>,
-) -> Result<Subscriber> {
+) -> Result<(Subscriber, Publisher)> {
     let net = NetConfig::load_default().context("loading the netidx config")?;
     let publisher = PublisherBuilder::new(net.clone()).bind_cfg(cfg.bind).build().await?;
     let subscriber = SubscriberBuilder::new(net).build()?;
@@ -174,13 +180,13 @@ async fn join(
             }
         }
     });
-    let member = Member { publisher, subscriber: subscriber.clone(), base, name, toolchains };
+    let member = Member { publisher: publisher.clone(), subscriber: subscriber.clone(), base, name, toolchains };
     tokio::spawn(async move {
         if let Err(e) = farm::run(member, load, tx).await {
             error!("left the farm: {e:#}");
         }
     });
-    Ok(subscriber)
+    Ok((subscriber, publisher))
 }
 
 fn hostname() -> String {
