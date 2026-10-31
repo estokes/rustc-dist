@@ -199,18 +199,21 @@ mod test {
         let dir = scratch("rlib");
         fs::write(dir.join("dep.rs"), "#[inline(never)]\npub fn f() -> u32 { 7 }\n")?;
         fs::write(dir.join("main.rs"), "fn main() { println!(\"{}\", dep::f()); }\n")?;
-        let rustc = |args: &[&str]| -> Result<bool> {
-            Ok(Command::new("rustc").current_dir(&dir).args(args).status()?.success())
+        // With rustc's diagnostics kept out of the test output.
+        let rustc = |args: &[&str]| -> Result<(bool, String)> {
+            let out = Command::new("rustc").current_dir(&dir).args(args).output()?;
+            Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
         };
-        assert!(rustc(&["--crate-name", "dep", "--crate-type", "lib", "--emit=metadata,link", "dep.rs"])?);
+        assert!(rustc(&["--crate-name", "dep", "--crate-type", "lib", "--emit=metadata,link", "dep.rs"])?.0);
         fs::rename(dir.join("libdep.rlib"), dir.join("real.rlib"))?;
         write_stand_in_rlib(&dir.join("libdep.rmeta"), &dir.join("libdep.rlib"))?;
         fs::remove_file(dir.join("libdep.rmeta"))?;
         let main = ["--crate-name", "main", "--extern", "dep=libdep.rlib", "main.rs"];
-        assert!(rustc(&[&main[..], &["--emit=metadata"]].concat())?, "metadata from the stand-in");
-        assert!(!rustc(&main)?, "the stand-in has no code to link");
+        assert!(rustc(&[&main[..], &["--emit=metadata"]].concat())?.0, "metadata from the stand-in");
+        let (linked, stderr) = rustc(&main)?;
+        assert!(!linked && stderr.contains("undefined symbol"), "the stand-in has no code to link: {stderr}");
         fs::rename(dir.join("real.rlib"), dir.join("libdep.rlib"))?;
-        assert!(rustc(&main)?);
+        assert!(rustc(&main)?.0);
         assert_eq!(Command::new(dir.join("main")).output()?.stdout, b"7\n");
         fs::remove_dir_all(&dir)?;
         Ok(())
