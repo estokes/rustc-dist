@@ -79,10 +79,10 @@ impl BoxState {
             self.profile.clone().into(),
             self.version.into(),
             self.toolchains.iter().map(|t| (t.key.clone(), t.targets.clone())).collect::<Vec<_>>().into(),
-            per_class(|c| c.cpus.into()),
+            per_class(|c| i64::from(c.cpus).into()),
             per_class(|c| (c.rate as f64 / 1000.).into()),
-            per_class(|c| c.free.into()),
-            per_class(|c| c.frees_in_ms.into()),
+            per_class(|c| i64::from(c.free).into()),
+            per_class(|c| c.frees_in_ms.map(i64::from).into()),
         ]
     }
 
@@ -94,10 +94,10 @@ impl BoxState {
             v.clone().cast_to()
         }
         let toolchains: Vec<(ArcStr, Vec<ArcStr>)> = cast(toolchains)?;
-        let cpus: Vec<u32> = cast(cpus)?;
+        let cpus: Vec<i64> = cast(cpus)?;
         let rates: Vec<f64> = cast(rates)?;
-        let free: Vec<u32> = cast(free)?;
-        let frees_in: Vec<Option<u32>> = cast(frees_in)?;
+        let free: Vec<i64> = cast(free)?;
+        let frees_in: Vec<Option<i64>> = cast(frees_in)?;
         let n = cpus.len();
         if rates.len() != n || free.len() != n || frees_in.len() != n {
             bail!("class columns of different lengths");
@@ -107,13 +107,15 @@ impl BoxState {
             .zip(rates)
             .zip(free)
             .zip(frees_in)
-            .map(|(((cpus, rate), free), frees_in_ms)| ClassState {
-                rate: (rate * 1000.).round() as u64,
-                cpus,
-                free,
-                frees_in_ms,
+            .map(|(((cpus, rate), free), frees_in_ms)| {
+                Ok(ClassState {
+                    rate: (rate * 1000.).round() as u64,
+                    cpus: cpus.try_into()?,
+                    free: free.try_into()?,
+                    frees_in_ms: frees_in_ms.map(u32::try_from).transpose()?,
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         Ok(Self {
             protocol: cast(protocol)?,
             profile: cast(profile)?,
@@ -332,7 +334,7 @@ mod test {
         let s = state(7, 0);
         assert_eq!(BoxState::from_columns(&s.columns()).unwrap(), s);
         let mut short = s.columns();
-        short[6] = Value::from(vec![1u32]);
+        short[6] = Value::from(vec![1i64]);
         assert!(BoxState::from_columns(&short).is_err());
     }
 

@@ -115,7 +115,8 @@ impl Board {
             Switching::Draining(to) => ArcStr::from(format_compact!("to {to}, once running jobs finish").as_str()).into(),
             Switching::Calibrating(to) => ArcStr::from(format_compact!("calibrating {to}").as_str()).into(),
         };
-        let per_class = |f: fn(&ClassStatus) -> u32| Value::from(st.classes.iter().map(f).collect::<Vec<_>>());
+        let per_class =
+            |f: fn(&ClassStatus) -> u32| Value::from(st.classes.iter().map(|c| i64::from(f(c))).collect::<Vec<_>>());
         let sum = |f: fn(&ClassStatus) -> u32| st.classes.iter().map(f).sum::<u32>();
         let figures: [(&'static str, Value); 14] = [
             ("switching profile", switching),
@@ -226,7 +227,7 @@ mod test {
             let below = net.subscriber().resolver().list(column.clone()).await?;
             assert!(below.is_empty(), "{column} is a directory, not a column");
         }
-        assert_eq!(value(&net, "/farm/status/a/class serving").await?, Value::from(vec![0u32, 2]));
+        assert_eq!(value(&net, "/farm/status/a/class serving").await?, Value::from(vec![0i64, 2]));
         assert_eq!(value(&net, &format!("{serde}/work")).await?, Value::from(2.5));
         assert_eq!(value(&net, &format!("{serde}/front (%)")).await?, Value::from(25u64));
         assert_eq!(value(&net, &format!("{serde}/copy (s)")).await?, Value::from(1.5));
