@@ -6,6 +6,7 @@ use crate::{
     blobs::{Hashes, Store},
     classes::{self, Class, Profile},
     farm::Load,
+    perf,
     protocol::{Job, Unit},
     remote::{self, Event, Outcome, ToServer},
     sandbox::{self, Server},
@@ -43,7 +44,7 @@ async fn server(dir: &Path) -> Result<ServerBox> {
     let net = InternalOnly::new().await?;
     let state = dir.join("state");
     let allowed = sys::allowed_cpus()?;
-    classes::save(&state, &Profile::DEFAULT, &[Class { calib_us: 1_000_000, cpus: allowed.clone() }])?;
+    classes::save(&state, &Profile::DEFAULT, &[Class { rate: 1000, cpus: allowed.clone() }])?;
     let setup = Setup {
         state_dir: state,
         fifo_dir: dir.to_path_buf(),
@@ -158,9 +159,15 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     let (job, unit) = project(&dir.join("ws"))?;
     let hashes = Hashes::default();
     let (outcome, events) = send(&b, &job, &unit, &hashes).await?;
-    let Outcome::Exit { code: 0, cpu_us, .. } = outcome else { bail!("remote rustc failed") };
+    let Outcome::Exit { code: 0, ran } = outcome else { bail!("remote rustc failed") };
     // rustc's own time; bwrap alone uses about 10 ms.
-    assert!(cpu_us > 200_000, "remote cpu {cpu_us} us");
+    assert!(ran.cpu_us > 200_000, "remote cpu {} us", ran.cpu_us);
+    let front = ran.front.context("app prints an .rmeta line")?;
+    assert!(front.wall_us < ran.wall_us && front.cpu_us <= ran.cpu_us + 10_000, "{ran:?}");
+    if perf::Counter::start(false).is_some() {
+        // A few hundred ms of rustc retire billions of instructions.
+        assert!(ran.instructions.is_some_and(|n| n > 500_000_000), "{ran:?}");
+    }
     let artifacts: Vec<String> = events
         .iter()
         .filter_map(|e| match e {

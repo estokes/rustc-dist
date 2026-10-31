@@ -7,6 +7,7 @@ mod config;
 mod daemon;
 mod farm;
 mod graph;
+mod perf;
 mod protocol;
 mod remote;
 mod sandbox;
@@ -139,13 +140,13 @@ fn status() -> Result<()> {
         )?,
         Switching::Calibrating(to) => writeln!(out, "profile {}, calibrating {to}", st.profile)?,
     }
-    writeln!(out, "\nclass  cpus  calibration  running  serving  free")?;
+    writeln!(out, "\nclass  cpus  G instr/s  running  serving  free")?;
     for (k, c) in st.classes.iter().enumerate() {
         writeln!(
             out,
-            "{k:5}  {:4}  {:8.1} ms  {:7}  {:7}  {:4}",
+            "{k:5}  {:4}  {:9.2}  {:7}  {:7}  {:4}",
             c.cpus,
-            c.calib_us as f64 / 1000.,
+            c.rate as f64 / 1000.,
             c.running,
             c.serving,
             c.free
@@ -166,12 +167,15 @@ fn status() -> Result<()> {
     for b in &st.boxes {
         let cpus: u32 = b.classes.iter().map(|c| c.cpus).sum();
         let free: u32 = b.classes.iter().map(|c| c.free).sum();
-        let fastest = b.classes.iter().map(|c| c.calib_us).min().unwrap_or(0) as f64 / 1000.;
+        let capacity: u64 = b.classes.iter().map(|c| c.rate * c.cpus as u64).sum();
         let note = if b.compatible { "" } else { ", other version" };
         writeln!(
             out,
-            "box {}: profile {}, {free} of {cpus} cpus free, fastest {fastest:.1} ms, {} from here{note}",
-            b.name, b.profile, b.sent
+            "box {}: profile {}, {free} of {cpus} cpus free, {:.0} G instr/s, {} from here{note}",
+            b.name,
+            b.profile,
+            capacity as f64 / 1000.,
+            b.sent
         )?;
     }
     if st.units.is_empty() {
@@ -179,25 +183,31 @@ fn status() -> Result<()> {
     }
     writeln!(
         out,
-        "\n{} units run, by work waiting on them ({} in the build graph). Runs: here and sent for \
-         this box's builds, served for other boxes'.",
+        "\n{} units run, by work waiting on them ({} in the build graph). Work is in G instructions; \
+         front is the single-threaded share, width the threads busy after it. Runs: here and sent \
+         for this box's builds, served for other boxes'.",
         st.units.len(),
         st.graph_nodes
     )?;
     writeln!(
         out,
-        "\n{:>9}  {:>9}  {:>8}  {:>8}  {:>5}  {:>5}  {:>6}  unit",
-        "rank (cu)", "cost (cu)", "wall (s)", "mem (MB)", "here", "sent", "served"
+        "\n{:>8}  {:>8}  {:>5}  {:>5}  {:>8}  {:>8}  {:>5}  {:>5}  {:>6}  unit",
+        "rank", "work", "front", "width", "wall (s)", "mem (MB)", "here", "sent", "served"
     )?;
     for u in &st.units {
-        let rank: CompactString = match u.rank_mcu {
-            Some(r) => format_compact!("{:9.3}", r as f64 / 1000.),
-            None => format_compact!("{:>9}", "-"),
+        let rank: CompactString = match u.rank_mi {
+            Some(r) => format_compact!("{:8.2}", r as f64 / 1000.),
+            None => format_compact!("{:>8}", "-"),
+        };
+        let front: CompactString = match u.front_mi {
+            Some(f) => format_compact!("{:4}%", f * 100 / u.cost_mi.max(1)),
+            None => format_compact!("{:>5}", "-"),
         };
         writeln!(
             out,
-            "{rank}  {:9.3}  {:8.1}  {:8}  {:5}  {:5}  {:6}  {}",
-            u.cost_mcu as f64 / 1000.,
+            "{rank}  {:8.2}  {front}  {:5.1}  {:8.1}  {:8}  {:5}  {:5}  {:6}  {}",
+            u.cost_mi as f64 / 1000.,
+            u.width_c as f64 / 100.,
             u.wall_ms as f64 / 1000.,
             u.mem_kb / 1024,
             u.here,

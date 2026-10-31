@@ -1,7 +1,8 @@
 use crate::{
     blobs::{self, Hash, Store, Upload},
-    protocol::Ran,
-    remote::{ARTIFACT, CHUNK, FileEntry, FromServer, SYSTEM, ToServer},
+    perf,
+    protocol::{self, Front, Ran},
+    remote::{CHUNK, FileEntry, FromServer, SYSTEM, ToServer},
     sched::{Answer, Msg, Slot},
     sys,
     toolchain::Installed,
@@ -234,7 +235,8 @@ enum Ev {
     Stderr(Bytes),
     Stdout(Bytes),
     Eof,
-    Exit(ExitStatus, libc::rusage),
+    /// With the instructions it retired, where they can be counted.
+    Exit(ExitStatus, libc::rusage, Option<u64>),
 }
 
 /// Kills the sandbox if the job is abandoned. A pidfd can't hit a reused
@@ -259,13 +261,36 @@ async fn run(con: &Connection, mut cmd: Command, root: &Path, slot: &Slot) -> Re
         cmd.pre_exec(move || sys::pin(&cpus).map_err(io::Error::other));
     }
     let start = Instant::now();
-    let mut child = cmd.spawn().context("starting bwrap")?;
-    let pid = child.id() as libc::pid_t;
-    slot.started(child.id());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (spawned_tx, spawned) = oneshot::channel();
+    // A thread of its own starts the sandbox and waits for it, so the
+    // instruction counter it opens counts nothing else.
+    let xtx = tx.clone();
+    thread::spawn(move || {
+        let counter = perf::Counter::start(true);
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = spawned_tx.send(Err(e));
+                return;
+            }
+        };
+        let pid = child.id() as libc::pid_t;
+        let pipes = (child.stdout.take(), child.stderr.take());
+        // wait4 reaps it; the Child must not try.
+        mem::forget(child);
+        let _ = spawned_tx.send(Ok((pid, pipes)));
+        let mut status = 0;
+        let mut ru: libc::rusage = unsafe { mem::zeroed() };
+        if unsafe { libc::wait4(pid, &mut status, 0, &mut ru) } == pid {
+            let _ = xtx.send(Ev::Exit(ExitStatus::from_raw(status), ru, counter.map(|c| c.read())));
+        }
+    });
+    let (pid, (stdout, stderr)) = spawned.await?.context("starting bwrap")?;
+    slot.started(pid as u32);
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     let mut kill = Kill((pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as i32) }));
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let stderr = child.stderr.take().context("stderr")?;
+    let stderr = stderr.context("stderr")?;
     let etx = tx.clone();
     thread::spawn(move || {
         let mut r = BufReader::new(stderr);
@@ -275,7 +300,7 @@ async fn run(con: &Connection, mut cmd: Command, root: &Path, slot: &Slot) -> Re
         }
         let _ = etx.send(Ev::Eof);
     });
-    let mut stdout = child.stdout.take().context("stdout")?;
+    let mut stdout = stdout.context("stdout")?;
     let otx = tx.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 16 * 1024];
@@ -284,42 +309,40 @@ async fn run(con: &Connection, mut cmd: Command, root: &Path, slot: &Slot) -> Re
         }
         let _ = otx.send(Ev::Eof);
     });
-    thread::spawn(move || {
-        let mut status = 0;
-        let mut ru: libc::rusage = unsafe { mem::zeroed() };
-        if unsafe { libc::wait4(pid, &mut status, 0, &mut ru) } == pid {
-            let _ = tx.send(Ev::Exit(ExitStatus::from_raw(status), ru));
-        }
-    });
-    // wait4 reaped it; the Child must not try.
-    mem::forget(child);
+    drop(tx);
     let mut eofs = 0;
     let mut exit = None;
+    let mut front = None;
     while eofs < 2 || exit.is_none() {
         match rx.recv().await.context("sandbox threads stopped")? {
             Ev::Stderr(line) => {
-                if line.windows(ARTIFACT.len()).any(|w| w == ARTIFACT) {
+                if protocol::is_artifact_line(&line) {
+                    if front.is_none() && protocol::is_metadata_line(&line) {
+                        let wall_us = start.elapsed().as_micros() as u64;
+                        front = Some(Front { wall_us, cpu_us: sys::tree_cpu_us(pid as u32) });
+                    }
                     send_artifact(con, root, &line).await?;
                 }
                 con.send_one(&FromServer::Stderr(line)).await?;
             }
             Ev::Stdout(data) => con.send_one(&FromServer::Stdout(data)).await?,
             Ev::Eof => eofs += 1,
-            Ev::Exit(status, ru) => exit = Some((status, ru)),
+            Ev::Exit(status, ru, instructions) => exit = Some((status, ru, instructions)),
         }
     }
     kill.0 = None;
-    let (status, ru) = exit.expect("loop ends with an exit");
+    let (status, ru, instructions) = exit.expect("loop ends with an exit");
     let us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
     let ran = Ran {
         cpu_us: us(ru.ru_utime) + us(ru.ru_stime),
         wall_us: start.elapsed().as_micros() as u64,
         maxrss_kb: ru.ru_maxrss as u64,
+        instructions,
+        front,
     };
     let code = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     debug!("sandbox exited {code}");
-    con.send_one(&FromServer::Exit { code, cpu_us: ran.cpu_us, wall_us: ran.wall_us, maxrss_kb: ran.maxrss_kb })
-        .await?;
+    con.send_one(&FromServer::Exit { code, ran }).await?;
     Ok((code == 0).then_some(ran))
 }
 

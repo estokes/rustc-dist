@@ -112,7 +112,7 @@ impl Graph {
         // Marks `id` as in progress, so a cycle in stale data ends here.
         self.ranks.insert(id.clone(), 0);
         let own = match self.nodes.get(id) {
-            Some(n) => stats.predict(&n.exact, &n.coarse).cost_mcu,
+            Some(n) => stats.predict(&n.exact, &n.coarse).cost_mi,
             None => 0,
         };
         let mut dependents: LPooled<Vec<ArcStr>> = LPooled::take();
@@ -217,8 +217,10 @@ mod test {
 
     fn stats(costs: &[(&str, u64)]) -> Stats {
         let mut s = Stats::new();
-        for &(id, cost_mcu) in costs {
-            s.record(&unit(id, &[]), Sample { cost_mcu, wall_ms: 1, mem_kb: 1, origin: Origin::Here });
+        for &(id, cost_mi) in costs {
+            let origin = Origin::Here;
+            let sample = Sample { cost_mi, front_mi: None, width_c: 100, wall_ms: 1, mem_kb: 1, origin };
+            s.record(&unit(id, &[]), sample);
         }
         s
     }

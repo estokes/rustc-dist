@@ -165,41 +165,51 @@ memory.
 
 The classes come from those times. Sort the CPUs by time and start a new class
 wherever two neighbours differ by more than about 8%. Two core types that
-measure the same land in one class, which is right for scheduling. A class's
-`calib_ms` is the median of its members' times.
+measure the same land in one class, which is right for scheduling. Each run
+also counts its instructions, and a class's rate is its members' mean
+instructions per CPU-µs. Without counters a run is taken to retire 697 M
+instructions, what a release build's run retires.
 
 `rustc-dist calibrate` measures and prints without saving. Each profile's
-classes go in `~/.local/state/rustc-dist/profiles/NAME.toml`. In phase 2 the
-daemon publishes each class at `BASE/NAME/class/N/` with `calib_ms`, `cpus` and
-`free`.
+classes go in `~/.local/state/rustc-dist/profiles/NAME.toml`, and boxes publish
+each class's rate, CPUs and free tokens.
 
-Job costs are normalized by the calibration of the class each job ran on, so
-one job history serves every profile.
-
-Acceptance check, to run on an idle box: the time ratios between classes from
-the chunkmap load must match, within about 10%, the ratios from a real rustc
-compile run the same way (the `graphix-shell` crate under `--profile quick`,
-one pinned copy per CPU). If they don't, tune the operation mix. This hasn't been run
-yet: on 2026-10-30 this box was at load 119 from graphix tests and the fuzzer.
+The calibrated rate is only a starting point. Every job that runs pinned to a
+class adds its instructions and CPU time to the class's rate, which weighs the
+calibration as 10 CPU-seconds of jobs and halves the weight of older jobs every
+60 CPU-seconds. Class speeds so come to reflect rustc rather than chunkmap,
+which replaces the acceptance check once planned here (comparing chunkmap's
+class ratios against a real compile's). Learned rates aren't saved yet; a
+restarted daemon starts again from calibration.
 
 ## Cost
 
 Agentic work compiles the same units over and over: `graphix_types` hundreds
 of times a day. Each unit's past runs predict its next one.
 
-The unit of cost is one calibration run (cu). A job that used `c` CPU seconds
-on class `k` costs `c / calib_s(k)` cu, the same number whichever box or class
-ran it, so every run of a unit counts toward one record.
+The unit of cost is an instruction: the user-space instructions retired by
+rustc and every thread and process under it, counted by the CPU (both core
+types on a hybrid CPU). The same job retires about the same count whichever
+box, class, profile or load ran it, so every run of a unit counts toward one
+record. A box that can't count instructions estimates them from CPU time at
+its class's rate. A predicted time is cost over rate.
 
 The job table is per daemon, persisted under `$XDG_STATE_HOME`. Its key is
 crate name plus the `-C metadata` hash, cargo's identity for a unit (package,
 version, features, profile, target). The hash doesn't change when sources are
 edited. Each entry holds:
 
-- an hdrhistogram of cost in milli-cu (2 significant figures, a few KB per
-  unit);
-- an hdrhistogram of wall time and of maxrss;
-- the remote-pinned flag (phase 2).
+- hdrhistograms (2 significant figures) of cost in millions of instructions,
+  of the front end's instructions, of width, of wall time and of peak memory;
+- runs counted by where they ran and for whom.
+
+The front end is the compile up to rustc's `.rmeta` line, which runs on one
+thread. Its instructions are the job's instructions times its share of CPU
+time, read from `/proc` when the line appears, since a thread's instruction
+count only reaches the job's total when the thread exits. Width is the CPU
+time after the front end over the wall time after it: how many threads codegen
+kept busy. A job with no `.rmeta` line (a binary) records its width over the
+whole run.
 
 Only successful compiles are recorded. Once a unit has 256 runs its counts are
 halved, so the prediction follows the crate as it grows.
@@ -260,7 +270,7 @@ jobs with time to spare on slow cores.
    can finish without delaying the build.
 4. For each class the daemon predicts when the job would finish there: when a
    slot frees (now, or the earliest predicted end of a job running in that
-   class) plus the job's cost times the class's calibration. The job takes the
+   class) plus the job's cost over the class's rate. The job takes the
    slowest class on which it finishes within its slack of the earliest finish.
    A job with no slack takes the class where it finishes first, even if it must
    wait for it.
@@ -469,8 +479,79 @@ coming back.
    matching, blob store and manifest protocol, inputs from dep-info and the
    build graph, bwrap sandbox, pipelined outputs, local fallback and remote
    pinning. See "Farm test" below.
-3. Cost tables and graphs shared across the farm. A measured comparison of
+3. Capacity scheduling, planned 2026-10-30; see below.
+4. Cost tables and graphs shared across the farm. A measured comparison of
    build times with and without rank placement, on an idle box.
+
+## Capacity scheduling (phase 3)
+
+The goal: work on the laptop and have every box in the house share the
+compiling, with the biggest jobs on the 9950X3D2. This is a small cluster
+built for the purpose. Every box has the same toolchains and the same system
+libraries and linker, kept so by the sysadmin.
+
+### Stage 1: measure work in instructions (built 2026-10-30)
+
+- A job's work is the user-space instructions retired by rustc and every
+  thread and process under it, counted by the CPU's performance counters
+  (summed over both core types on a hybrid CPU). The same job retires about
+  the same count on any core, box, power profile or load, unlike CPU time.
+  Where counters aren't available, work is estimated from CPU time.
+- Each class has a rate: instructions per CPU-µs. Calibration counts the
+  chunkmap run's instructions to seed it; jobs pinned to the class then
+  refine it, so class speeds come to reflect rustc rather than chunkmap.
+  A class's capacity is its CPUs times its rate; a box's is the sum.
+- A job's shape: its front end, the single-threaded part before rustc
+  prints its `.rmeta` line, as a share of its CPU time; and its width, the
+  average threads busy after that (CPU over wall time). A job that prints
+  no `.rmeta` line (a binary) has only a width.
+- Costs, ranks and predictions move to instructions; boxes publish rates.
+
+### Stage 2: heavy jobs span classes
+
+- Every job is heavy until measured light: a light job has run at about one
+  thread wide. Light jobs stay pinned to their class and its token pool, as
+  now. Heavy jobs may run on every CPU, with a private token pool the daemon
+  lends tokens into from whichever classes have them free, up to the job's
+  width (its codegen-unit limit until measured). Rustc asks for a token by
+  reading the pool, which the daemon can't see, so it keeps one spare token
+  in a heavy job's pool while the job is below its width, adds another when
+  the spare is taken, and takes back spares left unused for a tick.
+- Each class pool holds 1.5 tokens per CPU. Mild overcommit covers the time
+  jobs spend waiting on I/O; around 4x would be lost to context switching.
+- A heavy job's predicted time is its front end at one fast core's rate plus
+  the rest at its rate times the threads it can get, min(width, free
+  tokens).
+
+### Stage 3: binaries on other boxes, artifacts cached
+
+- Binaries, tests and proc macros become portable. They need every rlib
+  below them, which the build graph lists, and the server's linker, which
+  is the same as the client's by assumption.
+- A server keeps the outputs it builds in its blob store, so a binary
+  linked on the box that built its dependencies has little to receive.
+- The copy can overlap the compile. Rustc and the linker `mmap` their
+  inputs, so they can't read from pipes, and rustc maps every dependency
+  when it starts. But until the link, rustc reads only a dependency's
+  metadata. Checked on this box: a binary built against rlibs holding only
+  the dependency's `.rmeta` (as an archive's `lib.rmeta` member), with a
+  stand-in linker that swaps in the full rlibs before running the real one,
+  links and runs, including a dependency that links zlib (rustc still passed
+  `-lz`, which it reads from the metadata). So a server starts rustc once
+  sources and metadata are in place, receives the object code during
+  codegen, and the stand-in linker waits for it. The full rlib's second
+  member, `lib.rmeta-link`, was missing from the test rlibs without effect;
+  real projects need to confirm that. LTO, staticlibs and dylibs read the
+  object code earlier and wait for the full copy.
+- Whether the copy pays off is to be measured: each remote job records the
+  bytes it sent and the time spent sending them, next to the compile time.
+  Remote binaries have their own switch.
+
+### Stage 4: placement by capacity
+
+- A heavy job goes where its predicted finish is soonest, counting each
+  box's free capacity and the predicted transfer time. The biggest jobs
+  land on the box with the most free capacity.
 
 ## Farm test (2026-10-30)
 
@@ -529,7 +610,9 @@ Every number below is a guess. None has been tested on an idle box.
 | calibration length | 60 s | `src/config.rs:22` |
 | calibration keys per run (about 0.25 s on a P-core) | 2^15 | `src/calibrate.rs:20` |
 | halve a unit's history at | 256 runs | `src/stats.rs:18` |
-| cost of a job with no history at all | 1 cu | `src/stats.rs:20` |
+| cost of a job with no history at all | 1 G instructions | `src/stats.rs` `UNKNOWN_COST_MI` |
+| a class's calibration counts as | 10 CPU-s of jobs | `src/sched.rs` `RATE_PRIOR_US` |
+| older jobs count half toward a class's rate after | 60 CPU-s | `src/sched.rs` `RATE_HALF_LIFE_US` |
 | share of compressed swap predicted peaks may use beyond RAM | 50% | `src/config.rs` `compressed_swap_share` |
 | zswap compression ratio before it has stored anything | 3:1 | `src/sys.rs` `ZSWAP_RATIO` |
 | sample memory and job footprints every | 250 ms | `src/sched.rs` `MEASURE` |

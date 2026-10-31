@@ -387,7 +387,7 @@ async fn run_remote(
                 Ok(())
             }
             Event::Artifact(line) => {
-                forwarded_metadata |= line.windows(METADATA.len()).any(|w| w == METADATA);
+                forwarded_metadata |= protocol::is_metadata_line(&line);
                 protocol::send_async(sock, buf, &Reply::Output { stderr: true, data: line }).await
             }
             Event::Stderr(data) => {
@@ -411,12 +411,12 @@ async fn run_remote(
     }
     drop(handle);
     match outcome {
-        Ok(Outcome::Exit { code: 0, cpu_us, wall_us, maxrss_kb }) => {
+        Ok(Outcome::Exit { code: 0, ran }) => {
             for (stderr, data) in held {
                 protocol::send_async(sock, buf, &Reply::Output { stderr, data }).await?;
             }
             protocol::send_async(sock, buf, &Reply::Exit(0)).await?;
-            r.finish(RemoteOutcome::Done(Ran { cpu_us, wall_us, maxrss_kb }));
+            r.finish(RemoteOutcome::Done(ran));
             Ok(Remote::Done)
         }
         Ok(Outcome::Busy { version }) => {
@@ -439,4 +439,3 @@ async fn run_remote(
     }
 }
 
-const METADATA: &[u8] = br#""emit":"metadata""#;

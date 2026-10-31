@@ -64,6 +64,11 @@ const PIN_AFTER: u8 = 2;
 /// While jobs run here, sample the box's memory and their footprints this
 /// often. Placing a job samples again if the last sample is older.
 const MEASURE: Duration = Duration::from_millis(250);
+/// A class's calibrated rate counts as this much CPU time of jobs.
+const RATE_PRIOR_US: f64 = 10_000_000.;
+/// What a class's jobs say about its rate counts half as much after this
+/// much more CPU time of its jobs.
+const RATE_HALF_LIFE_US: f64 = 60_000_000.;
 
 atomic_id!(LayoutId);
 atomic_id!(JobId);
@@ -267,12 +272,36 @@ impl Drop for Fifo {
     }
 }
 
+/// A class's instructions per CPU-µs: its calibration, then more and more
+/// the jobs that ran on it.
+struct Rate {
+    instr: f64,
+    cpu_us: f64,
+}
+
+impl Rate {
+    fn seeded(rate: u64) -> Self {
+        Self { instr: rate as f64 * RATE_PRIOR_US, cpu_us: RATE_PRIOR_US }
+    }
+
+    fn add(&mut self, instr: u64, cpu_us: u64) {
+        let keep = 0.5f64.powf(cpu_us as f64 / RATE_HALF_LIFE_US);
+        self.instr = self.instr * keep + instr as f64;
+        self.cpu_us = self.cpu_us * keep + cpu_us as f64;
+    }
+
+    fn get(&self) -> u64 {
+        ((self.instr / self.cpu_us) as u64).max(1)
+    }
+}
+
 /// One profile's classes and their jobservers. A profile switch makes a
 /// new layout for new jobs; the old one lives until its jobs finish.
 struct Layout {
     id: LayoutId,
-    /// Fastest first.
+    /// Fastest at calibration first.
     classes: Vec<Class>,
+    rates: Vec<Rate>,
     fifos: Vec<Fifo>,
     grants: Vec<Arc<Grant>>,
     running: Vec<u32>,
@@ -297,7 +326,8 @@ impl Layout {
             let frame = buf.split().freeze();
             grants.push(Arc::new(Grant { frame, cpus: class.cpus.clone(), jobserver }));
         }
-        Ok(Self { id, running: vec![0; classes.len()], classes, fifos, grants })
+        let rates = classes.iter().map(|c| Rate::seeded(c.rate)).collect();
+        Ok(Self { id, running: vec![0; classes.len()], classes, rates, fifos, grants })
     }
 
     fn idle(&self) -> bool {
@@ -349,7 +379,7 @@ struct Waiting {
     unit: Unit,
     build: u32,
     pred: Prediction,
-    rank_mcu: u64,
+    rank_mi: u64,
     portable: Option<Portable>,
     since: Instant,
     reply: oneshot::Sender<Admission>,
@@ -368,11 +398,12 @@ struct Running {
     /// The build it is part of, by cargo's pid; None for another box's job.
     build: Option<u32>,
     place: Place,
-    calib_us: u64,
+    /// The rate of the class it runs on.
+    rate: u64,
     /// Predicted peak memory; none for a job on another box.
     mem_kb: u64,
-    cost_mcu: u64,
-    rank_mcu: u64,
+    cost_mi: u64,
+    rank_mi: u64,
     start: Instant,
     /// The root of its processes, once it has started here.
     pid: Option<u32>,
@@ -386,13 +417,13 @@ impl Running {
     /// for at least half again as long as it has.
     fn left_us(&self, now: Instant) -> u64 {
         let elapsed = now.duration_since(self.start).as_micros() as u64;
-        time_us(self.cost_mcu, self.calib_us).saturating_sub(elapsed).max(elapsed / 2)
+        time_us(self.cost_mi, self.rate).saturating_sub(elapsed).max(elapsed / 2)
     }
 
     /// Its rank less the part of its own cost already done.
-    fn rank_left_mcu(&self, now: Instant) -> u64 {
-        let done = now.duration_since(self.start).as_micros() as u64 * 1000 / self.calib_us;
-        self.rank_mcu.saturating_sub(done.min(self.cost_mcu))
+    fn rank_left_mi(&self, now: Instant) -> u64 {
+        let done = now.duration_since(self.start).as_micros() as u64 * self.rate / 1_000_000;
+        self.rank_mi.saturating_sub(done.min(self.cost_mi))
     }
 }
 
@@ -418,10 +449,9 @@ impl RemoteBox {
     }
 }
 
-/// Predicted µs for a job costing `cost_mcu` on a class calibrated at
-/// `calib_us`.
-fn time_us(cost_mcu: u64, calib_us: u64) -> u64 {
-    cost_mcu * calib_us / 1000
+/// Predicted µs for `cost_mi` million instructions at `rate` per µs.
+fn time_us(cost_mi: u64, rate: u64) -> u64 {
+    cost_mi * 1_000_000 / rate.max(1)
 }
 
 pub struct Sched {
@@ -617,7 +647,7 @@ impl Sched {
 
     fn submit(&mut self, unit: Unit, build: u32, remote: Option<Want>, reply: oneshot::Sender<Admission>) {
         self.graph.record(&unit);
-        let rank_mcu = self.graph.rank(&unit.id, &self.stats);
+        let rank_mi = self.graph.rank(&unit.id, &self.stats);
         let pred = self.stats.predict(&unit.exact, &unit.coarse);
         let pinned = self.mismatches.get(&unit.exact).is_some_and(|n| *n >= PIN_AFTER);
         let portable = match remote {
@@ -626,7 +656,7 @@ impl Sched {
             }
             _ => None,
         };
-        self.queue.push(Waiting { unit, build, pred, rank_mcu, portable, since: Instant::now(), reply });
+        self.queue.push(Waiting { unit, build, pred, rank_mi, portable, since: Instant::now(), reply });
     }
 
     fn finished(&mut self, job: JobId, unit: &Unit, ran: Option<Ran>) {
@@ -644,10 +674,13 @@ impl Sched {
             return;
         };
         layout.release(class);
+        if let Some(n) = ran.as_ref().and_then(|ran| ran.instructions.map(|n| (n, ran.cpu_us))) {
+            layout.rates[class].add(n.0, n.1);
+        }
         self.retired.retain(|l| !l.idle());
         if let Some(ran) = ran {
             let origin = if r.build.is_some() { Origin::Here } else { Origin::Served };
-            self.record(unit, &ran, r.calib_us, r.peak_kb, origin);
+            self.record(unit, &ran, r.rate, r.peak_kb, origin);
         }
     }
 
@@ -661,12 +694,24 @@ impl Sched {
         Some(r)
     }
 
-    /// `peak_kb` is the most RSS plus swap seen while it ran here, which
-    /// `maxrss_kb` misses when its pages were swapped out.
-    fn record(&mut self, unit: &Unit, ran: &Ran, calib_us: u64, peak_kb: u64, origin: Origin) {
+    /// `rate` is that of the class it ran on, for a box that can't count
+    /// instructions. `peak_kb` is the most RSS plus swap seen while it ran
+    /// here, which `maxrss_kb` misses when its pages were swapped out.
+    fn record(&mut self, unit: &Unit, ran: &Ran, rate: u64, peak_kb: u64, origin: Origin) {
         debug!("{} used {} ms cpu in {} ms", unit.exact, ran.cpu_us / 1000, ran.wall_us / 1000);
+        let cost_mi = ran.instructions.unwrap_or(ran.cpu_us * rate) / 1_000_000;
+        let (front_mi, width_c) = match ran.front {
+            Some(f) => {
+                let front_mi = cost_mi * f.cpu_us.min(ran.cpu_us) / ran.cpu_us.max(1);
+                let rest_wall = ran.wall_us.saturating_sub(f.wall_us).max(1);
+                (Some(front_mi), ran.cpu_us.saturating_sub(f.cpu_us) * 100 / rest_wall)
+            }
+            None => (None, ran.cpu_us * 100 / ran.wall_us.max(1)),
+        };
         let sample = Sample {
-            cost_mcu: ran.cpu_us * 1000 / calib_us,
+            cost_mi,
+            front_mi,
+            width_c,
             wall_ms: ran.wall_us / 1000,
             mem_kb: ran.maxrss_kb.max(peak_kb),
             origin,
@@ -680,7 +725,7 @@ impl Sched {
         match outcome {
             RemoteOutcome::Done(ran) => {
                 self.mismatches.remove(&unit.exact);
-                self.record(unit, &ran, r.calib_us, 0, Origin::Sent);
+                self.record(unit, &ran, r.rate, 0, Origin::Sent);
             }
             RemoteOutcome::Busy { version } => {
                 let rb = &mut self.remotes[remote];
@@ -754,8 +799,8 @@ impl Sched {
         if self.layout.fifos[class].take(1) == 0 {
             return refuse("no token");
         }
-        let rank_mcu = pred.cost_mcu;
-        Some(self.admit(unit, None, pred, rank_mcu, class, now))
+        let rank_mi = pred.cost_mi;
+        Some(self.admit(unit, None, pred, rank_mi, class, now))
     }
 
     fn switch_to(&mut self, to: Profile, recalibrate: bool) -> Result<()> {
@@ -897,7 +942,7 @@ impl Sched {
         let young = |w: &Waiting| now.duration_since(w.since) < GATHER;
         self.gathering = self.queue.iter().filter(|w| young(w)).map(|w| w.since + GATHER).min();
         let prio = |w: &Waiting| {
-            w.rank_mcu as f64 * (now.duration_since(w.since).as_secs_f64() / AGING_S).exp2()
+            w.rank_mi as f64 * (now.duration_since(w.since).as_secs_f64() / AGING_S).exp2()
         };
         self.queue.sort_by(|a, b| prio(b).total_cmp(&prio(a)));
         let mut admissible: LPooled<Vec<usize>> = LPooled::take();
@@ -912,8 +957,8 @@ impl Sched {
         for (build, rank) in self
             .queue
             .iter()
-            .map(|w| (w.build, w.rank_mcu))
-            .chain(self.running.iter().filter_map(|r| Some((r.build?, r.rank_left_mcu(now)))))
+            .map(|w| (w.build, w.rank_mi))
+            .chain(self.running.iter().filter_map(|r| Some((r.build?, r.rank_left_mi(now)))))
         {
             let h = horizon.entry(build).or_default();
             *h = (*h).max(rank);
@@ -931,7 +976,9 @@ impl Sched {
         let mut placed_us: LPooled<Vec<u64>> = LPooled::take();
         placed_us.resize(held.len(), u64::MAX);
         self.count_unseen();
-        let fastest = self.layout.classes[0].calib_us;
+        let mut rates: LPooled<Vec<u64>> = LPooled::take();
+        rates.extend(self.layout.rates.iter().map(Rate::get));
+        let fastest = rates.iter().copied().max().unwrap_or(1);
         let mut mem_free = self.mem_free_kb();
         // With nothing running here, one job runs whatever its memory, so
         // the box can't sit idle behind a job bigger than it.
@@ -946,21 +993,21 @@ impl Sched {
             let fits = !mem_blocked && (first_here || w.pred.mem_kb <= mem_free);
             let local = if fits { self.layout.classes.len() } else { 0 };
             cands.clear();
-            cands.extend(self.layout.classes[..local].iter().enumerate().map(|(k, c)| Cand {
-                calib_us: c.calib_us,
+            cands.extend(rates[..local].iter().enumerate().map(|(k, &rate)| Cand {
+                rate,
                 frees_in_us: frees_in[k],
                 overhead_us: 0,
                 place: Place::Local { layout: self.layout.id, class: k },
             }));
             if let Some(p) = &w.portable
-                && (!w.pred.known || time_us(w.pred.cost_mcu, fastest) >= REMOTE_MIN_US)
+                && (!w.pred.known || time_us(w.pred.cost_mi, fastest) >= REMOTE_MIN_US)
             {
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Some(state) = rb.usable(p) else { continue };
                     for (k, c) in state.classes.iter().enumerate() {
                         if rb.unseen.get(k).is_some_and(|n| *n < c.free) {
                             cands.push(Cand {
-                                calib_us: c.calib_us,
+                                rate: c.rate,
                                 frees_in_us: 0,
                                 overhead_us: REMOTE_OVERHEAD_US,
                                 place: Place::Remote { remote: r, class: k, shown_in: None },
@@ -975,8 +1022,8 @@ impl Sched {
                 continue;
             }
             let pick = if w.pred.known {
-                let slack_mcu = horizon[&w.build].saturating_sub(w.rank_mcu);
-                choose(&cands, local, w.pred.cost_mcu, slack_mcu, fastest)
+                let slack_mi = horizon[&w.build].saturating_sub(w.rank_mi);
+                choose(&cands, local, w.pred.cost_mi, slack_mi, fastest)
             } else {
                 anywhere_free(&cands, &held[..local])
             };
@@ -995,13 +1042,12 @@ impl Sched {
                 Place::Local { class, .. } if held[class] == 0 => {
                     // Jobs after this one see the queue it joins, so they
                     // don't all count on the same next free slot.
-                    let c = &self.layout.classes[class];
-                    frees_in[class] += time_us(w.pred.cost_mcu, c.calib_us) / c.cpus.len() as u64;
+                    let cpus = self.layout.classes[class].cpus.len() as u64;
+                    frees_in[class] += time_us(w.pred.cost_mi, rates[class]) / cpus;
                     self.starved = true;
                 }
                 Place::Local { class, .. } => {
-                    let c = &self.layout.classes[class];
-                    placed_us[class] = placed_us[class].min(time_us(w.pred.cost_mcu, c.calib_us));
+                    placed_us[class] = placed_us[class].min(time_us(w.pred.cost_mi, rates[class]));
                     held[class] -= 1;
                     if held[class] == 0 {
                         let placed = placed_us[class];
@@ -1019,7 +1065,7 @@ impl Sched {
             let w = self.queue.swap_remove(i);
             match place {
                 Place::Local { class, .. } => {
-                    let slot = self.admit(w.unit, Some(w.build), w.pred, w.rank_mcu, class, now);
+                    let slot = self.admit(w.unit, Some(w.build), w.pred, w.rank_mi, class, now);
                     // If the wrapper is gone the slot comes back through Drop.
                     let _ = w.reply.send(Admission::Slot(slot));
                 }
@@ -1049,7 +1095,7 @@ impl Sched {
         unit: Unit,
         build: Option<u32>,
         pred: Prediction,
-        rank_mcu: u64,
+        rank_mi: u64,
         class: usize,
         now: Instant,
     ) -> Slot {
@@ -1059,10 +1105,10 @@ impl Sched {
             job,
             build,
             place: Place::Local { layout: self.layout.id, class },
-            calib_us: self.layout.classes[class].calib_us,
+            rate: self.layout.rates[class].get(),
             mem_kb: pred.mem_kb,
-            cost_mcu: pred.cost_mcu,
-            rank_mcu,
+            cost_mi: pred.cost_mi,
+            rank_mi,
             start: now,
             pid: None,
             foot_kb: 0,
@@ -1074,16 +1120,16 @@ impl Sched {
     fn send_remote(&mut self, w: Waiting, remote: usize, class: usize, now: Instant) {
         let rb = &self.remotes[remote];
         debug!("sending {} to {} class {class}", w.unit.exact, rb.name);
-        let calib_us = rb.state.as_ref().map_or(1_000_000, |s| s.classes[class].calib_us);
+        let rate = rb.state.as_ref().map_or(1, |s| s.classes[class].rate);
         let job = JobId::new();
         self.running.push(Running {
             job,
             build: Some(w.build),
             place: Place::Remote { remote, class, shown_in: None },
-            calib_us,
+            rate,
             mem_kb: 0,
-            cost_mcu: w.pred.cost_mcu,
-            rank_mcu: w.rank_mcu,
+            cost_mi: w.pred.cost_mi,
+            rank_mi: w.rank_mi,
             start: now,
             pid: None,
             foot_kb: 0,
@@ -1114,10 +1160,11 @@ impl Sched {
         self.load.send_if_modified(|load| {
             let mut changed =
                 answered || load.profile != *profile || load.classes.len() != layout.classes.len();
-            load.classes.resize(layout.classes.len(), ClassState { calib_us: 0, cpus: 0, free: 0 });
-            for ((l, c), fifo) in load.classes.iter_mut().zip(&layout.classes).zip(&layout.fifos) {
+            load.classes.resize(layout.classes.len(), ClassState { rate: 0, cpus: 0, free: 0 });
+            let classes = layout.classes.iter().zip(&layout.rates).zip(&layout.fifos);
+            for (l, ((c, rate), fifo)) in load.classes.iter_mut().zip(classes) {
                 let free = if closed { 0 } else { fifo.free() };
-                let now = ClassState { calib_us: c.calib_us, cpus: c.cpus.len() as u32, free };
+                let now = ClassState { rate: rate.get(), cpus: c.cpus.len() as u32, free };
                 changed |= *l != now;
                 *l = now;
             }
@@ -1145,14 +1192,16 @@ impl Sched {
                     here,
                     sent,
                     served,
-                    cost_mcu: info.cost_mcu,
+                    cost_mi: info.cost_mi,
+                    front_mi: info.front_mi,
+                    width_c: info.width_c,
                     wall_ms: info.wall_ms,
                     mem_kb: info.mem_kb,
-                    rank_mcu: ranks.get(key).copied(),
+                    rank_mi: ranks.get(key).copied(),
                 }
             })
             .collect();
-        units.sort_unstable_by(|a, b| b.rank_mcu.cmp(&a.rank_mcu).then(b.cost_mcu.cmp(&a.cost_mcu)));
+        units.sort_unstable_by(|a, b| b.rank_mi.cmp(&a.rank_mi).then(b.cost_mi.cmp(&a.cost_mi)));
         let boxes = self
             .remotes
             .iter()
@@ -1192,7 +1241,8 @@ impl Sched {
                         }
                     }
                     let cpus = c.cpus.len() as u32;
-                    ClassStatus { calib_us: c.calib_us, cpus, running, serving, free: fifo.free() }
+                    let rate = self.layout.rates[k].get();
+                    ClassStatus { rate, cpus, running, serving, free: fifo.free() }
                 })
                 .collect(),
             finishing: self.retired.iter().flat_map(|l| l.running.iter()).sum(),
@@ -1224,13 +1274,14 @@ impl Sched {
 
 fn log_classes(profile: &Profile, classes: &[Class]) {
     for (k, c) in classes.iter().enumerate() {
-        info!("{profile} class {k}: {} cpus, calibration {} ms", c.cpus.len(), c.calib_us / 1000);
+        info!("{profile} class {k}: {} cpus, {:.2} G instructions/s", c.cpus.len(), c.rate as f64 / 1000.);
     }
 }
 
 /// Somewhere a job could run.
 struct Cand {
-    calib_us: u64,
+    /// Instructions per µs.
+    rate: u64,
     /// µs until it has a slot.
     frees_in_us: u64,
     /// µs a job spends getting there and back.
@@ -1243,18 +1294,18 @@ struct Cand {
 /// slack, so faster ones stay free for jobs more work waits on, or with no
 /// slack the one where it finishes first, even if it must wait for it.
 /// The rest are other boxes, which are spare capacity: the job goes to one
-/// if it finishes there sooner than on its local choice. `ref_calib_us`
-/// turns slack into time.
-fn choose(cands: &[Cand], local: usize, cost_mcu: u64, slack_mcu: u64, ref_calib_us: u64) -> usize {
-    let finish = |c: &Cand| c.frees_in_us + c.overhead_us + time_us(cost_mcu, c.calib_us);
+/// if it finishes there sooner than on its local choice. `ref_rate` turns
+/// slack into time.
+fn choose(cands: &[Cand], local: usize, cost_mi: u64, slack_mi: u64, ref_rate: u64) -> usize {
+    let finish = |c: &Cand| c.frees_in_us + c.overhead_us + time_us(cost_mi, c.rate);
     let here = &cands[..local];
     let first = here.iter().map(finish).min().unwrap_or(0);
-    let deadline = first + time_us(slack_mcu, ref_calib_us);
+    let deadline = first + time_us(slack_mi, ref_rate);
     let pick = here
         .iter()
         .enumerate()
         .filter(|(_, c)| finish(c) <= deadline)
-        .max_by(|(i, a), (j, b)| a.calib_us.cmp(&b.calib_us).then(j.cmp(i)))
+        .min_by(|(i, a), (j, b)| a.rate.cmp(&b.rate).then(i.cmp(j)))
         .map_or(0, |(i, _)| i);
     let away = cands[local..].iter().enumerate().min_by_key(|(_, c)| finish(c));
     match away {
@@ -1272,7 +1323,7 @@ fn anywhere_free(cands: &[Cand], held: &[usize]) -> usize {
     if let Some(k) = held.iter().position(|n| *n > 0) {
         return k;
     }
-    if let Some((j, _)) = away.iter().enumerate().min_by_key(|(_, c)| c.calib_us) {
+    if let Some((j, _)) = away.iter().enumerate().min_by_key(|(_, c)| std::cmp::Reverse(c.rate)) {
         return held.len() + j;
     }
     here.iter().enumerate().min_by_key(|(_, c)| c.frees_in_us).map_or(0, |(k, _)| k)
@@ -1281,7 +1332,7 @@ fn anywhere_free(cands: &[Cand], held: &[usize]) -> usize {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::toolchain::Toolchain;
+    use crate::{protocol::Front, toolchain::Toolchain};
     use anyhow::bail;
     use netidx_core::pack::Pack;
     use std::{
@@ -1291,8 +1342,13 @@ mod test {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    /// The rate at which a million instructions take `calib_us` / 1000 µs.
+    fn rate(calib_us: u64) -> u64 {
+        1_000_000_000 / calib_us
+    }
+
     fn class(calib_us: u64, cpus: &[u32]) -> Class {
-        Class { calib_us, cpus: cpus.to_vec() }
+        Class { rate: rate(calib_us), cpus: cpus.to_vec() }
     }
 
     fn unit(name: &str, deps: &[&str]) -> Unit {
@@ -1305,30 +1361,32 @@ mod test {
     }
 
     fn local(calib_us: u64, frees_in_us: u64) -> Cand {
-        Cand { calib_us, frees_in_us, overhead_us: 0, place: Place::Local { layout: LayoutId::new(), class: 0 } }
+        let place = Place::Local { layout: LayoutId::new(), class: 0 };
+        Cand { rate: rate(calib_us), frees_in_us, overhead_us: 0, place }
     }
 
     #[test]
     fn choose_spends_slack_on_slower_classes() {
         // 1000 mcu takes 1, 2 or 4 ms. All free.
         let free = [local(1000, 0), local(2000, 0), local(4000, 0)];
-        assert_eq!(choose(&free, 3, 1000, 0, 1000), 0);
-        assert_eq!(choose(&free, 3, 1000, 1000, 1000), 1);
-        assert_eq!(choose(&free, 3, 1000, 3000, 1000), 2);
+        assert_eq!(choose(&free, 3, 1000, 0, rate(1000)), 0);
+        assert_eq!(choose(&free, 3, 1000, 1000, rate(1000)), 1);
+        assert_eq!(choose(&free, 3, 1000, 3000, rate(1000)), 2);
         // The fast class frees in 5 ms: with no slack, start now on the middle one.
-        assert_eq!(choose(&[local(1000, 5000), local(2000, 0), local(4000, 0)], 3, 1000, 0, 1000), 1);
+        assert_eq!(choose(&[local(1000, 5000), local(2000, 0), local(4000, 0)], 3, 1000, 0, rate(1000)), 1);
         // Plenty of slack: wait 1 ms for the slow class rather than take a free fast one.
-        assert_eq!(choose(&[local(1000, 0), local(2000, 0), local(4000, 1000)], 3, 1000, 10_000, 1000), 2);
+        let slow_frees_soon = [local(1000, 0), local(2000, 0), local(4000, 1000)];
+        assert_eq!(choose(&slow_frees_soon, 3, 1000, 10_000, rate(1000)), 2);
         let remote = |calib_us| {
             let mut c = local(calib_us, 0);
             c.overhead_us = 200;
             c
         };
         // A remote class no faster than the local one loses to its overhead.
-        assert_eq!(choose(&[local(1000, 0), remote(1000)], 1, 1000, 0, 1000), 0);
+        assert_eq!(choose(&[local(1000, 0), remote(1000)], 1, 1000, 0, rate(1000)), 0);
         // Slack keeps a job on a slow local class, but another box that
         // finishes it sooner wins anyway: it costs this box nothing.
-        assert_eq!(choose(&[local(1000, 0), local(4000, 0), remote(1000)], 2, 1000, 10_000, 1000), 2);
+        assert_eq!(choose(&[local(1000, 0), local(4000, 0), remote(1000)], 2, 1000, 10_000, rate(1000)), 2);
     }
 
     #[test]
@@ -1368,9 +1426,10 @@ mod test {
         let (tx, rx) = mpsc::unbounded_channel();
         let (load_tx, load) = watch::channel(Load::default());
         let mut sched = Sched::new(setup, Profile::DEFAULT, load_tx, tx)?;
-        for &(name, cost_mcu, mem_kb) in costs {
+        for &(name, cost_mi, mem_kb) in costs {
             for _ in 0..5 {
-                let sample = Sample { cost_mcu, wall_ms: 1, mem_kb, origin: Origin::Here };
+                let origin = Origin::Here;
+                let sample = Sample { cost_mi, front_mi: None, width_c: 100, wall_ms: 1, mem_kb, origin };
                 sched.stats.record(&unit(name, &[]), sample);
             }
         }
@@ -1583,7 +1642,7 @@ mod test {
 
     fn remote_box(calib_us: u64, cpus: u32, free: u32, version: u64) -> (NPath, BoxState) {
         let toolchains = vec![Toolchain { key: "c h".into(), targets: vec!["h".into()] }];
-        let classes = vec![ClassState { calib_us, cpus, free }];
+        let classes = vec![ClassState { rate: rate(calib_us), cpus, free }];
         let state = BoxState { protocol: PROTOCOL, profile: "default".into(), version, toolchains, classes };
         (NPath::from("/farm/b/jobs"), state)
     }
@@ -1697,7 +1756,7 @@ mod test {
         time::sleep(MEASURE * 2).await;
         let foot = sys::tree_footprint_kb(child.id());
         // maxrss says 1 kB, as it would for a job swapped out at its peak.
-        job.finish(Ran { cpu_us: 1000, wall_us: 1000, maxrss_kb: 1 });
+        job.finish(Ran { cpu_us: 1000, wall_us: 1000, maxrss_kb: 1, instructions: None, front: None });
         let st = h.status().await;
         child.kill()?;
         child.wait()?;
@@ -1728,6 +1787,48 @@ mod test {
         assert_eq!(s.mem_free_kb(), 10_000);
         drop((slot, s));
         fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_is_recorded_as_work_front_end_and_width() -> Result<()> {
+        let dir = scratch("record");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], idle_box(u64::MAX), &[], &[])?;
+        let u = unit("a", &[]);
+        // 4 G instructions in 2 s of CPU over 1 s; the front end took 0.4 s
+        // of each, so the rest kept 1.6 s of CPU busy in 0.6 s.
+        let front = Some(Front { wall_us: 400_000, cpu_us: 400_000 });
+        let instructions = Some(4_000_000_000);
+        let ran = Ran { cpu_us: 2_000_000, wall_us: 1_000_000, maxrss_kb: 1, instructions, front };
+        s.record(&u, &ran, 1, 0, Origin::Here);
+        let info = |s: &Sched, key: &str| s.stats.units().find(|(k, _)| k.as_str() == key).unwrap().1;
+        let near = |v: u64, want: u64| v.abs_diff(want) * 100 <= want;
+        let a = info(&s, "a");
+        let front_ok = a.front_mi.is_some_and(|f| near(f, 800));
+        assert!(near(a.cost_mi, 4000) && front_ok, "{:?}", (a.cost_mi, a.front_mi));
+        assert!(near(a.width_c, 266), "{}", a.width_c);
+        // Without a count, work is CPU time at the class's rate.
+        let ran = Ran { instructions: None, front: None, ..ran };
+        s.record(&unit("b", &[]), &ran, 3000, 0, Origin::Here);
+        let b = info(&s, "b");
+        assert!(near(b.cost_mi, 6000) && near(b.width_c, 200), "{:?}", (b.cost_mi, b.width_c));
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn class_rates_learn_from_the_jobs_that_ran_there() -> Result<()> {
+        let h = Harness::start("rates", vec![class(1000, &[0])], u64::MAX, &[], &[])?;
+        let seeded = h.status().await.classes[0].rate;
+        assert_eq!(seeded, rate(1000));
+        // Ten minutes of CPU at 3000 instructions per µs outweighs the seed.
+        let job = slot(h.submit("a")).await?;
+        let cpu_us = 600_000_000;
+        let instructions = Some(cpu_us * 3000);
+        job.finish(Ran { cpu_us, wall_us: cpu_us, maxrss_kb: 1, instructions, front: None });
+        let learned = h.status().await.classes[0].rate;
+        assert!(learned.abs_diff(3000) < 30, "{learned}");
         Ok(())
     }
 
@@ -1836,7 +1937,7 @@ mod test {
     #[tokio::test]
     async fn status_lists_every_unit_run_here_or_sent() -> Result<()> {
         let h = Harness::start("units", vec![class(1000, &[0])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;
-        let ran = || Ran { cpu_us: 1000, wall_us: 1000, maxrss_kb: 1 };
+        let ran = || Ran { cpu_us: 1000, wall_us: 1000, maxrss_kb: 1, instructions: None, front: None };
         h.offer("theirs").await?.slot.expect("a free slot").finish(ran());
         slot(h.submit("mine")).await?.finish(ran());
         h.farm(remote_box(200, 4, 4, 1));
@@ -1847,7 +1948,7 @@ mod test {
         let st = h.status().await;
         let runs = |key: &str| {
             let u = st.units.iter().find(|u| u.key == key).unwrap();
-            (u.here, u.sent, u.served, u.rank_mcu.is_some())
+            (u.here, u.sent, u.served, u.rank_mi.is_some())
         };
         assert_eq!(runs("theirs"), (0, 0, 1, false), "not in this box's graph");
         assert_eq!(runs("mine"), (1, 0, 0, true));

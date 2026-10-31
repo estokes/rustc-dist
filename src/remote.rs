@@ -1,6 +1,6 @@
 use crate::{
     blobs::{Hash, Hashes},
-    protocol::{Job, Unit},
+    protocol::{self, Job, Ran, Unit},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
@@ -54,7 +54,8 @@ pub enum FromServer {
     /// it names.
     Stderr(Bytes),
     Output { path: ArcStr, mode: u32, data: Bytes, last: bool },
-    Exit { code: i32, cpu_us: u64, wall_us: u64, maxrss_kb: u64 },
+    /// `ran` is the server's measurement, whatever the code.
+    Exit { code: i32, ran: Ran },
     Failed(ArcStr),
 }
 
@@ -250,7 +251,7 @@ pub enum Event {
 
 pub enum Outcome {
     Busy { version: u64 },
-    Exit { code: i32, cpu_us: u64, wall_us: u64, maxrss_kb: u64 },
+    Exit { code: i32, ran: Ran },
 }
 
 /// Run a staged job on the box listening at `jobs`. `sink` gets rustc's
@@ -320,21 +321,17 @@ pub async fn run(
                 }
             }
             FromServer::Stderr(line) => {
-                let artifact = line.windows(ARTIFACT.len()).any(|w| w == ARTIFACT);
+                let artifact = protocol::is_artifact_line(&line);
                 sink(if artifact { Event::Artifact(line) } else { Event::Stderr(line) })?;
             }
             FromServer::Stdout(data) => sink(Event::Stdout(data))?,
-            FromServer::Exit { code, cpu_us, wall_us, maxrss_kb } => {
-                return Ok(Outcome::Exit { code, cpu_us, wall_us, maxrss_kb });
-            }
+            FromServer::Exit { code, ran } => return Ok(Outcome::Exit { code, ran }),
             FromServer::Failed(why) => bail!("{jobs}: {why}"),
             m => bail!("{jobs}: unexpected {m:?}"),
         }
     }
 }
 
-/// rustc's JSON marker for a line announcing a written file.
-pub const ARTIFACT: &[u8] = br#""$message_type":"artifact""#;
 
 #[cfg(test)]
 mod test {

@@ -162,6 +162,32 @@ fn read_into(path: &str, text: &mut String) -> bool {
     File::open(path).and_then(|mut f| f.read_to_string(text)).is_ok()
 }
 
+/// User plus system CPU time, in µs, of `pid` and its descendants so far,
+/// counting every thread.
+pub fn tree_cpu_us(pid: u32) -> u64 {
+    let mut path: LPooled<String> = LPooled::take();
+    let mut text: LPooled<String> = LPooled::take();
+    let mut ticks = 0;
+    descendants(pid, |p| {
+        path.clear();
+        let _ = write!(path, "/proc/{p}/stat");
+        if read_into(&path, &mut text) {
+            ticks += stat_ticks(&text);
+        }
+    });
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    ticks * 1_000_000 / hz
+}
+
+/// utime plus stime from a `/proc/PID/stat`. The command name in
+/// parentheses may hold spaces, so fields count from the last `)`.
+fn stat_ticks(stat: &str) -> u64 {
+    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else { return 0 };
+    let mut fields = rest.split_whitespace().skip(11);
+    let mut next = || fields.next().and_then(|f| f.parse::<u64>().ok()).unwrap_or(0);
+    next() + next()
+}
+
 pub struct Usage {
     pub cpu_us: u64,
     pub maxrss_kb: u64,
@@ -199,6 +225,13 @@ mod test {
         assert_eq!(m.capacity_kb, 1_000_000 + 200_000 * 4 / 2);
         assert_eq!(m.used_kb, 400_000 - 100_000 + 1_000_000);
         Ok(())
+    }
+
+    #[test]
+    fn stat_ticks_skip_the_command_name() {
+        let stat = "4242 (rustc (x) y) R 1 2 3 4 5 6 7 8 9 10 150 25 0 0 20 0 17";
+        assert_eq!(stat_ticks(stat), 175);
+        assert!(tree_cpu_us(std::process::id()) > 0);
     }
 
     #[test]

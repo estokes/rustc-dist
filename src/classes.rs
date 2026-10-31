@@ -1,3 +1,4 @@
+use crate::calibrate;
 use anyhow::{Context, Result, bail};
 use arcstr::{ArcStr, literal};
 use compact_str::format_compact;
@@ -9,18 +10,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// CPUs of equal measured speed. `calib_us` is the median time one
-/// calibration run took on them with every CPU loaded.
+/// CPUs of equal measured speed. `rate` is the instructions per CPU-µs
+/// each retired running the calibration load with every CPU loaded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Class {
-    pub calib_us: u64,
+    pub rate: u64,
     pub cpus: Vec<u32>,
 }
 
-/// Every allowed CPU as one class with a calibration of one second, so
-/// costs are CPU seconds. Used only when calibration fails.
+/// Every allowed CPU as one class, at the rate of a calibration run that
+/// took one second. Used only when calibration fails.
 pub fn fallback(allowed: &[u32]) -> Vec<Class> {
-    vec![Class { calib_us: 1_000_000, cpus: allowed.to_vec() }]
+    vec![Class { rate: calibrate::RUN_INSTRUCTIONS / 1_000_000, cpus: allowed.to_vec() }]
 }
 
 /// A power profile name, also used as a file name.
@@ -98,8 +99,8 @@ pub fn load(state_dir: &Path, profile: &Profile, allowed: &[u32]) -> Result<Opti
         toml::from_str(&text).with_context(|| format_compact!("parsing {}", path.display()))?;
     let mut classes = file.class;
     for class in &mut classes {
-        if class.calib_us == 0 {
-            bail!("{}: calib_us must be positive", path.display());
+        if class.rate == 0 {
+            bail!("{}: rate must be positive", path.display());
         }
         class.cpus.retain(|cpu| {
             let ok = allowed.contains(cpu);
@@ -110,7 +111,7 @@ pub fn load(state_dir: &Path, profile: &Profile, allowed: &[u32]) -> Result<Opti
         });
     }
     classes.retain(|c| !c.cpus.is_empty());
-    classes.sort_by_key(|c| c.calib_us);
+    classes.sort_by_key(|c| std::cmp::Reverse(c.rate));
     let mut seen: Vec<u32> = classes.iter().flat_map(|c| c.cpus.iter().copied()).collect();
     let total = seen.len();
     seen.sort_unstable();

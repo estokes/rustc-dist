@@ -1,8 +1,7 @@
 use crate::{
     argv::{self, Compile, Invocation},
-    client, config,
-    protocol::{self, Ask, Job, Ran, Reply},
-    remote::ARTIFACT,
+    client, config, perf,
+    protocol::{self, Ask, Front, Job, Ran, Reply},
     sys,
 };
 use anyhow::{Context, Error, Result, anyhow, bail};
@@ -94,6 +93,7 @@ fn exec(args: &[OsString]) -> Error {
 
 /// Run rustc on this box. With `filter_metadata`, drop its rmeta notice,
 /// because cargo already got one from a remote run that then failed.
+/// Rustc's stderr passes through here so the front end can be timed.
 fn compile(
     sock: &mut UnixStream,
     buf: &mut BytesMut,
@@ -104,10 +104,8 @@ fn compile(
     let parent = process::id() as libc::pid_t;
     let mut cmd = Command::new(&args[0]);
     cmd.args(&args[1..])
-        .env("CARGO_MAKEFLAGS", format_compact!("-j --jobserver-auth=fifo:{jobserver}").as_str());
-    if filter_metadata {
-        cmd.stderr(Stdio::piped());
-    }
+        .env("CARGO_MAKEFLAGS", format_compact!("-j --jobserver-auth=fifo:{jobserver}").as_str())
+        .stderr(Stdio::piped());
     // rustc must not outlive the wrapper that holds its slot.
     unsafe {
         cmd.pre_exec(move || {
@@ -120,32 +118,36 @@ fn compile(
             Ok(())
         });
     }
+    let counter = perf::Counter::start(true);
     let start = Instant::now();
     let mut child =
         cmd.spawn().with_context(|| format_compact!("running {}", Path::new(&args[0]).display()))?;
-    if let Some(stderr) = child.stderr.take() {
-        let mut out = io::stderr().lock();
-        for line in BufReader::new(stderr).split(b'\n') {
-            let line = line?;
-            let artifact = line.windows(ARTIFACT.len()).any(|w| w == ARTIFACT);
-            if !(artifact && line.windows(METADATA.len()).any(|w| w == METADATA)) {
-                out.write_all(&line)?;
-                out.write_all(b"\n")?;
-            }
+    let mut front = None;
+    let stderr = child.stderr.take().context("rustc's stderr")?;
+    let mut out = io::stderr().lock();
+    for line in BufReader::new(stderr).split(b'\n') {
+        let line = line?;
+        let metadata = protocol::is_metadata_line(&line);
+        if metadata && front.is_none() {
+            let wall_us = start.elapsed().as_micros() as u64;
+            front = Some(Front { wall_us, cpu_us: sys::tree_cpu_us(child.id()) });
+        }
+        if !(metadata && filter_metadata) {
+            out.write_all(&line)?;
+            out.write_all(b"\n")?;
         }
     }
     let status = child.wait()?;
     if status.success() {
         let wall_us = start.elapsed().as_micros() as u64;
         let usage = sys::children_usage();
-        let ran = Ran { cpu_us: usage.cpu_us, wall_us, maxrss_kb: usage.maxrss_kb };
+        let instructions = counter.map(|c| c.read());
+        let ran = Ran { cpu_us: usage.cpu_us, wall_us, maxrss_kb: usage.maxrss_kb, instructions, front };
         // A daemon that restarted meanwhile just misses this sample.
         let _ = protocol::send(sock, buf, &ran);
     }
     Ok(status)
 }
-
-const METADATA: &[u8] = br#""emit":"metadata""#;
 
 fn exit_as(status: ExitStatus) -> ! {
     if let Some(sig) = status.signal() {
@@ -155,4 +157,41 @@ fn exit_as(status: ExitStatus) -> ! {
         }
     }
     process::exit(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn a_compile_reports_its_instructions_and_front_end() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-wrapper-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let mut src = String::new();
+        for i in 0..200 {
+            src.push_str(&format!("pub fn f{i}(v: &[u64]) -> u64 {{ v.iter().map(|x| x * {i}).sum() }}\n"));
+        }
+        fs::write(dir.join("lib.rs"), src)?;
+        let args: Vec<OsString> = [
+            "rustc", "--crate-name", "t", "--crate-type", "lib", "--edition", "2021",
+            "--emit=dep-info,metadata,link", "--error-format=json", "--json=artifacts", "-C", "opt-level=2",
+        ]
+        .iter()
+        .map(OsString::from)
+        .chain([dir.join("lib.rs").into_os_string(), "--out-dir".into(), dir.clone().into_os_string()])
+        .collect();
+        let (mut ours, mut daemon) = UnixStream::pair()?;
+        let mut buf = BytesMut::new();
+        let status = compile(&mut ours, &mut buf, &args, "/nonexistent", false)?;
+        assert!(status.success());
+        let ran: Ran = protocol::recv(&mut daemon, &mut buf)?;
+        let front = ran.front.context("an .rmeta line")?;
+        assert!(front.wall_us < ran.wall_us && front.cpu_us > 0, "{ran:?}");
+        if perf::Counter::start(false).is_some() {
+            assert!(ran.instructions.is_some_and(|n| n > 100_000_000), "{ran:?}");
+        }
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 }

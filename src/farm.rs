@@ -26,7 +26,8 @@ const LIST_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pack)]
 pub struct ClassState {
-    pub calib_us: u64,
+    /// Instructions per CPU-µs.
+    pub rate: u64,
     pub cpus: u32,
     /// Jobserver tokens an offer to this class would find now: none while
     /// the box switches profile or its own jobs wait.

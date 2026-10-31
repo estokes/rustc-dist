@@ -92,11 +92,37 @@ pub enum Reply {
 
 /// Sent by the wrapper after rustc succeeds. A failed or killed rustc
 /// sends nothing, so its time is not recorded.
-#[derive(Debug, Pack)]
+#[derive(Debug, Clone, Copy, Pack)]
 pub struct Ran {
     pub cpu_us: u64,
     pub wall_us: u64,
     pub maxrss_kb: u64,
+    /// User-space instructions retired, where the box can count them.
+    pub instructions: Option<u64>,
+    /// When rustc printed its `.rmeta` line, if it did.
+    pub front: Option<Front>,
+}
+
+/// A compile up to its `.rmeta` line: the front end, which runs on one
+/// thread.
+#[derive(Debug, Clone, Copy, Pack)]
+pub struct Front {
+    pub wall_us: u64,
+    pub cpu_us: u64,
+}
+
+fn contains(line: &[u8], pat: &[u8]) -> bool {
+    line.windows(pat.len()).any(|w| w == pat)
+}
+
+/// Whether a line of rustc's JSON stderr announces a written file.
+pub fn is_artifact_line(line: &[u8]) -> bool {
+    contains(line, br#""$message_type":"artifact""#)
+}
+
+/// Whether a line of rustc's JSON stderr announces its `.rmeta`.
+pub fn is_metadata_line(line: &[u8]) -> bool {
+    is_artifact_line(line) && contains(line, br#""emit":"metadata""#)
 }
 
 #[derive(Debug, Pack)]
@@ -142,7 +168,8 @@ pub enum Switching {
 
 #[derive(Debug, Pack)]
 pub struct ClassStatus {
-    pub calib_us: u64,
+    /// Instructions per CPU-µs.
+    pub rate: u64,
     pub cpus: u32,
     /// Jobs of this box's builds.
     pub running: u32,
@@ -160,12 +187,16 @@ pub struct UnitStatus {
     pub sent: u64,
     /// Runs here for other boxes' builds.
     pub served: u64,
-    pub cost_mcu: u64,
+    /// Millions of instructions.
+    pub cost_mi: u64,
+    pub front_mi: Option<u64>,
+    /// Hundredths of the threads busy after the front end.
+    pub width_c: u64,
     pub wall_ms: u64,
     pub mem_kb: u64,
     /// Its cost plus the costliest chain of jobs that depend on it, if it
     /// is in this box's build graph.
-    pub rank_mcu: Option<u64>,
+    pub rank_mi: Option<u64>,
 }
 
 pub fn frame<T: Pack>(buf: &mut BytesMut, v: &T) -> Result<()> {

@@ -1,4 +1,4 @@
-use crate::{classes::Class, client, config, sys};
+use crate::{classes::Class, client, config, perf, sys};
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use compact_str::format_compact;
@@ -18,6 +18,9 @@ use std::{
 /// this ratio are in different classes.
 const CLASS_GAP: f64 = 1.08;
 const KEYS: usize = 1 << 15;
+/// Instructions one calibration run retires in a release build, for boxes
+/// that can't count them.
+pub const RUN_INSTRUCTIONS: u64 = 697_000_000;
 const BATCH: usize = 64;
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -95,34 +98,50 @@ fn run_once(keys: &[ArcStr], stop: Option<&AtomicBool>) -> Option<u64> {
     Some(sum)
 }
 
-/// Median CPU time of the runs that started after `warm`, with the thread
-/// pinned to `cpu`. CPU time leaves out the time other work holds the CPU,
-/// so a busy box still measures each core's speed. A CPU too slow to start
-/// a run after `warm` uses its earlier runs; every CPU finishes at least one.
-fn worker(cpu: u32, t0: Instant, warm: Duration, stop: &AtomicBool) -> Result<u64> {
+/// A CPU's calibration: the median CPU time of a run, and the
+/// instructions per CPU-µs it retired.
+#[derive(Debug, Clone, Copy)]
+struct Speed {
+    time_us: u64,
+    rate: u64,
+}
+
+/// The speed of the runs that started after `warm`, with the thread pinned
+/// to `cpu`. CPU time leaves out the time other work holds the CPU, so a
+/// busy box still measures each core's speed. A CPU too slow to start a run
+/// after `warm` uses its earlier runs; every CPU finishes at least one.
+fn worker(cpu: u32, t0: Instant, warm: Duration, stop: &AtomicBool) -> Result<Speed> {
     sys::pin(&[cpu])?;
     let keys = keys();
+    let counter = perf::Counter::start(false);
+    let count = || counter.as_ref().map_or(0, |c| c.read());
     let mut warming = Vec::new();
     let mut measured = Vec::new();
     loop {
         let start = Instant::now();
         let cpu_start = sys::thread_cpu_us();
+        let instr_start = count();
         let interruptible = !(warming.is_empty() && measured.is_empty());
         let Some(sum) = run_once(&keys, interruptible.then_some(stop)) else { break };
         black_box(sum);
-        let t = sys::thread_cpu_us() - cpu_start;
-        if start.duration_since(t0) >= warm { measured.push(t) } else { warming.push(t) }
+        let run = (sys::thread_cpu_us() - cpu_start, count() - instr_start);
+        if start.duration_since(t0) >= warm { measured.push(run) } else { warming.push(run) }
         if stop.load(Ordering::Relaxed) {
             break;
         }
     }
-    let times = if measured.is_empty() { &mut warming } else { &mut measured };
-    times.sort_unstable();
-    Ok(times[times.len() / 2])
+    let runs = if measured.is_empty() { &mut warming } else { &mut measured };
+    runs.sort_unstable();
+    let time_us = runs[runs.len() / 2].0;
+    let rate = match counter {
+        Some(_) => runs.iter().map(|r| r.1).sum::<u64>() / runs.iter().map(|r| r.0).sum::<u64>().max(1),
+        None => RUN_INSTRUCTIONS / time_us.max(1),
+    };
+    Ok(Speed { time_us, rate })
 }
 
-/// Run the load on every CPU at once and return each CPU's time.
-fn measure(cpus: &[u32], seconds: u64) -> Result<Vec<(u32, u64)>> {
+/// Run the load on every CPU at once and return each CPU's speed.
+fn measure(cpus: &[u32], seconds: u64) -> Result<Vec<(u32, Speed)>> {
     let stop = AtomicBool::new(false);
     let t0 = Instant::now();
     let warm = Duration::from_secs(seconds) / 2;
@@ -140,25 +159,27 @@ fn measure(cpus: &[u32], seconds: u64) -> Result<Vec<(u32, u64)>> {
             .into_iter()
             .zip(cpus)
             .map(|(w, &cpu)| {
-                let t = w.join().map_err(|_| anyhow!("calibration thread panicked"))??;
-                Ok((cpu, t))
+                let speed = w.join().map_err(|_| anyhow!("calibration thread panicked"))??;
+                Ok((cpu, speed))
             })
             .collect()
     })
 }
 
 /// Group CPUs by time: sort them and split where neighbours differ by
-/// more than `CLASS_GAP`. Fastest class first.
-fn group(mut times: Vec<(u32, u64)>) -> Vec<Class> {
-    times.sort_by_key(|&(cpu, t)| (t, cpu));
+/// more than `CLASS_GAP`. A class's rate is its CPUs' mean. Fastest class
+/// first.
+fn group(mut speeds: Vec<(u32, Speed)>) -> Vec<Class> {
+    speeds.sort_by_key(|&(cpu, s)| (s.time_us, cpu));
     let mut classes = Vec::new();
     let mut start = 0;
-    for i in 1..=times.len() {
-        if i == times.len() || times[i].1 as f64 > times[i - 1].1 as f64 * CLASS_GAP {
-            let members = &times[start..i];
+    for i in 1..=speeds.len() {
+        if i == speeds.len() || speeds[i].1.time_us as f64 > speeds[i - 1].1.time_us as f64 * CLASS_GAP {
+            let members = &speeds[start..i];
             let mut cpus: Vec<u32> = members.iter().map(|&(cpu, _)| cpu).collect();
             cpus.sort_unstable();
-            classes.push(Class { calib_us: members[members.len() / 2].1, cpus });
+            let rate = members.iter().map(|(_, s)| s.rate).sum::<u64>() / members.len() as u64;
+            classes.push(Class { rate, cpus });
             start = i;
         }
     }
@@ -174,13 +195,14 @@ pub fn run(cpus: &[u32], seconds: u64) -> Result<Vec<Class>> {
 pub fn print(seconds: u64) -> Result<()> {
     let cpus = sys::allowed_cpus()?;
     eprintln!("calibrating {} cpus for {seconds}s", cpus.len());
-    let times = measure(&cpus, seconds)?;
-    for &(cpu, t) in &times {
-        eprintln!("  cpu {cpu:3}: {:.1} ms", t as f64 / 1000.);
+    let speeds = measure(&cpus, seconds)?;
+    for &(cpu, s) in &speeds {
+        let (ms, g) = (s.time_us as f64 / 1000., s.rate as f64 / 1000.);
+        eprintln!("  cpu {cpu:3}: {ms:.1} ms, {g:.2} G instructions/s");
     }
     let mut out = io::stdout().lock();
-    for (k, c) in group(times).iter().enumerate() {
-        writeln!(out, "class {k}: {:.1} ms, cpus {:?}", c.calib_us as f64 / 1000., c.cpus)?;
+    for (k, c) in group(speeds).iter().enumerate() {
+        writeln!(out, "class {k}: {:.2} G instructions/s, cpus {:?}", c.rate as f64 / 1000., c.cpus)?;
     }
     Ok(())
 }
@@ -227,13 +249,30 @@ mod test {
 
     #[test]
     fn groups_split_at_gaps() {
-        let times = vec![(0, 800), (1, 810), (2, 790), (3, 1200), (4, 1230), (5, 1500), (6, 1520)];
-        let classes = group(times);
+        let speeds = |v: &[(u32, u64)]| {
+            v.iter().map(|&(cpu, time_us)| (cpu, Speed { time_us, rate: 1_000_000 / time_us })).collect()
+        };
+        let times = [(0, 800), (1, 810), (2, 790), (3, 1200), (4, 1230), (5, 1500), (6, 1520)];
+        let classes = group(speeds(&times));
         assert_eq!(classes.len(), 3);
-        assert_eq!(classes[0], Class { calib_us: 800, cpus: vec![0, 1, 2] });
+        assert_eq!(classes[0], Class { rate: (1250 + 1234 + 1265) / 3, cpus: vec![0, 1, 2] });
         assert_eq!(classes[1].cpus, vec![3, 4]);
         assert_eq!(classes[2].cpus, vec![5, 6]);
-        assert_eq!(group(vec![(0, 1000), (1, 1050)]).len(), 1);
+        assert_eq!(group(speeds(&[(0, 1000), (1, 1050)])).len(), 1);
+    }
+
+    #[test]
+    fn a_run_retires_about_the_fallback_count() {
+        let Some(c) = perf::Counter::start(false) else { return };
+        let keys = keys();
+        let before = c.read();
+        black_box(run_once(&keys, None));
+        let ratio = (c.read() - before) as f64 / RUN_INSTRUCTIONS as f64;
+        // Debug builds retire many more; the fallback is for release builds.
+        assert!(ratio > 0.95, "{ratio}");
+        if !cfg!(debug_assertions) {
+            assert!(ratio < 1.05, "{ratio}");
+        }
     }
 
     #[test]
@@ -244,3 +283,4 @@ mod test {
         assert_eq!(run_once(&keys, Some(&stop)), None);
     }
 }
+
