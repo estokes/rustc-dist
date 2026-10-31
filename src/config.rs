@@ -23,7 +23,8 @@ pub struct Config {
     /// The netidx path every box of the farm publishes under. Without it
     /// this box works alone.
     pub base: Option<String>,
-    /// This box's name under `base`. The host name by default.
+    /// This box's name under `base`. The host name without its domain by
+    /// default.
     pub name: Option<String>,
     /// Where this box listens for other boxes, in netidx's bind syntax,
     /// e.g. `192.168.1.0/24`. The netidx config's default otherwise, which

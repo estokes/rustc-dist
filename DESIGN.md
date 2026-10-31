@@ -506,7 +506,7 @@ Config is real TOML (`toml` + serde), parsed into two separate structs.
 
 - User, `~/.config/rustc-dist.toml`: `compressed_swap_share`, `tokens_per_cpu`,
   `calibration_seconds`, and for a farm `base` (the netidx path every box
-  publishes under), `name` (the host name by default), `bind` (where other
+  publishes under), `name` (the host name without its domain by default), `bind` (where other
   boxes reach this one, in netidx's syntax, since netidx's default is often
   loopback only), `cache_dir`, `cache_gb` and `remote_links` (on by default).
   Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit

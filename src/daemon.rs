@@ -185,7 +185,7 @@ async fn join(
 
 fn hostname() -> String {
     fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|h| h.trim().replace('/', "_"))
+        .map(|h| h.trim().split('.').next().unwrap_or_default().replace('/', "_"))
         .unwrap_or_else(|_| "rustc-dist".into())
 }
 
