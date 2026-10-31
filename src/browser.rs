@@ -123,7 +123,7 @@ impl Board {
             ("running", (sum(|c| c.running) + st.spread.running).into()),
             ("serving", (sum(|c| c.serving) + st.spread.serving).into()),
             ("cpus", sum(|c| c.cpus).into()),
-            ("G instr/s", round(st.classes.iter().map(|c| c.rate_g() * c.cpus as f64).sum(), 0).into()),
+            ("G instr per s", round(st.classes.iter().map(|c| c.rate_g() * c.cpus as f64).sum(), 0).into()),
             ("class running", per_class(|c| c.running)),
             ("class serving", per_class(|c| c.serving)),
             ("class lent", per_class(|c| c.lent)),
@@ -221,7 +221,11 @@ mod test {
         show(&mut board, &publisher, &status(both)).await?;
         assert_eq!(value(&net, "/farm/status/a/waiting").await?, Value::from(7u32));
         assert_eq!(value(&net, "/farm/status/a/running").await?, Value::from(2u32));
-        assert_eq!(value(&net, "/farm/status/a/G instr/s").await?, Value::from(38.0));
+        assert_eq!(value(&net, "/farm/status/a/G instr per s").await?, Value::from(38.0));
+        for column in net.subscriber().resolver().list(Path::from("/farm/status/a")).await?.iter() {
+            let below = net.subscriber().resolver().list(column.clone()).await?;
+            assert!(below.is_empty(), "{column} is a directory, not a column");
+        }
         assert_eq!(value(&net, "/farm/status/a/class serving").await?, Value::from(vec![0u32, 2]));
         assert_eq!(value(&net, &format!("{serde}/work")).await?, Value::from(2.5));
         assert_eq!(value(&net, &format!("{serde}/front (%)")).await?, Value::from(25u64));

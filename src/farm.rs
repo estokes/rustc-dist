@@ -40,7 +40,7 @@ pub const STATE: [&str; 8] = [
     "version",
     "toolchains",
     "class cpus",
-    "class G instr/s",
+    "class G instr per s",
     "class free",
     "class next free (ms)",
 ];
@@ -216,7 +216,10 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
     loop {
         tokio::select! {
             r = load.changed() => {
-                r?;
+                if r.is_err() {
+                    // The scheduler has stopped.
+                    break;
+                }
                 changed = true;
             }
             _ = publish.tick(), if changed => {
