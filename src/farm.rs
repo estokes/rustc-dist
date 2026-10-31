@@ -1,17 +1,24 @@
+//! A farm in netidx, under the config's `base`:
+//!
+//! - `BASE/status/NAME/COLUMN`: a row per box, which the netidx browser
+//!   draws as a table. The columns in [`STATE`] are what other boxes read;
+//!   the rest are for people (see `browser`).
+//! - `BASE/api/NAME/jobs`: where a box takes remote jobs.
+//! - `BASE/units/NAME/UNIT/COLUMN`: the units a box has run.
+
 use crate::{protocol::PROTOCOL, sched::Msg, toolchain::Toolchain};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, bail};
 use arcstr::ArcStr;
-use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, channel::mpsc as fmpsc};
 use log::{info, warn};
 use netidx::{
     path::Path,
-    publisher::{Publisher, Val, Value},
+    publisher::{FromValue, Publisher, UpdateBatch, Val, Value},
     resolver_client::ChangeTracker,
     subscriber::{Dval, Event, SubId, Subscriber, UpdateChan, UpdatesFlags},
 };
-use netidx_core::pack::Pack;
 use netidx_derive::Pack;
+use poolshark::local::LPooled;
 use std::{collections::HashMap, time::Duration};
 use tokio::{
     sync::{mpsc, watch},
@@ -23,6 +30,20 @@ use tokio::{
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 /// How often to look for boxes joining or leaving.
 const LIST_EVERY: Duration = Duration::from_secs(1);
+
+/// The status columns a box's state is published in. A change updates the
+/// columns it touches in one batch, which subscribers get whole, so a box
+/// never sees half of another's state.
+pub const STATE: [&str; 8] = [
+    "protocol",
+    "profile",
+    "version",
+    "toolchains",
+    "class cpus",
+    "class G instr/s",
+    "class free",
+    "class next free (ms)",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pack)]
 pub struct ClassState {
@@ -38,8 +59,8 @@ pub struct ClassState {
     pub frees_in_ms: Option<u32>,
 }
 
-/// What a box publishes at `BASE/NAME/state`.
-#[derive(Debug, Clone, PartialEq, Eq, Pack)]
+/// What a box publishes for other boxes, in its [`STATE`] columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoxState {
     pub protocol: u32,
     pub profile: ArcStr,
@@ -48,6 +69,59 @@ pub struct BoxState {
     pub version: u64,
     pub toolchains: Vec<Toolchain>,
     pub classes: Vec<ClassState>,
+}
+
+impl BoxState {
+    fn columns(&self) -> [Value; 8] {
+        let per_class = |f: fn(&ClassState) -> Value| Value::from(self.classes.iter().map(f).collect::<Vec<_>>());
+        [
+            self.protocol.into(),
+            self.profile.clone().into(),
+            self.version.into(),
+            self.toolchains.iter().map(|t| (t.key.clone(), t.targets.clone())).collect::<Vec<_>>().into(),
+            per_class(|c| c.cpus.into()),
+            per_class(|c| (c.rate as f64 / 1000.).into()),
+            per_class(|c| c.free.into()),
+            per_class(|c| c.frees_in_ms.into()),
+        ]
+    }
+
+    fn from_columns(columns: &[Value]) -> Result<Self> {
+        let [protocol, profile, version, toolchains, cpus, rates, free, frees_in] = columns else {
+            bail!("{} state columns", columns.len());
+        };
+        fn cast<T: FromValue>(v: &Value) -> Result<T> {
+            v.clone().cast_to()
+        }
+        let toolchains: Vec<(ArcStr, Vec<ArcStr>)> = cast(toolchains)?;
+        let cpus: Vec<u32> = cast(cpus)?;
+        let rates: Vec<f64> = cast(rates)?;
+        let free: Vec<u32> = cast(free)?;
+        let frees_in: Vec<Option<u32>> = cast(frees_in)?;
+        let n = cpus.len();
+        if rates.len() != n || free.len() != n || frees_in.len() != n {
+            bail!("class columns of different lengths");
+        }
+        let classes = cpus
+            .into_iter()
+            .zip(rates)
+            .zip(free)
+            .zip(frees_in)
+            .map(|(((cpus, rate), free), frees_in_ms)| ClassState {
+                rate: (rate * 1000.).round() as u64,
+                cpus,
+                free,
+                frees_in_ms,
+            })
+            .collect();
+        Ok(Self {
+            protocol: cast(protocol)?,
+            profile: cast(profile)?,
+            version: cast(version)?,
+            toolchains: toolchains.into_iter().map(|(key, targets)| Toolchain { key, targets }).collect(),
+            classes,
+        })
+    }
 }
 
 /// The part of a box's state its scheduler changes.
@@ -60,18 +134,33 @@ pub struct Load {
 
 /// Where a box takes remote jobs.
 pub fn jobs_path(base: &Path, name: &str) -> Path {
-    base.append(name).append("jobs")
+    base.append("api").append(name).append("jobs")
 }
 
-fn pack(state: &BoxState) -> Result<Value> {
-    let mut buf = BytesMut::with_capacity(state.encoded_len());
-    state.encode(&mut buf).map_err(|e| anyhow!("{e}"))?;
-    Ok(Value::from(buf.freeze()))
+/// A box's row in the status table.
+pub fn status_path(base: &Path, name: &str) -> Path {
+    base.append("status").append(name)
 }
 
-fn unpack(v: Value) -> Result<BoxState> {
-    let mut bytes = v.cast_to::<Bytes>()?;
-    BoxState::decode(&mut bytes).map_err(|e| anyhow!("{e}"))
+/// The table of units a box has run.
+pub fn units_path(base: &Path, name: &str) -> Path {
+    base.append("units").append(name)
+}
+
+/// A published value and what it last showed, so only changes are sent.
+pub struct Cell(Val, Value);
+
+impl Cell {
+    pub fn publish(publisher: &Publisher, path: Path, v: Value) -> Result<Self> {
+        Ok(Self(publisher.publish(path, v.clone())?, v))
+    }
+
+    pub fn set(&mut self, batch: &mut UpdateBatch, v: Value) {
+        if self.1 != v {
+            self.0.update(batch, v.clone());
+            self.1 = v;
+        }
+    }
 }
 
 pub struct Member {
@@ -80,6 +169,23 @@ pub struct Member {
     pub base: Path,
     pub name: ArcStr,
     pub toolchains: Vec<Toolchain>,
+}
+
+/// Another box being watched: its state columns as they last arrived.
+struct Watched {
+    _subs: Vec<Dval>,
+    columns: [Option<Value>; 8],
+}
+
+impl Watched {
+    /// Its state, once every column has arrived.
+    fn state(&self) -> Option<Result<BoxState>> {
+        let mut columns: LPooled<Vec<Value>> = LPooled::take();
+        for c in &self.columns {
+            columns.push(c.clone()?);
+        }
+        Some(BoxState::from_columns(&columns))
+    }
 }
 
 /// Publish this box's state and tell the scheduler about every other
@@ -92,12 +198,18 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
         toolchains: m.toolchains.clone(),
         classes: load.classes.clone(),
     };
-    let val: Val = m.publisher.publish(m.base.append(&m.name).append("state"), pack(&state(&load.borrow_and_update()))?)?;
-    info!("publishing {}", m.base.append(&m.name));
+    let row = status_path(&m.base, &m.name);
+    let mut cells = STATE
+        .iter()
+        .zip(state(&load.borrow_and_update()).columns())
+        .map(|(col, v)| Cell::publish(&m.publisher, row.append(col), v))
+        .collect::<Result<Vec<_>>>()?;
+    info!("publishing {row}");
+    let table = m.base.append("status");
     let (updates_tx, mut updates): (UpdateChan, _) = fmpsc::channel(64);
-    let mut boxes: HashMap<ArcStr, Dval> = HashMap::new();
-    let mut names: HashMap<SubId, ArcStr> = HashMap::new();
-    let mut tracker = ChangeTracker::new(m.base.clone());
+    let mut boxes: HashMap<ArcStr, Watched> = HashMap::new();
+    let mut columns: HashMap<SubId, (ArcStr, usize)> = HashMap::new();
+    let mut tracker = ChangeTracker::new(table.clone());
     let mut list = time::interval(LIST_EVERY);
     let mut publish = time::interval(PUBLISH_EVERY);
     let mut changed = false;
@@ -110,31 +222,43 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
             _ = publish.tick(), if changed => {
                 changed = false;
                 let mut batch = m.publisher.start_batch();
-                val.update(&mut batch, pack(&state(&load.borrow_and_update()))?);
+                for (cell, v) in cells.iter_mut().zip(state(&load.borrow_and_update()).columns()) {
+                    cell.set(&mut batch, v);
+                }
                 batch.commit(None).await;
             }
             batch = updates.next() => {
                 let Some(mut batch) = batch else { break };
+                let mut touched: LPooled<Vec<ArcStr>> = LPooled::take();
                 for (id, ev) in batch.drain(..) {
-                    let Some(name) = names.get(&id) else { continue };
-                    let state = match ev {
-                        Event::Update(v) => match unpack(v) {
-                            Ok(s) => Some((jobs_path(&m.base, name), s)),
-                            Err(e) => {
-                                warn!("state of {name}: {e:#}");
-                                None
-                            }
-                        },
+                    let Some((name, i)) = columns.get(&id) else { continue };
+                    let Some(w) = boxes.get_mut(name) else { continue };
+                    w.columns[*i] = match ev {
+                        Event::Update(v) => Some(v),
                         Event::Unsubscribed => None,
                     };
-                    let _ = tx.send(Msg::Farm { name: name.clone(), state });
+                    if !touched.contains(name) {
+                        touched.push(name.clone());
+                    }
+                }
+                for name in touched.drain(..) {
+                    let Some(w) = boxes.get(&name) else { continue };
+                    let state = match w.state() {
+                        Some(Ok(s)) => Some((jobs_path(&m.base, &name), s)),
+                        Some(Err(e)) => {
+                            warn!("state of {name}: {e:#}");
+                            None
+                        }
+                        None => None,
+                    };
+                    let _ = tx.send(Msg::Farm { name, state });
                 }
             }
             _ = list.tick() => {
                 if !m.subscriber.resolver().check_changed(&mut tracker).await? {
                     continue;
                 }
-                let listed = m.subscriber.resolver().list(m.base.clone()).await?;
+                let listed = m.subscriber.resolver().list(table.clone()).await?;
                 let present: Vec<ArcStr> = listed
                     .iter()
                     .filter_map(|p| Path::basename(p).map(ArcStr::from))
@@ -143,23 +267,99 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
                 for name in &present {
                     if !boxes.contains_key(name) {
                         info!("box {name} joined");
-                        let dval = m.subscriber.subscribe(m.base.append(name).append("state"));
-                        dval.updates(UpdatesFlags::BEGIN_WITH_LAST, updates_tx.clone());
-                        names.insert(dval.id(), name.clone());
-                        boxes.insert(name.clone(), dval);
+                        let at = status_path(&m.base, name);
+                        let subs: Vec<Dval> = STATE
+                            .iter()
+                            .enumerate()
+                            .map(|(i, col)| {
+                                let dval = m.subscriber.subscribe(at.append(col));
+                                dval.updates(UpdatesFlags::BEGIN_WITH_LAST, updates_tx.clone());
+                                columns.insert(dval.id(), (name.clone(), i));
+                                dval
+                            })
+                            .collect();
+                        boxes.insert(name.clone(), Watched { _subs: subs, columns: Default::default() });
                     }
                 }
-                boxes.retain(|name, dval| {
+                boxes.retain(|name, _| {
                     let keep = present.contains(name);
                     if !keep {
                         info!("box {name} left");
-                        names.remove(&dval.id());
                         let _ = tx.send(Msg::Farm { name: name.clone(), state: None });
                     }
                     keep
                 });
+                columns.retain(|_, (name, _)| boxes.contains_key(name));
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use netidx::InternalOnly;
+
+    fn state(version: u64, free: u32) -> BoxState {
+        BoxState {
+            protocol: PROTOCOL,
+            profile: "default".into(),
+            version,
+            toolchains: vec![Toolchain { key: "c h".into(), targets: vec!["h".into(), "wasm32".into()] }],
+            classes: vec![
+                ClassState { rate: 6960, cpus: 30, free, frees_in_ms: None },
+                ClassState { rate: 3970, cpus: 2, free: 3, frees_in_ms: Some(0) },
+            ],
+        }
+    }
+
+    async fn state_of_a(msgs: &mut mpsc::UnboundedReceiver<Msg>) -> Result<(Path, BoxState)> {
+        loop {
+            match time::timeout(Duration::from_secs(10), msgs.recv()).await {
+                Ok(Some(Msg::Farm { name, state: Some(state) })) if name == "a" => return Ok(state),
+                Ok(Some(_)) => continue,
+                _ => bail!("no state from a"),
+            }
+        }
+    }
+
+    #[test]
+    fn state_round_trips_through_its_columns() {
+        let s = state(7, 0);
+        assert_eq!(BoxState::from_columns(&s.columns()).unwrap(), s);
+        let mut short = s.columns();
+        short[6] = Value::from(vec![1u32]);
+        assert!(BoxState::from_columns(&short).is_err());
+    }
+
+    #[tokio::test]
+    async fn boxes_see_each_others_state_as_it_changes() -> Result<()> {
+        let net = InternalOnly::new().await?;
+        let base = Path::from("/farm");
+        let member = |name: &str| Member {
+            publisher: net.publisher().clone(),
+            subscriber: net.subscriber().clone(),
+            base: base.clone(),
+            name: name.into(),
+            toolchains: state(0, 0).toolchains,
+        };
+        let load = |version, free| {
+            let s = state(version, free);
+            Load { profile: s.profile, version, classes: s.classes }
+        };
+        let (a_load, a_rx) = watch::channel(load(1, 0));
+        let (a_tx, _a_msgs) = mpsc::unbounded_channel();
+        tokio::spawn(run(member("a"), a_rx, a_tx));
+        let (_b_load, b_rx) = watch::channel(load(1, 0));
+        let (b_tx, mut b_msgs) = mpsc::unbounded_channel();
+        tokio::spawn(run(member("b"), b_rx, b_tx));
+        let (jobs, s) = state_of_a(&mut b_msgs).await?;
+        assert_eq!(jobs, Path::from("/farm/api/a/jobs"));
+        assert_eq!(s, state(1, 0));
+        a_load.send(load(2, 5))?;
+        let (_, s) = state_of_a(&mut b_msgs).await?;
+        assert_eq!(s, state(2, 5), "the new version and its free tokens arrive together");
+        Ok(())
+    }
 }

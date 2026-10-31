@@ -181,7 +181,12 @@ async fn join(
             }
         }
     });
-    let status = browser::run(publisher.clone(), base.append(&name).append("status"), tx.clone());
+    let status = browser::run(
+        publisher.clone(),
+        farm::status_path(&base, &name),
+        farm::units_path(&base, &name),
+        tx.clone(),
+    );
     tokio::spawn(async move {
         if let Err(e) = status.await {
             error!("no longer publishing status: {e:#}");

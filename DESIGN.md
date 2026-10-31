@@ -19,8 +19,8 @@ is at once:
 
 - the box's admission controller: every rustc on the box, whether its job came
   from a local cargo or from another box, holds one of its slots;
-- a farm member: publishes toolchain, slot classes, free counts and
-  calibration under `BASE/NAME`;
+- a farm member: publishes toolchains, slot classes, free counts and
+  calibration in its row of `BASE/status`;
 - a farm client: sends its users' jobs to other boxes;
 - a remote executor: runs other boxes' jobs in a sandbox.
 
@@ -345,10 +345,21 @@ work, so build times say nothing yet; placement is all that was checked.
 
 ### Farm
 
-A daemon whose config has `base` joins the farm. It publishes one packed value
-at `BASE/NAME/state`: protocol version, profile, a version number, its
-toolchains, and each class's calibration, CPUs, free tokens, and how soon its
-next token is predicted to free. Free tokens
+A daemon whose config has `base` (say `/build`) joins the farm. The farm's
+netidx namespace:
+
+- `BASE/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
+  a table.
+- `BASE/api/NAME/jobs`: where the box takes jobs, a netidx pack channel
+  listener. Each job is one connection.
+- `BASE/units/NAME/UNIT/COLUMN`: the units the box has run (see below).
+
+A box's state is eight columns of its status row, each its own value:
+protocol version, profile, a version number, its toolchains, and per class
+(as arrays) CPUs, G instructions/s, free tokens, and how many ms until its
+next token is predicted to free. A change updates the columns it touches in
+one batch, which subscribers get whole and in order, so no box sees half a
+state, and unchanged columns aren't sent. Free tokens
 are counted in the class's jobserver FIFO with `FIONREAD`, which doesn't take
 them, so they leave out the tokens rustc's codegen threads hold. The
 prediction is the soonest predicted end of a job holding one of the class's
@@ -358,9 +369,8 @@ next change, and clients count it down from when the state arrived. A box
 publishes no free tokens while it switches profile or its own jobs wait. The
 scheduler counts after every event, and every 100 ms while jobs run, since
 codegen threads take and return tokens without telling it. A changed load is
-republished at most every 100 ms. The daemon watches every other box under
-`BASE` and takes jobs at `BASE/NAME/jobs`, a netidx pack channel listener.
-Each job is one connection.
+republished at most every 100 ms. The daemon lists `BASE/status` for other
+boxes and subscribes to each one's state columns.
 
 Toolchains are rustup's (`~/.rustup/toolchains/*`). A compiler is matched by
 rustc's commit hash and host, and a job with `--target` also needs that
@@ -392,13 +402,15 @@ builds run here. Units outside this box's build graph have no rank. Units sent
 elsewhere also show the median time their sent runs spent on files and the MB
 they sent. Each class shows this box's jobs, other boxes' jobs and free tokens.
 
-In a farm each box also publishes what `status` shows under `BASE/NAME/status`,
-for the netidx browser: figures about the box (profile, jobs waiting, memory)
-as values, and three tables, `classes/K`, `boxes/NAME` and `units/UNIT`, with
-`status`'s columns as typed numbers, so the browser sorts them. Another box's
-row also shows when its next token was predicted to free. It refreshes every
-2 s and sends only cells that changed. Building a status takes the scheduler a
-few ms, which is why it isn't faster.
+In a farm each box also publishes what `status` shows, for the netidx browser.
+Beside its state columns, its status row has figures for people: jobs
+waiting, running and serving, CPUs, total G instructions/s, per class jobs
+running, serving and tokens lent, and memory. So `BASE/status` shows the
+whole farm at a glance. Its units go in a table of their own at
+`BASE/units/NAME`, with `status`'s columns. Values are typed numbers, so the
+browser sorts them. These refresh every 2 s and send only cells that
+changed. Building a status takes the scheduler a few ms, which is why it
+isn't faster.
 
 ### Inputs
 
@@ -688,7 +700,8 @@ Known gaps:
 
 ## Cluster test (2026-10-31)
 
-Three boxes in one netidx domain, publishing under `/build/rustc-dist`, each
+Three boxes in one netidx domain, publishing under `/build/rustc-dist` (now
+`/build`, laid out as in "Farm" above), each
 listening on the LAN (`bind`), with the cache on tmpfs
 (`/tmp/rustc-dist-cache`, 16 GB). The laptop is on wifi; the others are wired.
 

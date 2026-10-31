@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 8;
+pub const PROTOCOL: u32 = 9;
 const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under
@@ -293,11 +293,6 @@ impl BoxStatus {
     /// G instructions per second over all its CPUs.
     pub fn capacity_g(&self) -> f64 {
         g(self.classes.iter().map(|c| c.rate * c.cpus as u64).sum())
-    }
-
-    /// Seconds after its last state that a token was predicted to free.
-    pub fn frees_in_s(&self) -> Option<f64> {
-        self.classes.iter().filter_map(|c| c.frees_in_ms).min().map(|ms| ms as f64 / 1000.)
     }
 }
 
