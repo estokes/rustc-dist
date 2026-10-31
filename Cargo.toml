@@ -2,6 +2,11 @@
 name = "rustc-dist"
 version = "0.1.0"
 edition = "2024"
+description = "Schedules rustc on the right cores of each box, and shares builds across boxes over netidx"
+license = "MIT"
+readme = "README.md"
+keywords = ["cargo", "rustc", "build", "distributed", "netidx"]
+categories = ["development-tools::build-utils", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
