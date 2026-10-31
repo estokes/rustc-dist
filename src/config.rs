@@ -14,6 +14,9 @@ pub struct Config {
     /// Share of compressed swap (zram, zswap) that jobs' predicted peak
     /// memory may fill beyond RAM.
     pub compressed_swap_share: f64,
+    /// Jobserver tokens per CPU. A little over one keeps CPUs busy while
+    /// jobs wait on I/O.
+    pub tokens_per_cpu: f64,
     /// How long the daemon runs the calibration load for a new profile.
     pub calibration_seconds: u64,
     /// The netidx path every box of the farm publishes under. Without it
@@ -29,6 +32,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             compressed_swap_share: 0.5,
+            tokens_per_cpu: 1.5,
             calibration_seconds: 60,
             base: None,
             name: None,
@@ -78,6 +82,9 @@ pub fn load() -> Result<Config> {
     };
     if !(0. ..=1.).contains(&cfg.compressed_swap_share) {
         bail!("{}: compressed_swap_share must be in [0, 1]", path.display());
+    }
+    if !(1. ..=4.).contains(&cfg.tokens_per_cpu) {
+        bail!("{}: tokens_per_cpu must be in [1, 4]", path.display());
     }
     if cfg.calibration_seconds < 4 {
         bail!("{}: calibration_seconds must be at least 4", path.display());

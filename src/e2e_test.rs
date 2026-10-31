@@ -50,6 +50,7 @@ async fn server(dir: &Path) -> Result<ServerBox> {
         fifo_dir: dir.to_path_buf(),
         allowed,
         memory: Box::new(|| sys::box_memory(0.5)),
+        tokens_per_cpu: 1.5,
         calibration_seconds: 4,
     };
     let (tx, rx) = mpsc::unbounded_channel();
@@ -126,11 +127,18 @@ fn project(dir: &Path) -> Result<(Job, Unit)> {
     Ok((job, c.unit))
 }
 
-async fn send(b: &ServerBox, job: &Job, unit: &Unit, hashes: &Hashes) -> Result<(Outcome, Vec<Event>)> {
+/// Run the job on `b`, pinned to `class` or on every CPU.
+async fn send(
+    b: &ServerBox,
+    job: &Job,
+    unit: &Unit,
+    hashes: &Hashes,
+    class: Option<u32>,
+) -> Result<(Outcome, Vec<Event>)> {
     let crates: Vec<ArcStr> = unit.deps.iter().filter_map(|d| d.file.clone()).collect();
     let staged = remote::stage(job, &crates, hashes)?;
     let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
-    let offer = ToServer::Offer { unit: unit.clone(), key, target: None, class: 0 };
+    let offer = ToServer::Offer { unit: unit.clone(), key, target: None, class };
     let mut events = Vec::new();
     let outcome = remote::run(&b.subscriber, b.jobs.clone(), offer, job, &staged, |ev| {
         events.push(ev);
@@ -158,7 +166,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     let b = server(&dir.join("box")).await?;
     let (job, unit) = project(&dir.join("ws"))?;
     let hashes = Hashes::default();
-    let (outcome, events) = send(&b, &job, &unit, &hashes).await?;
+    let (outcome, events) = send(&b, &job, &unit, &hashes, None).await?;
     let Outcome::Exit { code: 0, ran } = outcome else { bail!("remote rustc failed") };
     // rustc's own time; bwrap alone uses about 10 ms.
     assert!(ran.cpu_us > 200_000, "remote cpu {} us", ran.cpu_us);
@@ -184,7 +192,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     assert!(dep_info.contains("app/src/data.txt"), "{dep_info}");
     // Everything is in the store now, so a second run sends no blobs.
     let blobs = blob_count(&b.store_dir);
-    let (outcome, _) = send(&b, &job, &unit, &hashes).await?;
+    let (outcome, _) = send(&b, &job, &unit, &hashes, Some(0)).await?;
     assert!(matches!(outcome, Outcome::Exit { code: 0, .. }));
     assert_eq!(blob_count(&b.store_dir), blobs);
     // The server recorded both runs as served, with their memory.
@@ -199,7 +207,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
         fs::remove_file(deps.join(f))?;
     }
     fs::write(dir.join("ws/app/src/lib.rs"), "pub fn broken() -> u32 { \"no\" }\n")?;
-    let (outcome, events) = send(&b, &job, &unit, &hashes).await?;
+    let (outcome, events) = send(&b, &job, &unit, &hashes, None).await?;
     assert!(matches!(outcome, Outcome::Exit { code: 1, .. }));
     assert!(events.iter().any(|e| matches!(e, Event::Stderr(_))), "the error is reported");
     assert!(!deps.join("libapp-a1.rlib").exists());

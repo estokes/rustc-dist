@@ -49,7 +49,8 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             Reply::Trivial => return Err(exec(&args)),
             Reply::Slot { cpus, jobserver, filter_metadata } => {
                 sys::pin(&cpus)?;
-                let status = compile(&mut sock, &mut buf, &args, &jobserver, filter_metadata)?;
+                let out = &mut io::stderr().lock();
+                let status = compile(&mut sock, &mut buf, &args, &jobserver, filter_metadata, out)?;
                 exit_as(status)
             }
             Reply::Output { stderr: true, data } => io::stderr().write_all(&data)?,
@@ -91,15 +92,16 @@ fn exec(args: &[OsString]) -> Error {
     anyhow!(err).context(format_compact!("exec {}", Path::new(&args[0]).display()))
 }
 
-/// Run rustc on this box. With `filter_metadata`, drop its rmeta notice,
-/// because cargo already got one from a remote run that then failed.
-/// Rustc's stderr passes through here so the front end can be timed.
+/// Run rustc on this box, passing its stderr to `out` so the front end can
+/// be timed. With `filter_metadata`, drop its rmeta notice, because cargo
+/// already got one from a remote run that then failed.
 fn compile(
     sock: &mut UnixStream,
     buf: &mut BytesMut,
     args: &[OsString],
     jobserver: &str,
     filter_metadata: bool,
+    out: &mut impl Write,
 ) -> Result<ExitStatus> {
     let parent = process::id() as libc::pid_t;
     let mut cmd = Command::new(&args[0]);
@@ -124,7 +126,6 @@ fn compile(
         cmd.spawn().with_context(|| format_compact!("running {}", Path::new(&args[0]).display()))?;
     let mut front = None;
     let stderr = child.stderr.take().context("rustc's stderr")?;
-    let mut out = io::stderr().lock();
     for line in BufReader::new(stderr).split(b'\n') {
         let line = line?;
         let metadata = protocol::is_metadata_line(&line);
@@ -183,7 +184,8 @@ mod test {
         .collect();
         let (mut ours, mut daemon) = UnixStream::pair()?;
         let mut buf = BytesMut::new();
-        let status = compile(&mut ours, &mut buf, &args, "/nonexistent", false)?;
+        let mut out = Vec::new();
+        let status = compile(&mut ours, &mut buf, &args, "/nonexistent", false, &mut out)?;
         assert!(status.success());
         let ran: Ran = protocol::recv(&mut daemon, &mut buf)?;
         let front = ran.front.context("an .rmeta line")?;
@@ -191,6 +193,14 @@ mod test {
         if perf::Counter::start(false).is_some() {
             assert!(ran.instructions.is_some_and(|n| n > 100_000_000), "{ran:?}");
         }
+        let forwarded = |out: &[u8]| out.split(|b| *b == b'\n').any(protocol::is_metadata_line);
+        assert!(forwarded(&out), "cargo gets the .rmeta line");
+        // After a remote run already sent cargo one, it is dropped, but the
+        // front end is still timed.
+        let mut out = Vec::new();
+        assert!(compile(&mut ours, &mut buf, &args, "/nonexistent", true, &mut out)?.success());
+        let ran: Ran = protocol::recv(&mut daemon, &mut buf)?;
+        assert!(!forwarded(&out) && ran.front.is_some());
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

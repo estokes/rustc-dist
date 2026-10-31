@@ -109,6 +109,9 @@ impl Hists {
 pub struct Prediction {
     /// Millions of instructions.
     pub cost_mi: u64,
+    pub front_mi: Option<u64>,
+    /// Hundredths of a thread; none until the unit or its crate has run.
+    pub width_c: Option<u64>,
     pub mem_kb: u64,
     /// It comes from the unit's or its crate's own runs, not every job's.
     pub known: bool,
@@ -147,11 +150,15 @@ impl Stats {
         match own {
             Some(h) => Prediction {
                 cost_mi: h.cost_mi.value_at_quantile(0.5),
+                front_mi: median(&h.front_mi),
+                width_c: median(&h.width_c),
                 mem_kb: h.mem_kb.value_at_quantile(0.9),
                 known: true,
             },
             None => Prediction {
                 cost_mi: median(&self.global.cost_mi).unwrap_or(UNKNOWN_COST_MI),
+                front_mi: None,
+                width_c: None,
                 mem_kb: median(&self.global.mem_kb).unwrap_or(0),
                 known: false,
             },
@@ -273,7 +280,8 @@ mod test {
     use super::*;
 
     fn unit(exact: &str, coarse: &str) -> Unit {
-        Unit { exact: ArcStr::from(exact), coarse: ArcStr::from(coarse), id: ArcStr::from(exact), deps: vec![] }
+        let (exact, coarse) = (ArcStr::from(exact), ArcStr::from(coarse));
+        Unit { id: exact.clone(), exact, coarse, deps: vec![], codegen_units: 16 }
     }
 
     fn predict(s: &Stats, u: &Unit) -> Prediction {
@@ -295,6 +303,7 @@ mod test {
             s.record(&unit("light:1", "light"), sample(20));
         }
         let heavy = predict(&s, &unit("heavy:1", "heavy"));
+        assert_eq!((heavy.front_mi, heavy.width_c), (None, Some(100)));
         assert!((49_000..=51_000).contains(&heavy.cost_mi), "{}", heavy.cost_mi);
         let other_profile = predict(&s, &unit("heavy:2", "heavy"));
         assert_eq!(other_profile.cost_mi, heavy.cost_mi);

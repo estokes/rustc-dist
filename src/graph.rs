@@ -212,6 +212,7 @@ mod test {
                 .iter()
                 .map(|d| Dep { id: ArcStr::from(*d), file: Some(format_compact!("/t/lib{d}.rmeta").as_str().into()) })
                 .collect(),
+            codegen_units: 16,
         }
     }
 

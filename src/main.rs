@@ -140,18 +140,24 @@ fn status() -> Result<()> {
         )?,
         Switching::Calibrating(to) => writeln!(out, "profile {}, calibrating {to}", st.profile)?,
     }
-    writeln!(out, "\nclass  cpus  G instr/s  running  serving  free")?;
+    writeln!(out, "\nclass  cpus  G instr/s  running  serving  lent  free")?;
     for (k, c) in st.classes.iter().enumerate() {
         writeln!(
             out,
-            "{k:5}  {:4}  {:9.2}  {:7}  {:7}  {:4}",
+            "{k:5}  {:4}  {:9.2}  {:7}  {:7}  {:4}  {:4}",
             c.cpus,
             c.rate as f64 / 1000.,
             c.running,
             c.serving,
+            c.lent,
             c.free
         )?;
     }
+    writeln!(
+        out,
+        "on every cpu: {} running, {} serving; lent tokens are theirs",
+        st.spread.running, st.spread.serving
+    )?;
     if st.finishing > 0 {
         writeln!(out, "{} jobs finishing under the previous profile", st.finishing)?;
     }

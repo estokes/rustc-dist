@@ -70,15 +70,31 @@ below) and overridable in config. On this laptop sysfs suggests three:
 | E     | 8    | 3.7 GHz     |
 | LP-E  | 4    | 3.3 GHz     |
 
-A class has one slot per CPU. A job runs pinned to its class's CPU set (the
-whole set, not one CPU).
+A job is light if it has been measured to keep fewer than 1.5 threads busy
+after its front end; every other job, including one never measured, is
+heavy. A light job runs pinned to one class's CPU set (the whole set, not one
+CPU). A heavy job runs on every CPU of the box.
 
 ### Jobserver
 
-Each class has a FIFO jobserver (`--jobserver-auth=fifo:PATH`) holding one
-token per CPU. Admitting a job takes a token, the job's codegen threads take
-more from the same FIFO, and the token returns when the job exits. Rustc
-threads per class never exceed the class's CPUs.
+Each class has a FIFO jobserver (`--jobserver-auth=fifo:PATH`) holding 1.5
+tokens per CPU (`tokens_per_cpu`). Mild overcommit keeps CPUs busy while jobs
+wait on I/O; around 4x would be lost to context switching. Admitting a light
+job takes a token from its class, its codegen threads take more from the same
+FIFO, and the token returns when the job exits.
+
+A heavy job gets a FIFO of its own, which the daemon lends tokens into from
+the class FIFOs, fastest class first. Admitting it takes one token, which it
+holds without reading, and lends one spare. Rustc reads a token when it wants
+another thread, which the daemon can't see, so the spare is how a job asks.
+Every 100 ms the daemon checks each heavy job's FIFO: if the spare is gone it
+lends twice what the job holds, up to its codegen units; spares left unused for
+a whole tick go back, all but one. When the job ends, every token it borrowed
+goes back to the class it came from, so a killed rustc can't leak them. Light
+and heavy jobs together never hold more than the classes' tokens.
+
+A class whose last light job ends is refilled, to recover tokens a killed
+rustc leaked, but only with the tokens heavy jobs don't hold.
 
 Cargo's own jobserver is never handed to rustc. Cargo's `jobs` setting only
 caps how many wrappers wait. Set it at or above the farm's slot count.
@@ -336,7 +352,8 @@ target's standard library installed. The client learns the key of the rustc
 cargo runs from `rustc -vV`, cached by path and mtime.
 
 A server admits a remote job only into a free token of the class asked for,
-and only when none of its own jobs is waiting, so local work comes first. It
+or for a heavy job the fastest class with one, and only when none of its own
+jobs is waiting, so local work comes first. It
 answers busy otherwise. An admitted job holds a normal slot: it shares the
 class's jobserver and CPUs with local jobs, and its cost goes into the
 server's history too.
@@ -434,7 +451,7 @@ never sent. Real compile errors get compiled twice. They usually fail fast.
 
 Config is real TOML (`toml` + serde), parsed into two separate structs.
 
-- User, `~/.config/rustc-dist.toml`: `compressed_swap_share`,
+- User, `~/.config/rustc-dist.toml`: `compressed_swap_share`, `tokens_per_cpu`,
   `calibration_seconds`, and for a farm `base` (the netidx path every box
   publishes under), `name` (the host name by default) and `blob_cache_gb`.
   Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit
@@ -507,21 +524,20 @@ libraries and linker, kept so by the sysadmin.
   no `.rmeta` line (a binary) has only a width.
 - Costs, ranks and predictions move to instructions; boxes publish rates.
 
-### Stage 2: heavy jobs span classes
+### Stage 2: heavy jobs span classes (built 2026-10-30)
 
-- Every job is heavy until measured light: a light job has run at about one
-  thread wide. Light jobs stay pinned to their class and its token pool, as
-  now. Heavy jobs may run on every CPU, with a private token pool the daemon
-  lends tokens into from whichever classes have them free, up to the job's
-  width (its codegen-unit limit until measured). Rustc asks for a token by
-  reading the pool, which the daemon can't see, so it keeps one spare token
-  in a heavy job's pool while the job is below its width, adds another when
-  the spare is taken, and takes back spares left unused for a tick.
-- Each class pool holds 1.5 tokens per CPU. Mild overcommit covers the time
-  jobs spend waiting on I/O; around 4x would be lost to context switching.
-- A heavy job's predicted time is its front end at one fast core's rate plus
-  the rest at its rate times the threads it can get, min(width, free
-  tokens).
+- Every job is heavy until measured light. Light jobs stay pinned to their
+  class; heavy jobs run on every CPU with tokens lent from the classes (see
+  Jobserver above). Class pools hold 1.5 tokens per CPU.
+- A heavy job's predicted time is its front end at the fastest class's rate
+  plus the rest at the mean rate per CPU, over the threads it can get:
+  min(its width, the tokens free). Its width is as measured, or its codegen
+  units if never measured. It goes wherever it finishes first, this box or
+  another, and on another box it runs on every CPU too; a server starts it
+  holding a token from its fastest class and a spare. With no history to
+  predict by, it takes this box if a token is free, else the other box with
+  the most free capacity, else waits here.
+- Light jobs choose among classes by slack, as before.
 
 ### Stage 3: binaries on other boxes, artifacts cached
 
@@ -619,7 +635,10 @@ Every number below is a guess. None has been tested on an idle box.
 | keep graph nodes unseen for | 60 days | `src/graph.rs:18` |
 | only send jobs predicted to take at least | 1 s | `src/sched.rs` `REMOTE_MIN_US` |
 | predicted cost of going remote | 200 ms | `src/sched.rs` `REMOTE_OVERHEAD_US` |
-| count free tokens while jobs run every | 100 ms | `src/sched.rs` `SAMPLE` |
+| count free tokens and lend to heavy jobs every | 100 ms | `src/sched.rs` `SAMPLE` |
+| jobserver tokens per CPU | 1.5 | `src/config.rs` `tokens_per_cpu` |
+| a job is light below this many threads busy | 1.5 | `src/sched.rs` `LIGHT_WIDTH_C` |
+| a heavy job's spare is taken: lend it | twice what it holds | `src/sched.rs` `Layout::lend` |
 | keep a unit local after remote-fail, local-pass | 2 times | `src/sched.rs` `PIN_AFTER` |
 | blob cache | 20 GB | `src/config.rs` |
 

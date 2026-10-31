@@ -88,6 +88,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     let metadata = cg.metadata;
     let opt = if cg.opt.is_empty() { "0" } else { cg.opt };
     let exact: ArcStr = format_compact!("{driver}:{name}:{metadata}:{emit}{suffix}").as_str().into();
+    let codegen_units = cg.units.unwrap_or(if cg.incremental { 256 } else { 16 });
     let id = if name.starts_with("build_script_") {
         out_dir_arg.and_then(|d| build_group(Path::new(d)))
     } else if !cg.extra.is_empty() {
@@ -123,6 +124,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
             id: id.unwrap_or_else(|| exact.clone()),
             exact,
             deps,
+            codegen_units,
         },
         portable,
         target: target.map(ArcStr::from),
@@ -134,6 +136,7 @@ struct Codegen<'a> {
     metadata: &'a str,
     extra: &'a str,
     opt: &'a str,
+    units: Option<u32>,
     incremental: bool,
     native_cpu: bool,
 }
@@ -146,6 +149,8 @@ impl<'a> Codegen<'a> {
             self.extra = v;
         } else if let Some(v) = arg.strip_prefix("opt-level=") {
             self.opt = v;
+        } else if let Some(v) = arg.strip_prefix("codegen-units=") {
+            self.units = v.parse().ok();
         } else if arg == "incremental" || arg.starts_with("incremental=") {
             self.incremental = true;
         } else if arg == "target-cpu=native" {
@@ -226,6 +231,9 @@ mod test {
         assert_eq!(t.coarse.as_str(), "rustc:a:O0:link:test");
         let c = unit(&["/r/bin/clippy-driver", "/r/bin/rustc", "--crate-name", "a"], None);
         assert_eq!(c.exact.as_str(), "clippy-driver:a::");
+        assert_eq!(u.codegen_units, 16, "rustc's default");
+        assert_eq!(unit(&["rustc", "--crate-name", "a", "-C", "codegen-units=4"], None).codegen_units, 4);
+        assert_eq!(unit(&["rustc", "--crate-name", "a", "-Cincremental=/i"], None).codegen_units, 256);
     }
 
     /// From a cargo build log: `a` depends on `outside`.

@@ -72,6 +72,7 @@ pub async fn run() -> Result<()> {
             let share = cfg.compressed_swap_share;
             Box::new(move || sys::box_memory(share))
         },
+        tokens_per_cpu: cfg.tokens_per_cpu,
         calibration_seconds: cfg.calibration_seconds,
     };
     let (tx, rx) = mpsc::unbounded_channel();
@@ -189,7 +190,9 @@ fn hostname() -> String {
 fn remove_stale_fifos(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with("class-") {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("class-") || name.starts_with("spread-") {
             let _ = fs::remove_file(entry.path());
         }
     }

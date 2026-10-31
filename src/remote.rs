@@ -34,8 +34,9 @@ pub struct FileEntry {
 
 #[derive(Debug, Pack)]
 pub enum ToServer {
-    /// Run `unit` in `class` with the toolchain `key`.
-    Offer { unit: Unit, key: ArcStr, target: Option<ArcStr>, class: u32 },
+    /// Run `unit` with the toolchain `key`, pinned to `class`, or with
+    /// none on every CPU.
+    Offer { unit: Unit, key: ArcStr, target: Option<ArcStr>, class: Option<u32> },
     Manifest { files: Vec<FileEntry>, dirs: Vec<ArcStr> },
     Chunk { hash: Hash, data: Bytes, last: bool },
     Run { args: Vec<ArcStr>, env: Vec<(ArcStr, ArcStr)>, cwd: ArcStr },

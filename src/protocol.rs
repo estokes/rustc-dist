@@ -22,6 +22,9 @@ pub struct Unit {
     pub coarse: ArcStr,
     pub id: ArcStr,
     pub deps: Vec<Dep>,
+    /// The most threads its codegen can use: `-C codegen-units`, or
+    /// rustc's default.
+    pub codegen_units: u32,
 }
 
 /// A job this one reads the output of. `file` is the crate file named on
@@ -129,7 +132,9 @@ pub fn is_metadata_line(line: &[u8]) -> bool {
 pub struct Status {
     pub profile: ArcStr,
     pub switching: Switching,
+    /// Light jobs, pinned to one class each.
     pub classes: Vec<ClassStatus>,
+    pub spread: SpreadStatus,
     /// Jobs still running under an earlier profile's layout.
     pub finishing: u32,
     pub waiting: u32,
@@ -175,8 +180,17 @@ pub struct ClassStatus {
     pub running: u32,
     /// Other boxes' jobs.
     pub serving: u32,
+    /// Tokens lent to heavy jobs.
+    pub lent: u32,
     /// Tokens in its jobserver.
     pub free: u32,
+}
+
+/// Heavy jobs, which run on every CPU: this box's and other boxes'.
+#[derive(Debug, Pack)]
+pub struct SpreadStatus {
+    pub running: u32,
+    pub serving: u32,
 }
 
 #[derive(Debug, Pack)]
