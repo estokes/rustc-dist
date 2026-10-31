@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer};
 use std::{
     env, fs,
     io::ErrorKind,
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
 };
 
@@ -143,7 +143,16 @@ pub fn state_dir() -> PathBuf {
 pub fn runtime_dir() -> PathBuf {
     match env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("rustc-dist"),
-        _ => PathBuf::from(format_compact!("/tmp/rustc-dist-{}", unsafe { libc::getuid() }).as_str()),
+        // Where systemd puts it, for a rustc-dist run without it set (sudo
+        // clears it), so it finds the daemon the user service started.
+        _ => {
+            let uid = unsafe { libc::getuid() };
+            let systemd = PathBuf::from(format_compact!("/run/user/{uid}").as_str());
+            match fs::metadata(&systemd) {
+                Ok(m) if m.is_dir() && m.uid() == uid => systemd.join("rustc-dist"),
+                _ => PathBuf::from(format_compact!("/tmp/rustc-dist-{uid}").as_str()),
+            }
+        }
     }
 }
 

@@ -127,12 +127,11 @@ cargo install rustc-dist
    rustc-dist profile power-saver --recalibrate
    ```
 
-   The command must run as the user the daemon runs as. From a root script,
-   for example:
+   The command must run as the user the daemon runs as, with that user's
+   `HOME`. From a root script, for example:
 
    ```sh
-   runuser -u alice -- env HOME=/home/alice XDG_RUNTIME_DIR=/run/user/1000 \
-       /home/alice/.cargo/bin/rustc-dist profile power-saver
+   sudo -u alice /home/alice/.cargo/bin/rustc-dist profile power-saver
    ```
 
 4. Build as usual. `rustc-dist status` shows what it's doing, and

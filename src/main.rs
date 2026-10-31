@@ -125,7 +125,8 @@ fn profile(name: &str, recalibrate: bool) -> Result<()> {
     let mut buf = BytesMut::new();
     match client::request_running(ask, &mut buf)? {
         None => {
-            eprintln!("no daemon is running; it will start in profile {}", profile.name());
+            let sock = config::socket_path();
+            eprintln!("no daemon at {}; the next one will start in profile {}", sock.display(), profile.name());
             Ok(())
         }
         Some(Reply::Done) => Ok(()),
