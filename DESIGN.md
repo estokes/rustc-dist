@@ -648,7 +648,6 @@ What the test found:
 
 Known gaps:
 
-- Not yet run across two machines.
 - One connection per job. A persistent connection per pair of boxes would
   save the setup if it shows up in measurements.
 - Upload and output file I/O run on async worker threads.
@@ -663,6 +662,70 @@ Known gaps:
   fails remotely and builds here.
 - An rlib's `lib.rmeta-link` member, which real rlibs have, is missing from
   stand-ins. Rustc hasn't needed it in tests so far.
+
+## Cluster test (2026-10-31)
+
+Three boxes in one netidx domain, publishing under `/build/rustc-dist`, each
+listening on the LAN (`bind`), with the cache on tmpfs
+(`/tmp/rustc-dist-cache`, 16 GB). The laptop is on wifi; the others are wired.
+
+| box | CPUs | RAM | calibrated classes (G instructions/s per CPU) |
+|---|---|---|---|
+| washu-chan (laptop) | Ultra X7 358H, 16 | 62 GB | 4 at 3.95, 8 at 2.20, 4 at 1.49 |
+| ryouko | 9950X3D2, 32 | 123 GB | 30 at 4.51, 2 at 3.97 |
+| aieka | i9-10980XE, 36 | 62 GB | 36 at 0.59 |
+
+Stable rustc was the same commit on all three. Nightly differed, so nightly
+builds stay local. The test is a clean graphix dev build (its own profile,
+opt-level "s"), launched from washu-chan with `RUSTC_WRAPPER=rustc-dist` and
+256 cargo jobs into a fresh target directory.
+
+| graphix dev build | wall |
+|---|---|
+| washu-chan alone, plain cargo | 2m 27s |
+| farm from washu-chan, first build | 2m 11s |
+| farm from washu-chan, second build | 1m 28s |
+| ryouko alone, plain cargo | 1m 19s |
+
+The first build sent 147 jobs (141 to ryouko, 6 to aieka), and the laptop
+spent 1119 s of CPU. The second sent 141 (140 to ryouko, 1 to aieka),
+including both `graphix_types` units, and the laptop spent 377 s. No remote
+job failed in either, nor in 623 more from builds stopped part way. File moves
+averaged 167 ms per job to ryouko in the first build and 103 ms in the
+second; aieka's took 0.4 to 1.2 s, for reasons not yet known.
+
+What the test found:
+
+- The build is bound by its longest chain, not by capacity. Over the units
+  both builds ran there are 6944 G instructions of work, 2188 G of it on the
+  chain `graphix_types` → `graphix_compiler` → `graphix_package_core` →
+  `graphix_shell` and what lies below it. The whole farm could do the work in
+  about 21 s and ryouko alone in about 28 s, but the chain needs roughly 50 s
+  on ryouko even with every codegen thread busy. Boxes past ryouko barely
+  matter for this build.
+- `graphix_types` (962 G instructions, 17% front end) took 61 s on an idle
+  ryouko, averaging 2.8 threads after its front end. Heavy units the laptop
+  ran itself, under load, show 1.0. Whether rustc can't spread that crate's
+  codegen or its tokens ran short is not yet known.
+- Calibration underrates aieka. Per thread, its load runs at 3.64 G/s on one
+  CPU, 2.29 with one thread on each of 18 cores, and 0.56 with all 36
+  threads, so SMT halves the box's throughput under it. The load's working
+  set fits ryouko's large L3 and not aieka's. Instruction counting works
+  there, in bwrap too, with `perf_event_paranoid` at 2.
+- aieka can't learn its way out. A server spreads an offer with no class over
+  every CPU, and spread jobs don't teach a class (`finished` in
+  `src/sched.rs`). Light jobs go to aieka only if its class looks fastest,
+  which at 0.59 it never does, so it only gets heavy jobs and keeps its
+  calibration. ryouko learned from light jobs: class 0 went from 4.51 to
+  8.00. The laptop's classes went to 5.51, 4.14 and 3.33.
+- With no history, the first build sent jobs that compiled in 20 to 80 ms.
+  Unknown units count as 1 G instructions, which aieka's rate made look
+  longer than the 1 s cutoff.
+- A restarted daemon was listed twice in the resolver for about seven
+  minutes, because dropping the publisher at exit didn't finish clearing it.
+  The daemon now shuts its publisher down before exiting.
+- Publishers on these workstations listen on loopback by default. `bind` in
+  the config sets where other boxes reach a box.
 
 ## Guesses to test on the quiet cluster
 
