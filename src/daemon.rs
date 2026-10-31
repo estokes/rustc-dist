@@ -143,7 +143,7 @@ async fn join(
     tx: mpsc::UnboundedSender<Msg>,
 ) -> Result<Subscriber> {
     let net = NetConfig::load_default().context("loading the netidx config")?;
-    let publisher = PublisherBuilder::new(net.clone()).build().await?;
+    let publisher = PublisherBuilder::new(net.clone()).bind_cfg(cfg.bind).build().await?;
     let subscriber = SubscriberBuilder::new(net).build()?;
     let base = NPath::from(ArcStr::from(base));
     let name = ArcStr::from(cfg.name.clone().unwrap_or_else(hostname));

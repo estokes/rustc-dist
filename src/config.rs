@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use compact_str::format_compact;
-use serde::Deserialize;
+use netidx::publisher::BindCfg;
+use serde::{Deserialize, Deserializer};
 use std::{
     env, fs,
     io::ErrorKind,
@@ -24,6 +25,11 @@ pub struct Config {
     pub base: Option<String>,
     /// This box's name under `base`. The host name by default.
     pub name: Option<String>,
+    /// Where this box listens for other boxes, in netidx's bind syntax,
+    /// e.g. `192.168.1.0/24`. The netidx config's default otherwise, which
+    /// is often loopback only.
+    #[serde(deserialize_with = "bind_cfg")]
+    pub bind: Option<BindCfg>,
     /// How much disk other boxes' inputs may use here.
     pub blob_cache_gb: u64,
     /// Send jobs that link (binaries, tests, proc macros) to other boxes
@@ -39,10 +45,16 @@ impl Default for Config {
             calibration_seconds: 60,
             base: None,
             name: None,
+            bind: None,
             blob_cache_gb: 20,
             remote_links: true,
         }
     }
+}
+
+fn bind_cfg<'de, D: Deserializer<'de>>(d: D) -> Result<Option<BindCfg>, D::Error> {
+    let s = String::deserialize(d)?;
+    s.parse().map(Some).map_err(serde::de::Error::custom)
 }
 
 /// `rustc-dist.toml` in a project.
@@ -164,5 +176,13 @@ mod test {
         assert!(project(&dir).is_ok() && project(&dir.join("ws")).is_err());
         fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn bind_is_netidx_syntax() {
+        let cfg: Config = toml::from_str("base = \"/rustc-dist\"\nbind = \"192.168.1.0/24\"\n").unwrap();
+        assert_eq!(cfg.bind, Some("192.168.1.0/24".parse().unwrap()));
+        assert_eq!(toml::from_str::<Config>("").unwrap().bind, None);
+        assert!(toml::from_str::<Config>("bind = \"192.168.1.0\"\n").is_err());
     }
 }
