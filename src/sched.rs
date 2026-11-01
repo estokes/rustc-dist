@@ -1542,61 +1542,6 @@ impl Sched {
         }
     }
 
-    // XCR claude for claude: [risk/medium] The new layout starts with every class's full
-    // pool while the retired layouts' jobs still hold theirs on the same CPUs, and their
-    // heavy jobs keep borrowing from the old pools (Event::Sample lends in every
-    // layout). On a full box a switch admits a second full set of jobs at once: 16 CPUs
-    // at 1.5 tokens per CPU run 24 jobs, and switching to an already calibrated
-    // "battery" profile starts up to 24 more, 48 rustc on 16 CPUs, the opposite of what
-    // a battery profile wants and past the goal of never overcommitting a box. Only
-    // memory admission bounds it. a_calibrated_profile_applies_to_new_jobs_at_once
-    // asserts this ("The old layout's only token is held, yet the new job runs"). A fix:
-    // start the new pool less what retired leases hold (by CPU overlap, or slowest
-    // classes first), and hand retired tokens to the new pool as their jobs end.
-    // (sched-03)
-    // 2026-11-01 claude: Eric ruled (2026-11-01): start the new pools less what retired
-    // leases hold, and hand retired tokens to the new pools as their jobs end (a).
-    // 2026-11-01 claude: Per the ruling: Sched::apply zeroes every retired layout's free
-    // pool (they lend nothing more) and the new Layout::owe takes what retired leases
-    // hold off the new pools, slowest class first, tracking it in Layout::owed (and
-    // Layout::overdrawn past every class's tokens). Sched::reclaim, after each lending
-    // tick (Sched::lend) and each job's end, moves whatever retired pools got back to
-    // Layout::repaid, which pays overdrawn first, then the owed classes fastest first.
-    // Sched::frees_in_us counts retired jobs for a class while it is owed.
-    // a_calibrated_profile_applies_to_new_jobs_at_once now asserts a third job waits
-    // until the old job ends and then runs on the class that lent the token; new test
-    // jobs_running_at_a_switch_borrow_nothing_more_and_what_they_leave_goes_to_the_new_classes
-    // covers lending after the switch and tokens given back mid-run. Both fail without
-    // Layout::owe or Sched::reclaim's repaid. DESIGN.md (Calibration) updated.
-    // 2026-11-01 claude: Layout::owe, Layout::repaid and zeroing retired pools in Sched::apply
-    // hold: each of the two named tests fails with owe or repaid removed, and the second one
-    // also fails if retired pools aren't zeroed. What still fails is the new owed-class branch
-    // of Sched::frees_in_us. It counts the soonest-ending retired job for any owed class, but
-    // repaid pays overdrawn first and then the owed classes fastest first, so that job's token
-    // often doesn't reach the class. Probe (a temporary test in a copy, since removed): one
-    // class on 4 cpus at 1 token per cpu, jobs short (1 s) and three long (100 s) placed, then
-    // switch_to a calibrated battery with one class on cpu 0. Result: pool [0], owed [1],
-    // overdrawn 3, frees_in_us(0) = Some(999719). Once short finishes, overdrawn drops to 2
-    // and the class is still owed. Its first token comes back only when the third long job
-    // ends. The same goes for a slower owed class while a faster one is owed. Dispatch's
-    // frees_in for local candidates that wait and the published frees_in_ms both use this
-    // value. So in the CR's battery case (old jobs hold more than the new profile's tokens),
-    // jobs wait here for a token predicted at the next old job's end, and the prediction
-    // slides to each later end while a free box goes unused. Fix: for an owed class, predict
-    // the time when tokens back from retired jobs, taken in order of predicted end, cover
-    // overdrawn plus the owed of faster classes plus one. Add a test with overdrawn > 0.
-    // 2026-11-01 claude: Sched::frees_in_us now predicts an owed class's token from the
-    // retired jobs taken in order of predicted end (Running::left_us), at the one whose tokens
-    // (Lease::lent) bring what they gave back past overdrawn plus what faster classes
-    // (Layout::by_speed) are owed; a class not owed still counts only the current layout's
-    // jobs holding its tokens, and an owed class takes the sooner of the two. New test
-    // a_class_owed_tokens_frees_one_when_the_old_jobs_have_given_back_what_comes_first: four
-    // old jobs of 1, 50, 100 and 200 s hold 4 tokens, battery has 2 (owed [1, 1], overdrawn
-    // 2); the fast class must free at the 100 s job's end and the slow one at the 200 s job's,
-    // both as frees_in_us and as published frees_in_ms, and still so after the 1 s job ends
-    // (overdrawn 1). With the old frees_in_us it fails at Some(999660), the 1 s job; leaving
-    // out overdrawn fails the fast class, leaving out the faster classes' owed fails the slow
-    // one. DESIGN.md (Calibration) says so.
     fn apply(&mut self, profile: Profile, classes: Vec<Class>) {
         let layout = Layout::new(&profile, classes, self.setup.tokens_per_cpu, &mut self.stats);
         let old = mem::replace(&mut self.layout, layout);

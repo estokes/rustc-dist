@@ -237,48 +237,6 @@ impl Hashes {
         Ok(Self { known: Mutex::new(known), dirty: AtomicBool::new(false), saving: Mutex::new(()) })
     }
 
-    // XCR claude for claude: [perf/medium] This stats every file the table
-    // knows, writes the table, and fsyncs it, all on the caller's thread, and
-    // its caller is Sched::save on the scheduler's event loop, every
-    // SAVE_EVERY (60 s) whenever a hash was taken, which during a build is
-    // always. On washu-chan the table covers every input of every lane (tens
-    // of thousands of paths, many in swap-backed tmpfs), so placement stops
-    // for as long as that takes, and an fsync on a busy disk can take seconds.
-    // It also clones every PathBuf into the snapshot. Run it on a blocking
-    // thread: Hashes is already shared through triomphe::Arc. (blobs-01)
-    // 2026-11-01 claude: Sched::save now runs Hashes::save on spawn_blocking
-    // (the one call, a few lines), and Hashes::save holds a new `saving` mutex
-    // so the periodic save and the final one at shutdown never share
-    // hashes.tmp. The final save at shutdown now races main's 1 s
-    // shutdown_timeout; if it is cut short the old table stays (tmp plus
-    // rename). No test: what changed is which thread runs it, which no test
-    // here observes.
-    // 2026-11-01 claude: Taking Hashes::save off the scheduler's loop holds,
-    // but the save at shutdown is no longer sure to finish. Sched::run's last
-    // self.save() now spawns the hashes save and returns at once. daemon::run's
-    // sched.await then returns, main's rt.shutdown_timeout(1 s) stops waiting
-    // for the save, and the process exits partway through writing. Before the
-    // fix, Sched::run saved inline and daemon::run waited for it. So every
-    // restart (each rustc-dist install) can lose up to a minute of hashes, and
-    // DESIGN's Inputs says reading those files again after a restart ran at
-    // about 110 MB/s from swap. Fix: have Sched::run wait for the hashes save
-    // after its loop (for example, Sched::save returns the JoinHandle and run
-    // awaits it at shutdown), and leave the save every minute as it is. No test
-    // is needed for which thread runs it, but the shutdown path could be
-    // covered by a scheduler test that drains and then checks that the hashes
-    // file exists.
-    // 2026-11-01 claude: Sched::save now returns the hashes save's JoinHandle;
-    // the periodic save in Sched::run's loop leaves it running as before, and
-    // after the loop run awaits the final one (Hashes::save's saving mutex
-    // makes it wait for a periodic save still under way too), so daemon::run's
-    // sched.await covers it and main's shutdown_timeout no longer cuts it off.
-    // DESIGN.md (Inputs) says the table is written once more before the daemon
-    // exits. Regression:
-    // sched::test::the_file_hashes_are_saved_before_the_scheduler_stops hashes
-    // a file, sends Msg::Drain, awaits Sched::run, and loads the hashes file at
-    // once, which must hold the hash; with the final save spawned and not
-    // awaited it failed 5 of 5 runs (Some((None, 5))). It is a race in
-    // principle (the detached save could win), but it can't fail with the fix.
     /// Save the hashes of files still as they were hashed, if a hash was
     /// taken since the last save, and forget the rest, but those being
     /// hashed. It stats every file it knows and syncs the table, so it

@@ -662,60 +662,6 @@ impl Stats {
     pub fn place(&mut self, key: &str, fast: u64, rate: u64) -> PlaceId {
         if let Some(&id) = self.by_key.get(key) {
             let p = &mut self.places[id.0 as usize];
-            // XCR claude for claude: [bug/medium] A recalibrated place reads its old runs at
-            // the new rate. RunSample keeps work (front_us * fast, tokens_us * rate) at the
-            // calibration current when it ran, and Record::size divides that by the
-            // place's factor now. This reset puts the factor back to the starting curve
-            // but leaves the samples in the old rate's units, so every prediction from the
-            // unit's runs here (Basis::Place, and Basis::Box and Stats::predict through
-            // them) scales by old rate / new rate, though the runs measured the same
-            // hardware. Probe (a temporary test, `cargo test --bin rustc-dist zz_probe`):
-            // u ran 5 times for 1 s at a/p/0 calibrated 1000; predict_at then time_us gave
-            // 1_000_000 µs (Basis::Place); after `s.place("a/p/0", 2000, 2000)` it gave
-            // 500_000. Reached by `rustc-dist profile NAME --recalibrate`, the documented
-            // fix for a bad calibration (where the ratio is largest), and by another box
-            // recalibrating. The reset also drops the place's sends and µs per kB, which
-            // say nothing about its CPUs. Fix: keep the measured µs in RunSample and apply
-            // the place's current fast/rate in Record::size (or rescale the place's
-            // samples by old over new rate here), and keep `sends` across a
-            // recalibration. (stats-01)
-            // 2026-11-01 claude: Eric ruled (2026-11-01): store measured µs in each run and
-            // apply the place's current rates when sizing; keep sends across a
-            // recalibration (a).
-            // 2026-11-01 claude: RunSample now keeps measured µs (front_us, rest_us,
-            // tokens_us) and RunSample::work_mi applies the place's current fast and rate,
-            // in Record::size and for global_cost. Stats::place calls Place::recalibrate,
-            // which clears only the curve, so the sends and µs per kB stay. The table is
-            // now rdstat10 (8 bytes: rdstats10 does not fit MAGIC's [u8; 8]). An rdstats9
-            // table loads through read_work_run, and rdstats8 sums and rdstats4 seed runs
-            // through WorkSample::measured: each run becomes the µs its work takes at its
-            // place's saved calibration, at the same width, so it predicts what rdstats9
-            // did. Regression:
-            // a_recalibrated_place_reads_its_runs_at_its_new_rates_and_keeps_its_sends
-            // (fails on the old code: 500_000 after recalibrating; and 200_020, the guess,
-            // if the sends are dropped), and
-            // a_table_of_work_at_calibrated_speeds_loads_as_measured_runs for the rdstats9
-            // conversion, seed width included.
-            // 2026-11-01 claude: The fix holds, and the live table converts exactly: a copy
-            // of washu-chan's rdstats9 jobs.hdr (1619 units, 13599 runs, 14 places) loaded
-            // through the old code and the new gives identical per-run work and width (to 9
-            // digits) and identical predict, predict_at basis and time_us for every unit at
-            // every place, and a resave as rdstat10 reloads identically. One gap in the
-            // regression test: a_table_of_work_at_calibrated_speeds_loads_as_measured_runs
-            // writes a/0 with fast == rate (1000), so it cannot tell a front end converted
-            // at fast from one converted at rate. Changing WorkSample::measured's front_us
-            // to divide by p.rate instead of p.fast leaves all 25 stats tests passing. The
-            // live all places have fast != rate (here/low/all: 1814 vs 1498), so that
-            // regression would mis-size every converted front end there. Give a/0 a fast
-            // unlike its rate in that test, with the expected µs to match.
-            // 2026-11-01 claude:
-            // a_table_of_work_at_calibrated_speeds_loads_as_measured_runs now writes its
-            // place as a/all with fast 2000 and rate 1000, so a:1's 400 MI front end must
-            // load as 200_000 µs (at fast) and its 2400 MI rest as 2_400_000 token-µs over
-            // 600_000 µs (at rate), and still predict (400, 2400, width 400).
-            // WorkSample::measured's front end divided by rate fails it at (400000, 600000,
-            // 2400000); its rest divided by fast fails it at (200000, 300000, 1200000)
-            // (both checked).
             if (p.fast, p.rate) != (fast.max(1), rate.max(1)) {
                 p.recalibrate(fast, rate);
                 self.dirty = true;
@@ -1048,41 +994,6 @@ impl Stats {
         Ok(stats)
     }
 
-    // XCR claude for claude: [risk/low] This pushes one RunSample per rdstats8 cell, a
-    // place and load bucket, so a unit that ran in more than RUNS_KEPT of them loads with
-    // runs_kept over the cap. `push` trims only when len == cap, so such a queue never
-    // shrinks back and grows by one per run until its samples age out at KEEP_S. Not hit
-    // on this box (a probe loading a copy of its jobs.hdr found 16 at most), and no test
-    // reads an rdstats8 table. Fix: trim in `push` with `while q.len() >= cap`; once
-    // every box has saved an rdstats9 table, read_sums and SUMS_MAGIC can go. (stats-09)
-    // 2026-11-01 claude: push now trims with while q.len() >= cap, and read_sums sorts
-    // each unit's runs_kept and sends by time, so the trim drops the oldest and
-    // Record::send's drop-first is right. Regression:
-    // a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_than_any_unit, the first
-    // test that reads an rdstats8 table. It writes 20 cells newest first; after one more
-    // run, runs_kept is 16, oldest first, the oldest 15 s old. On the old code it stays
-    // at 21; without the sort the oldest kept is 6 s old. Whether read_sums and
-    // SUMS_MAGIC can go is Eric's call once every box has saved an rdstats9 or rdstat10
-    // table.
-    // 2026-11-01 claude: push's while-trim and the oldest-first sort hold
-    // (a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_than_any_unit fails at
-    // 21 runs with the if-trim, and with the oldest kept 6 s old without the sort). The
-    // same over-the-cap problem is left in sends: read_sums pushes one UnitSend per cell,
-    // up to BUCKETS.len() (11) at one place, more than UNIT_SENDS_KEPT (8). Record::send
-    // removes only one per send, so that unit keeps 11 sends at that place for good.
-    // Probe (a temporary test in a scratch copy): an rdstats8 unit with a send in each of
-    // 11 cells at a/0, then 20 more sends to a/0, still has 11 of its own sends there,
-    // not 8. Fix: trim in Record::send with a loop (while there >= UNIT_SENDS_KEPT), or
-    // load read_sums' sends through Record::send after the sort, and extend the test to
-    // cover it.
-    // 2026-11-01 claude: Record::send now drops every send at the new send's place past
-    // UNIT_SENDS_KEPT, oldest first (one retain pass), so a unit loaded from an rdstats8
-    // table with more sends at a place than that is back to the cap after its next send
-    // there. The test is renamed
-    // a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_or_sends_than_any_unit:
-    // each of its 20 cells now also holds a send, the unit loads with 20 sends, and after
-    // one sent run at a/0 it must hold UNIT_SENDS_KEPT (8), oldest first, the oldest 7 s
-    // old. With Record::send dropping one per send it fails at 20 sends (checked).
     /// A table of decayed sums: each sum's mean becomes one sample, kept
     /// oldest first.
     fn read_sums(r: &mut impl Read, decay: Decay) -> Result<Self> {

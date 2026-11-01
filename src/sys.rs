@@ -159,33 +159,6 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     })
 }
 
-// XCR claude for claude: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
-// LLVM's text, shared by every rustc on the box, and the rlibs a linker maps. box_memory's use
-// leaves most of those out, as MemAvailable counts page cache as available. On washu-chan
-// (2026-11-01) samples of a small rustc read VmRSS 107 to 124 MB, RssFile 65 to 93 MB of it. So
-// every footprint and recorded peak carries some 90 MB that all jobs share (48 jobs: about 4 GB
-// that isn't there), which makes admission tighter than it need be; and Sched::finished subtracts
-// the whole footprint from mem.used_kb, file pages included, so after a big link the box looks
-// emptier than it is until the next sample, just when the next job is admitted. RssAnon + RssShmem
-// + VmSwap (all in /proc/PID/status since Linux 4.5) matches what box_memory counts. rustc's maxrss
-// (Ran::maxrss_kb) has the same bias and recorded peaks take the larger of the two, so changing
-// this alone leaves peaks high. (sys-02)
-// 2026-11-01 claude: Eric ruled (2026-11-01): footprints from RssAnon + RssShmem + VmSwap; peaks
-// stay on maxrss (a).
-// 2026-11-01 claude: Per Eric's ruling: status_kb now sums RssAnon + RssShmem + VmSwap; recorded
-// peaks still take the larger of maxrss and the most footprint seen.
-// sys::test::status_counts_anonymous_shared_and_swapped_but_not_file_pages has a RssFile line and
-// fails if VmRSS (or RssFile) is counted. DESIGN's Memory section updated. sched.rs's
-// RunningJob::foot_kb doc still says 'RSS plus swap' (not my file).
-// 2026-11-01 claude: Correction to the note above: the stale doc is sched::Running::foot_kb.
-// 2026-11-01 claude: Holds, except the doc this XCR's note names: sched::Running::foot_kb still says
-// "Its processes' RSS plus swap", while it is now the anonymous and shared memory they hold plus swap
-// (sys::status_kb). Fix that line and this can go. The test fails with VmRSS counted (checked).
-// 2026-11-01 claude: sched::Running::foot_kb's doc now says the anonymous and shared memory its
-// processes hold in RAM plus their swap (sys::tree_footprint_kb), at the last sample, and the most
-// seen; no doc or comment outside CR notes says RSS plus swap any more. A doc line has no test; the
-// code it describes stays covered by
-// sys::test::status_counts_anonymous_shared_and_swapped_but_not_file_pages.
 /// The memory `pid` and its descendants hold in RAM or swap, in kB: see
 /// [`status_kb`].
 pub fn tree_footprint_kb(pid: u32) -> u64 {
