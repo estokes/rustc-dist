@@ -31,11 +31,11 @@ use tokio::{
     time,
 };
 
-struct ServerBox {
-    _net: InternalOnly,
+pub(crate) struct ServerBox {
+    pub(crate) net: InternalOnly,
     subscriber: netidx::subscriber::Subscriber,
     links: Links,
-    jobs: NPath,
+    pub(crate) jobs: NPath,
     tx: mpsc::UnboundedSender<Msg>,
     store_dir: PathBuf,
 }
@@ -49,7 +49,7 @@ impl Drop for ServerBox {
 /// The zstd level both sides compress at.
 const LEVEL: i32 = 1;
 
-async fn server(dir: &Path) -> Result<ServerBox> {
+pub(crate) async fn server(dir: &Path) -> Result<ServerBox> {
     server_with(dir, toolchain::installed()).await
 }
 
@@ -80,7 +80,7 @@ async fn server_with(dir: &Path, toolchains: Toolchains) -> Result<ServerBox> {
     let jobs = NPath::from("/test/rustc-dist/b/jobs");
     tokio::spawn(sandbox::listen(net.publisher().clone(), jobs.clone(), server).await?);
     let (subscriber, links) = (net.subscriber().clone(), Links::new(net.subscriber().clone()));
-    Ok(ServerBox { subscriber, links, _net: net, jobs, tx, store_dir })
+    Ok(ServerBox { subscriber, links, net, jobs, tx, store_dir })
 }
 
 fn rustc() -> PathBuf {
@@ -292,7 +292,7 @@ fn blob(dir: &Path, h: &Hash) -> PathBuf {
 }
 
 /// Wait up to `secs` for `done`.
-async fn until(secs: u64, what: &str, mut done: impl FnMut() -> bool) -> Result<()> {
+pub(crate) async fn until(secs: u64, what: &str, mut done: impl FnMut() -> bool) -> Result<()> {
     for _ in 0..secs * 10 {
         if done() {
             return Ok(());
@@ -303,7 +303,7 @@ async fn until(secs: u64, what: &str, mut done: impl FnMut() -> bool) -> Result<
 }
 
 /// How many other boxes' jobs `b` serves.
-async fn serving(b: &ServerBox) -> Result<u32> {
+pub(crate) async fn serving(b: &ServerBox) -> Result<u32> {
     let (reply, status) = oneshot::channel();
     b.tx.send(Msg::Status { reply })?;
     let st = status.await?;
@@ -311,7 +311,7 @@ async fn serving(b: &ServerBox) -> Result<u32> {
 }
 
 /// The processes whose command line names `path`.
-fn running(path: &Path) -> Vec<u32> {
+pub(crate) fn running(path: &Path) -> Vec<u32> {
     let needle = path.as_os_str().as_bytes();
     let Ok(procs) = fs::read_dir("/proc") else { return vec![] };
     procs
@@ -326,7 +326,7 @@ fn running(path: &Path) -> Vec<u32> {
 
 /// A library that never finishes compiling: its static spins in const
 /// eval.
-fn endless(dir: &Path) -> Result<(Job, Unit)> {
+pub(crate) fn endless(dir: &Path) -> Result<(Job, Unit)> {
     fs::create_dir_all(dir.join("spin/src"))?;
     fs::create_dir_all(dir.join("target/deps"))?;
     fs::write(
