@@ -108,7 +108,7 @@ const ZSWAP_RATIO: f64 = 3.;
 /// disk has room for. Capacity is RAM plus `swap_share` of the data
 /// compressed swap can still take: free zram swap, and the rest of zswap's
 /// pool at its compression ratio, up to the free slots of the swap behind
-/// it, as every page zswap holds keeps one.
+/// it that those shared pages leave, as every page zswap holds keeps one.
 pub fn box_memory(swap_share: f64) -> Result<BoxMemory> {
     let meminfo = fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
     let swaps = fs::read_to_string("/proc/swaps").context("reading /proc/swaps")?;
@@ -141,21 +141,28 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     }
     let zram_free = zram_kb.saturating_sub(zram_used);
     let disk_free = swap_free.saturating_sub(zram_free);
-    // CR claude for claude: [risk/medium] disk_free is spent twice: zswap's room
+    // XCR claude for claude: [risk/medium] disk_free is spent twice: zswap's room
     // is capped by it, and used_kb discounts tmpfs (shared) pages by it, as pages
     // the kernel could swap out. With zswap on and a tmpfs larger than RAM, both
     // count the same free disk swap, so capacity minus use overstates the room by
     // up to disk_free. Raised by the 2026-11-01 review of (sys-01). Fix: give the
     // tmpfs discount first claim on disk_free and cap zswap's room by what is
     // left, with a test where both want more than disk_free. (sys-03)
+    // 2026-11-01 claude: sys::memory takes the tmpfs discount
+    // (shared.min(disk_free)) first and caps zswap's room by the free disk slots
+    // it leaves. sys::test::tmpfs_pages_claim_free_disk_swap_before_zswap has
+    // both want more than disk_free and fails with zswap capped by all of
+    // disk_free again (checked). box_memory's doc and DESIGN's Memory section say
+    // so.
+    let shared_out = shared.min(disk_free);
     let zswap_free = zswap_pool_percent.map_or(0, |pct| {
         let ratio = if zswap > 0 { zswapped as f64 / zswap as f64 } else { ZSWAP_RATIO };
         let pool = (total * pct / 100) as f64;
-        ((pool * ratio) as u64).saturating_sub(zswapped).min(disk_free)
+        ((pool * ratio) as u64).saturating_sub(zswapped).min(disk_free - shared_out)
     });
     Ok(BoxMemory {
         capacity_kb: total + ((zram_free + zswap_free) as f64 * swap_share) as u64,
-        used_kb: total.saturating_sub(available).saturating_sub(shared.min(disk_free)),
+        used_kb: total.saturating_sub(available).saturating_sub(shared_out),
     })
 }
 
@@ -318,6 +325,26 @@ mod test {
         let full = meminfo.replace("128932344", "2516924");
         let m = memory(&full, swaps, None, 0.5)?;
         assert_eq!(m.used_kb, 65_301_992 - 20_964_736);
+        Ok(())
+    }
+
+    #[test]
+    fn tmpfs_pages_claim_free_disk_swap_before_zswap() -> Result<()> {
+        // zswap with a 20% pool of 16 GB, empty, in front of a disk with
+        // 2 GB of free slots, and 1.5 GB of tmpfs pages in RAM: the tmpfs
+        // pages take 1.5 GB of the slots, leaving zswap 500 MB.
+        let meminfo = "MemTotal: 16000000 kB\nMemAvailable: 9000000 kB\nShmem: 1500000 kB\n\
+                       SwapTotal: 8000000 kB\nSwapFree: 2000000 kB\nZswap: 0 kB\nZswapped: 0 kB\n";
+        let swaps = "Filename Type Size Used Priority\n/dev/nvme0n1p3 partition 8000000 6000000 -2\n";
+        let m = memory(meminfo, swaps, Some(20), 0.5)?;
+        assert_eq!(m.used_kb, 7_000_000 - 1_500_000);
+        assert_eq!(m.capacity_kb, 16_000_000 + 500_000 / 2);
+        // tmpfs pages beyond the free slots take them all: no room is left
+        // for zswap.
+        let big = meminfo.replace("Shmem: 1500000", "Shmem: 3000000");
+        let m = memory(&big, swaps, Some(20), 0.5)?;
+        assert_eq!(m.used_kb, 7_000_000 - 2_000_000);
+        assert_eq!(m.capacity_kb, 16_000_000);
         Ok(())
     }
 

@@ -144,7 +144,8 @@ data compressed swap can still take (`compressed_swap_share`). For zram, that
 is its swap devices' free space; for zswap, the pool limit times the
 compression ratio zswap is getting, or 3:1 until it has stored something,
 less what the pool holds, and never more than the free space of the swap
-behind it, since every page zswap holds keeps a slot there.
+behind it, since every page zswap holds keeps a slot there. Shared pages
+counted as free (below) claim that space first, so it isn't counted twice.
 
 The daemon measures the box rather than trusting its own bookkeeping, so other
 processes count. Use is what RAM holds (`MemTotal - MemAvailable`), which
