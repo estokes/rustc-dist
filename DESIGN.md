@@ -248,6 +248,18 @@ its front end at the fast rate plus the rest at the rate per CPU over the
 threads it can get, min(width, the place's CPUs for a heavy job), times the
 place's factor at the load there now plus the threads the job adds.
 
+The size and width a place's prediction uses come from the unit's own runs
+at that place when it has any, else from its runs at other places of that
+box (another class, the same profile), and only for a box it never ran on
+from all its runs. Each run counts at its place's factor for the load it
+saw, so the prediction is the time it took there scaled by the place's curve
+to the load now: the curve's shape matters, not its level. On 2026-11-01
+graphix_types (`836c9a8b3f8d481b`) had nine runs on ryouko of 55 s and two
+here of 108 and 146 s. Its size came mostly from ryouko, and washu-chan's
+factor for heavy jobs, learned from every unit, turned it into 54 s here:
+it stayed here and took 146 s. It also held 2.8 tokens on ryouko and 4
+here, which one width per unit hid in the factor.
+
 Every estimate is a weighted median of recent samples, weights halving with
 age, so old samples fade but no one sample, however long, moves the middle.
 What a run teaches:

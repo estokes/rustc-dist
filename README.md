@@ -213,9 +213,12 @@ local = ["sqlx-macros"]
 Calibrations and history live in `~/.local/state/rustc-dist`. The daemon logs
 to the journal (`journalctl --user -u rustc-dist`), at the level set by
 `RUSTC_DIST_LOG` (`info` by default). `RUSTC_DIST_LOG=info,placement=debug`
-adds a line per job saying where it went: each place it could have gone,
-with the seconds until a slot, moving its files and running there, the one
-it took starred, and why the boxes it couldn't go to were out.
+adds a line per job saying where it went: whether it ran before and its time
+on one thread of this box's fastest class; each place it could have gone,
+with the seconds until a slot, moving its files and running there, and what
+that run time comes from (`[own]` its runs there, `[box]` its runs on that
+box, `[est]` an estimate from its size); the one it took starred; and why the
+boxes it couldn't go to were out.
 
 ## What stays local
 

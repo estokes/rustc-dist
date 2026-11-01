@@ -9,7 +9,7 @@ use crate::{
         Unit, UnitStatus, frame,
     },
     remote::{self, CrateFiles},
-    stats::{self, Decay, Origin, PlaceId, Prediction, Run, Stats, Transfer},
+    stats::{self, Basis, Decay, Origin, PlaceId, Prediction, Run, Stats, Transfer},
     sys::{self, BoxMemory},
 };
 use anyhow::{Context, Result};
@@ -1481,12 +1481,23 @@ impl Sched {
 
     /// Where a job of `codegen_units` runs here at `place`, a class or
     /// every CPU.
-    fn spot(&self, pred: &Prediction, codegen_units: u32, place: Place) -> Spot {
-        let (cpus, places) = (self.local_cpus(), &self.layout.places);
+    /// Where a place on this box is in the cost table, whether a job there
+    /// is pinned to a class, and the box's CPUs.
+    fn local(&self, place: Place) -> (PlaceId, bool, u64) {
+        let places = &self.layout.places;
         match place {
-            Place::Local { class, .. } => Spot::new(pred, codegen_units, places.classes[class], true, cpus),
-            Place::Spread { .. } | Place::Remote { .. } => Spot::new(pred, codegen_units, places.all, false, cpus),
+            Place::Local { class, .. } => (places.classes[class], true, self.local_cpus()),
+            Place::Spread { .. } | Place::Remote { .. } => (places.all, false, self.local_cpus()),
         }
+    }
+
+    /// `unit` at `at`, pinned to a class or not, on a box of `cpus`: the
+    /// spot it takes and µs it runs under `load_c` (see `run_us`), from
+    /// its own runs there when it has any (see `Stats::predict_at`).
+    fn estimate(&self, unit: &Unit, (at, pinned, cpus): (PlaceId, bool, u64), load_c: u32, waits: bool) -> Estimate {
+        let (pred, basis) = self.stats.predict_at(&unit.exact, &unit.coarse, at);
+        let spot = Spot::new(&pred, unit.codegen_units, at, pinned, cpus);
+        Estimate { spot, run_us: self.run_us(&pred, &spot, load_c, waits), basis }
     }
 
     /// Predicted µs at `spot` on a box under `load_c`: with the job's own
@@ -1568,7 +1579,9 @@ impl Sched {
             let w = &self.queue[i];
             let fits = !mem_blocked && (first_here || w.pred.mem_kb <= mem_free);
             let waits_here = !fits || held.iter().all(|&n| n == 0);
-            let fastest_us = self.stats.time_us(&w.pred, self.layout.places.classes[fastest], load_here, 1.);
+            let fastest_at = self.layout.places.classes[fastest];
+            let fastest_pred = self.stats.predict_at(&w.unit.exact, &w.unit.coarse, fastest_at).0;
+            let fastest_us = self.stats.time_us(&fastest_pred, fastest_at, load_here, 1.);
             let away = match &w.portable {
                 None => Err("it can't go to another box"),
                 Some(p) if !w.pred.known || waits_here || fastest_us >= REMOTE_MIN_US => Ok(p),
@@ -1580,10 +1593,10 @@ impl Sched {
                 let local = if fits { held.len() } else { 0 };
                 for k in 0..local {
                     let place = Place::Local { layout: id, class: k };
-                    let spot = self.spot(&w.pred, w.unit.codegen_units, place);
                     let waits = held[k] == 0;
-                    let run_us = self.run_us(&w.pred, &spot, if waits { self.load_c } else { load_here }, waits);
-                    cands.push(Cand { start_us: frees_in[k], copy_us: 0, run_us, spot, place, queue: None });
+                    let load_c = if waits { self.load_c } else { load_here };
+                    let Estimate { spot, run_us, basis } = self.estimate(&w.unit, self.local(place), load_c, waits);
+                    cands.push(Cand { start_us: frees_in[k], copy_us: 0, run_us, spot, place, queue: None, basis });
                 }
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Ok((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
@@ -1601,11 +1614,10 @@ impl Sched {
                             },
                         };
                         let place = Place::Remote { remote: r, class: Some(k), shown_in: None };
-                        let spot = Spot::new(&w.pred, w.unit.codegen_units, at, true, cpus);
                         let load_c = if waits { state.load_c } else { load_there[r] };
-                        let run_us = self.run_us(&w.pred, &spot, load_c, waits);
+                        let Estimate { spot, run_us, basis } = self.estimate(&w.unit, (at, true, cpus), load_c, waits);
                         let copy_us = self.stats.copy_us(&w.unit, at, links, missing_kb);
-                        cands.push(Cand { start_us: frees_in_us, copy_us, run_us, spot, place, queue: None });
+                        cands.push(Cand { start_us: frees_in_us, copy_us, run_us, spot, place, queue: None, basis });
                     }
                 }
                 (!cands.is_empty()).then(|| {
@@ -1625,19 +1637,18 @@ impl Sched {
                         None => first_free.unwrap_or((0, 0)),
                     };
                     let place = Place::Spread { layout: id, class };
-                    let spot = self.spot(&w.pred, w.unit.codegen_units, place);
                     let waits = held[class] == 0;
-                    let run_us = self.run_us(&w.pred, &spot, if waits { self.load_c } else { load_here }, waits);
-                    cands.push(Cand { start_us, copy_us: 0, run_us, spot, place, queue: None });
+                    let load_c = if waits { self.load_c } else { load_here };
+                    let Estimate { spot, run_us, basis } = self.estimate(&w.unit, self.local(place), load_c, waits);
+                    cands.push(Cand { start_us, copy_us: 0, run_us, spot, place, queue: None, basis });
                 }
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Ok((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
                     let cpus = state.classes.iter().map(|c| c.cpus as u64).sum();
                     let place = Place::Remote { remote: r, class: None, shown_in: None };
-                    let spot = Spot::new(&w.pred, w.unit.codegen_units, places.all, false, cpus);
                     let waits = rb.avail.iter().all(|&n| n == 0);
                     let load_c = if waits { state.load_c } else { load_there[r] };
-                    let run_us = self.run_us(&w.pred, &spot, load_c, waits);
+                    let Estimate { spot, run_us, basis } = self.estimate(&w.unit, (places.all, false, cpus), load_c, waits);
                     let missing_kb = away.map_or(0, |p| rb.held.missing_kb(&p.inputs));
                     let copy_us = self.stats.copy_us(&w.unit, places.all, links, missing_kb);
                     // A busy box is worth waiting for if it finishes the job
@@ -1651,7 +1662,7 @@ impl Sched {
                         false => None,
                     };
                     if let Some((start_us, queue)) = start {
-                        cands.push(Cand { start_us, copy_us, run_us, spot, place, queue });
+                        cands.push(Cand { start_us, copy_us, run_us, spot, place, queue, basis });
                     }
                 }
                 (!cands.is_empty()).then(|| pick_wide(&cands, w.pred.known))
@@ -1744,9 +1755,12 @@ impl Sched {
         }
     }
 
-    /// Where `w` goes and why: its prediction; each place it could go, with
-    /// the seconds until a slot, moving its files and running there, the
-    /// one it takes starred; and why it couldn't go anywhere else.
+    /// Where `w` goes and why: whether it ran before and its time on one
+    /// thread of this box's fastest class; each place it could go, with the
+    /// seconds until a slot, moving its files and running there, and what
+    /// that run time comes from (its own runs there, its runs on that box,
+    /// or an estimate from its size), the one it takes starred; and why it
+    /// couldn't go anywhere else.
     fn placement(
         &self,
         w: &Waiting,
@@ -1758,8 +1772,8 @@ impl Sched {
     ) -> LPooled<String> {
         let mut line: LPooled<String> = LPooled::take();
         let s = |us: u64| us as f64 / 1e6;
-        let history = if w.pred.known { "history" } else { "no history" };
-        let _ = write!(line, "{} ({history}, {:.2} s on the fastest class here):", w.unit.exact, s(fastest_us));
+        let ran = if w.pred.known { "ran before" } else { "never ran" };
+        let _ = write!(line, "{} ({ran}; {:.2} s on one thread of the fastest class here):", w.unit.exact, s(fastest_us));
         for (i, c) in cands.iter().enumerate() {
             let star = if i == chosen { "*" } else { "" };
             let _ = match c.place {
@@ -1768,7 +1782,12 @@ impl Sched {
                 Place::Remote { remote, class: Some(k), .. } => write!(line, " {star}{}/{k}", self.remotes[remote].name),
                 Place::Remote { remote, class: None, .. } => write!(line, " {star}{}/all", self.remotes[remote].name),
             };
-            let _ = write!(line, " {:.2}+{:.2}+{:.2}", s(c.start_us), s(c.copy_us), s(c.run_us));
+            let basis = match c.basis {
+                Basis::Place => "own",
+                Basis::Box => "box",
+                Basis::Size => "est",
+            };
+            let _ = write!(line, " {:.2}+{:.2}+{:.2} [{basis}]", s(c.start_us), s(c.copy_us), s(c.run_us));
         }
         if !fits {
             line.push_str("; not here: its memory doesn't fit");
@@ -1871,8 +1890,8 @@ impl Sched {
             .layout
             .lease(job, pinned, first, unit.codegen_units, fifo_dir, &cpus, meter.clone())
             .with_context(|| format_compact!("starting {}", unit.exact))?;
-        let spot = self.spot(&pred, unit.codegen_units, place);
-        let (at, run_us) = (spot.at, self.run_us(&pred, &spot, self.load_c, false));
+        let Estimate { spot, run_us, .. } = self.estimate(&unit, self.local(place), self.load_c, false);
+        let at = spot.at;
         self.running.push(Running {
             job,
             build,
@@ -2001,7 +2020,9 @@ impl Sched {
                     true => Place::Local { layout: id, class: fastest },
                     false => Place::Spread { layout: id, class: fastest },
                 };
-                let spot = self.spot(&info.pred, 1, place);
+                let (at, pinned, cpus) = self.local(place);
+                let (pred, _) = self.stats.predict_at(key, key, at);
+                let spot = Spot::new(&pred, 1, at, pinned, cpus);
                 UnitStatus {
                     key: key.clone(),
                     here,
@@ -2010,7 +2031,7 @@ impl Sched {
                     work_ms: ms(info.pred.cost_mi()),
                     front_ms: (info.pred.front_mi > 0).then(|| ms(info.pred.front_mi)),
                     width_c: info.pred.width_c.unwrap_or(100),
-                    now_ms: self.run_us(&info.pred, &spot, self.load_c, false) / 1000,
+                    now_ms: self.run_us(&pred, &spot, self.load_c, false) / 1000,
                     wall_ms: info.wall_ms,
                     mem_kb: info.pred.mem_kb,
                     copy_ms: info.copy_ms,
@@ -2127,6 +2148,13 @@ impl Sched {
     }
 }
 
+/// What `Sched::estimate` predicts of a job at a place.
+struct Estimate {
+    spot: Spot,
+    run_us: u64,
+    basis: Basis,
+}
+
 /// Somewhere a job could run.
 struct Cand {
     /// µs until it has a slot, then moving its files, then running.
@@ -2138,6 +2166,7 @@ struct Cand {
     /// The class of another box whose next free token a heavy job would
     /// wait for.
     queue: Option<usize>,
+    basis: Basis,
 }
 
 impl Cand {
@@ -2227,7 +2256,7 @@ mod test {
 
     fn local(run_us: u64, start_us: u64) -> Cand {
         let place = Place::Local { layout: LayoutId::new(), class: 0 };
-        Cand { start_us, copy_us: 0, run_us, spot: spot(), place, queue: None }
+        Cand { start_us, copy_us: 0, run_us, spot: spot(), place, queue: None, basis: Basis::Place }
     }
 
     #[test]
@@ -2266,6 +2295,7 @@ mod test {
             run_us,
             spot: spot(),
             queue: None,
+            basis: Basis::Place,
             place: if here {
                 Place::Spread { layout: LayoutId::new(), class: 0 }
             } else {
@@ -2810,13 +2840,12 @@ mod test {
     async fn a_box_slower_than_its_calibration_on_the_same_units_stops_getting_them() -> Result<()> {
         let dir = scratch("slow-box");
         let (mut s, mut rx, _load) = sched(&dir, vec![class(1000, &[0])], room(u64::MAX), &[], &[])?;
-        // b is calibrated five times as fast: 5 s here, 1 s there. It takes 20.
+        // b is calibrated five times as fast: 5 s here, 1 s there. It takes
+        // 20, and once it has, that run predicts the next there.
         s.farm("b".into(), Some(remote_box(200, 4, 4, 1)));
         history(&mut s, "big", 5_000_000, 100);
         let sent = (0..30).take_while(|_| run_on_b(&mut s, &mut rx, "big", 20_000, 0)).count();
-        assert!((1..30).contains(&sent), "sent {sent} times");
-        let (_, places) = s.remotes[0].state.as_ref().unwrap();
-        assert!(s.stats.factor(places.classes[0], 0) > 4., "{}", s.stats.factor(places.classes[0], 0));
+        assert_eq!(sent, 1);
         drop(s);
         fs::remove_dir_all(&dir)?;
         Ok(())
@@ -2912,20 +2941,28 @@ mod test {
         s.submit(unit("job", &[]), 1, want(), reply);
         let (reply, _rx) = oneshot::channel();
         s.submit(unit("stays", &[]), 1, None, reply);
-        let cand = |start_us, copy_us, run_us, place| Cand { start_us, copy_us, run_us, spot: spot(), place, queue: None };
+        let cand = |start_us, copy_us, run_us, place, basis| Cand {
+            start_us,
+            copy_us,
+            run_us,
+            spot: spot(),
+            place,
+            queue: None,
+            basis,
+        };
         let here = Place::Spread { layout: s.layout.id, class: 0 };
         let b = Place::Remote { remote: 0, class: None, shown_in: None };
-        let cands = [cand(0, 0, 5_000_000, here), cand(250_000, 400_000, 1_000_000, b)];
+        let cands = [cand(0, 0, 5_000_000, here, Basis::Place), cand(250_000, 400_000, 1_000_000, b, Basis::Size)];
         let (job, stays) = (&s.queue[0], &s.queue[1]);
         let away = job.portable.as_ref().context("portable")?;
         assert_eq!(
             s.placement(job, 1_000_000, true, Ok(away), &cands, 1).as_str(),
-            "job (no history, 1.00 s on the fastest class here): here/all 0.00+0.00+5.00 *b/all 0.25+0.40+1.00; \
-             not c: it lacks the toolchain"
+            "job (never ran; 1.00 s on one thread of the fastest class here): here/all 0.00+0.00+5.00 [own] \
+             *b/all 0.25+0.40+1.00 [est]; not c: it lacks the toolchain"
         );
         assert_eq!(
             s.placement(stays, 1_000_000, false, Err("it can't go to another box"), &cands[1..], 0).as_str(),
-            "stays (no history, 1.00 s on the fastest class here): *b/all 0.25+0.40+1.00; \
+            "stays (never ran; 1.00 s on one thread of the fastest class here): *b/all 0.25+0.40+1.00 [est]; \
              not here: its memory doesn't fit; no other box: it can't go to another box"
         );
         drop(s);

@@ -235,6 +235,8 @@ struct Send {
 /// heavy jobs run.
 struct Place {
     key: ArcStr,
+    /// The box and profile it is part of: its key but the class.
+    group: ArcStr,
     /// Calibrated instructions per µs: of its fastest class, where a front
     /// end runs, and per CPU.
     fast: u64,
@@ -251,8 +253,10 @@ struct Place {
 
 impl Place {
     fn new(key: ArcStr, fast: u64, rate: u64) -> Self {
+        let group = key.rsplit_once('/').map_or(key.as_str(), |(g, _)| g).into();
         let mut p = Self {
             key,
+            group,
             fast: fast.max(1),
             rate: rate.max(1),
             curve: std::array::from_fn(|_| VecDeque::new()),
@@ -453,12 +457,12 @@ impl Record {
         }
     }
 
-    /// Its size from its runs but those at `skip`'s place and load bucket.
-    fn size(&self, places: &[Place], now: f64, half_life_s: f64, skip: Option<(PlaceId, u8)>) -> Option<Size> {
+    /// Its size from those of its runs `counts` takes.
+    fn size(&self, places: &[Place], now: f64, half_life_s: f64, counts: impl Fn(&RunSample) -> bool) -> Option<Size> {
         let (mut front, mut rest, mut width): (LPooled<Vec<_>>, LPooled<Vec<_>>, LPooled<Vec<_>>) =
             (LPooled::take(), LPooled::take(), LPooled::take());
         let mut runs = 0.;
-        for r in self.runs_kept.iter().filter(|r| Some((r.place, nearest(r.load_c))) != skip) {
+        for r in self.runs_kept.iter().filter(|r| counts(r)) {
             let (k, m) = (keep(r.at, now, half_life_s), places[r.place.0 as usize].factor(r.load_c));
             runs += k;
             front.push((r.front_mi / m, k));
@@ -488,6 +492,18 @@ impl Prediction {
     pub fn cost_mi(&self) -> u64 {
         self.front_mi + self.rest_mi
     }
+}
+
+/// What a prediction at a place comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// The unit's runs there.
+    Place,
+    /// Its runs at other places of that box.
+    Box,
+    /// Its size from all its runs, or its crate's, or every unit's, at the
+    /// place's factor.
+    Size,
 }
 
 /// What `status` shows of a unit.
@@ -637,10 +653,29 @@ impl Stats {
         self.dirty = true;
     }
 
+    /// The prediction for a unit at `place`: from its runs there if it has
+    /// any, else from its runs elsewhere on that box, so a box is judged by
+    /// how long the unit took on it; each run counts at that place's factor
+    /// for the load it saw, so the prediction follows the load there now.
+    /// Only a unit that never ran on the box is predicted from its size.
+    pub fn predict_at(&self, exact: &ArcStr, coarse: &ArcStr, place: PlaceId) -> (Prediction, Basis) {
+        let (places, now, half_life_s) = (&self.places, self.now, self.decay.half_life_s);
+        let group = &places[place.0 as usize].group;
+        if let Some(r) = self.exact.get(exact) {
+            if let Some(s) = r.size(places, now, half_life_s, |s| s.place == place) {
+                return (known(r, &s), Basis::Place);
+            }
+            if let Some(s) = r.size(places, now, half_life_s, |s| places[s.place.0 as usize].group == *group) {
+                return (known(r, &s), Basis::Box);
+            }
+        }
+        (self.predict(exact, coarse), Basis::Size)
+    }
+
     pub fn predict(&self, exact: &ArcStr, coarse: &ArcStr) -> Prediction {
         let own = [(&self.exact, exact), (&self.coarse, coarse)].into_iter().find_map(|(map, key)| {
             let r = map.get(key)?;
-            let s = r.size(&self.places, self.now, self.decay.half_life_s, None)?;
+            let s = r.size(&self.places, self.now, self.decay.half_life_s, |_| true)?;
             Some((r, s))
         });
         match own {
@@ -658,7 +693,7 @@ impl Stats {
     /// Every unit with runs.
     pub fn units(&self) -> impl Iterator<Item = (&ArcStr, UnitInfo)> {
         self.exact.iter().filter_map(|(key, r)| {
-            let s = r.size(&self.places, self.now, self.decay.half_life_s, None)?;
+            let s = r.size(&self.places, self.now, self.decay.half_life_s, |_| true)?;
             let info = UnitInfo {
                 runs: r.runs,
                 pred: known(r, &s),
@@ -682,7 +717,9 @@ impl Stats {
         // The front end holds the one token the job starts with.
         let tokens_us = (run.tokens_us as f64 - front_us).max(rest_us);
         if let Some(r) = self.exact.get(&unit.exact)
-            && let Some(other) = r.size(&self.places, now, self.decay.half_life_s, Some((run.place, nearest(run.load_c))))
+            && let Some(other) = r.size(&self.places, now, self.decay.half_life_s, |s| {
+                (s.place, nearest(s.load_c)) != (run.place, nearest(run.load_c))
+            })
             && other.runs > 0.
         {
             let threads = if rest_us > 0. { tokens_us / rest_us } else { 1. };
@@ -758,7 +795,7 @@ impl Stats {
         }
         let (mut cost, mut mem) = (histogram(1_000_000_000), histogram(1 << 30));
         for r in self.exact.values() {
-            if let Some(s) = r.size(&self.places, now, self.decay.half_life_s, None) {
+            if let Some(s) = r.size(&self.places, now, self.decay.half_life_s, |_| true) {
                 cost.saturating_record((s.front_mi + s.rest_mi).max(1.) as u64);
                 mem.saturating_record(r.mem_kb.value_at_quantile(0.9).max(1));
             }
@@ -1209,6 +1246,48 @@ mod test {
         non_decreasing(&mut p);
         let v: Vec<f64> = p.iter().map(|p| p.1).collect();
         assert_eq!(v, [1., 1.5, 1.5, 4.5, 4.5]);
+    }
+
+    #[test]
+    fn a_unit_is_predicted_at_a_place_from_its_runs_there() {
+        let mut s = Stats::new(Decay::default());
+        let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/0", 1000, 1000));
+        // u ran mostly on b; on a it took 2.6 s. v says a is twice as fast
+        // as b, which isn't so for u.
+        for _ in 0..9 {
+            s.record(&unit("u:1", "u"), &run(b, 0, 1000));
+        }
+        for _ in 0..2 {
+            s.record(&unit("u:1", "u"), &run(a, 0, 2600));
+        }
+        for _ in 0..50 {
+            s.record(&unit("v:1", "v"), &run(a, 0, 500));
+            s.record(&unit("v:1", "v"), &run(b, 0, 1000));
+        }
+        let at = |s: &Stats, p: PlaceId, load_c: u32| {
+            let (pred, basis) = s.predict_at(&ArcStr::from("u:1"), &ArcStr::from("u"), p);
+            (s.time_us(&pred, p, load_c, 1.) as f64 / 1e3, basis)
+        };
+        let (on_a, basis) = at(&s, a, 0);
+        assert!(near(on_a, 2600.) && basis == Basis::Place, "{on_a} {basis:?}");
+        assert!(near(at(&s, b, 0).0, 1000.), "{:?}", at(&s, b, 0));
+        // Under more load there, its runs there count at the place's curve.
+        let busy = at(&s, a, 300).0;
+        assert!(near(busy / on_a, s.factor(a, 300) / s.factor(a, 0)), "{busy}");
+    }
+
+    #[test]
+    fn a_unit_new_to_a_class_is_predicted_from_its_runs_on_that_box_then_its_size() {
+        let mut s = Stats::new(Decay::default());
+        let (fast, slow) = (s.place("a/p/0", 2000, 2000), s.place("a/p/1", 1000, 1000));
+        let other = s.place("c/p/0", 1000, 1000);
+        for _ in 0..5 {
+            s.record(&unit("u:1", "u"), &run(fast, 0, 1000));
+        }
+        let (pred, basis) = s.predict_at(&ArcStr::from("u:1"), &ArcStr::from("u"), slow);
+        let t = s.time_us(&pred, slow, 0, 1.) as f64 / 1e3;
+        assert!(near(t, 2000.) && basis == Basis::Box, "{t} {basis:?}");
+        assert_eq!(s.predict_at(&ArcStr::from("u:1"), &ArcStr::from("u"), other).1, Basis::Size);
     }
 
     #[test]
