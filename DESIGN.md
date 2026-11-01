@@ -835,6 +835,58 @@ nothing, so a send is now priced by the bytes the box lacks (see Cost).
 Open: placing a job also slows the jobs already on the box. The curves could
 predict that too, but at first a prediction covers only the job being placed.
 
+### Stage 6: robust estimates and heartbeats (planned 2026-11-01)
+
+The table's estimates are decayed means and sums, which one bad run moves:
+
+- Fifteen graphix tests sent to ryouko at once each sent the same 520 MB (since
+  fixed: a box no longer asks for a blob already on its way). Their 135 s sends
+  set ryouko's average for jobs that link and each test's own average, so link
+  jobs went to aieka instead. aieka's cache stayed warm and ryouko never got
+  the chance to look better.
+- A place's factor is total time over total calibrated time, so one run that
+  swapped, or starved behind other work, pulls it. aieka's heavy factor of 0.29,
+  a third of its calibrated time on a box ryouko should beat, is likely one.
+- A box that looks bad gets no jobs, so nothing corrects it but time.
+
+Each estimate becomes a weighted median of its recent samples. Weights halve
+with age at the half-life, as now, so old samples still fade, but no single
+sample, however long, moves the middle:
+
+- A unit's sends to a place: its last 8, each the time it spent moving files
+  and the kB it sent. The prediction is their weighted median of each send's
+  time adjusted to the kB missing now, at the place's µs per kB.
+- Sends to a place of each kind (link or not): the last 64, the same way. The
+  µs per kB is the weighted median of the slopes between pairs of them whose
+  kB differ by at least 1 MB (Theil-Sen), the 50 MB/s guess until there are
+  such pairs. Stats stay box to box: networks are complex, and one box's
+  link says little about another's.
+- A place's factor at each load bucket: the last 32 comparisons, each a run's
+  time over what its unit's size from runs elsewhere predicts, weighted by that
+  prediction, so long jobs still count most, and by age. Calibration counts as
+  a sample of weight `P` that never ages, as now, so a bucket with no recent
+  runs goes back to it.
+- A unit's size: the weighted median over its last 16 runs of the size each
+  implies at its place's current factor.
+
+That holds about a kB per unit, some 7 MB for 7,000 units, and the table's
+format changes.
+
+Recent samples are only as fresh as the jobs sent, and a box the medians
+judge badly gets none. So while jobs are waiting here and another box takes
+none from here and has a token free, this box sends it a heartbeat: half a MB
+or a MB of bytes no box has, alternately, so they are never already held, at
+most once a minute per box. A heartbeat's time and size are a sample for the
+box's sends of each kind, so throughput and the fixed cost of a send stay
+current, and enough fresh heartbeats outweigh old bad sends as those age.
+A heartbeat takes no token and runs nothing.
+
+Open: heartbeats keep a box's transfer stats fresh, but not its speed: a box
+whose factor says it is slow, wrongly, gets no runs to say otherwise, only
+time pulling it back to calibration. Sending it a real job now and then when
+it is idle and jobs wait here would, at some cost to that job. Or the prior's
+pull could be enough once the factor is a median.
+
 ## Farm test (2026-10-30)
 
 Two daemons on this laptop, each with its own state, talking through a private
