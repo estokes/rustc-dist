@@ -1,12 +1,14 @@
 use crate::{
+    blobs::{Hash, Hashes},
     calibrate,
     classes::{self, Class, Profile},
     farm::{BoxState, ClassState, Load},
     graph::Graph,
     protocol::{
-        BoxClass, BoxStatus, ClassStatus, Measured, Ran, Reply, SpreadStatus, Status, Switching,
+        BoxClass, BoxStatus, ClassStatus, Measured, Ran, Reads, Reply, SpreadStatus, Status, Switching,
         Unit, UnitStatus, frame,
     },
+    remote::{self, CrateFiles},
     stats::{self, Decay, Origin, PlaceId, Prediction, Run, Stats, Transfer},
     sys::{self, BoxMemory},
 };
@@ -20,7 +22,7 @@ use netidx_core::atomic_id;
 use poolshark::local::LPooled;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::CString,
     fs, io, mem,
     os::{
@@ -51,10 +53,6 @@ const GATHER: Duration = Duration::from_millis(20);
 /// While a local class has a free slot, only jobs predicted to take this
 /// long on the fastest local class are worth sending to another box.
 const REMOTE_MIN_US: u64 = 1_000_000;
-/// What a job sent to a place nothing has been sent to yet is predicted
-/// to spend other than compiling: connecting, sending inputs it lacks,
-/// and fetching outputs.
-const REMOTE_OVERHEAD_US: u64 = 200_000;
 /// While jobs run here, count and lend each one's jobserver tokens this
 /// often: codegen threads take and return them without telling the
 /// scheduler.
@@ -82,12 +80,13 @@ const LOAD_TAU: Duration = Duration::from_secs(10);
 atomic_id!(LayoutId);
 atomic_id!(JobId);
 
-/// What a job needs to run on another box.
+/// What a job needs to run on another box: a toolchain, how it reads the
+/// crates below it, and the directory their paths are relative to.
 pub struct Want {
     pub key: ArcStr,
     pub target: Option<ArcStr>,
-    /// It links, so it sends every rlib below it.
-    pub links: bool,
+    pub reads: Reads,
+    pub cwd: ArcStr,
 }
 
 pub enum Msg {
@@ -235,12 +234,14 @@ pub struct Answer {
 }
 
 /// A job that ran on another box: what that box measured, how long its
-/// linker waited for files, and what moving them cost.
+/// linker waited for files, what moving them cost, and the crate files the
+/// box holds after it, by hash with their size in kB.
 pub struct SentRun {
     pub ran: Ran,
     pub measured: Measured,
     pub linker_waited_us: u64,
     pub transfer: Transfer,
+    pub kept: Vec<(Hash, u64)>,
 }
 
 pub enum RemoteOutcome {
@@ -635,6 +636,8 @@ pub struct Setup {
     pub memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
     /// Counts the tasks runnable on the box.
     pub runnable: Box<dyn Fn() -> Result<u32> + Send + Sync>,
+    /// The hashes of files jobs sent to other boxes read.
+    pub hashes: Arc<Hashes>,
     pub tokens_per_cpu: f64,
     pub calibration_seconds: u64,
     pub decay: Decay,
@@ -645,7 +648,76 @@ struct Portable {
     key: ArcStr,
     target: Option<ArcStr>,
     crates: Vec<ArcStr>,
+    /// It links, so it sends every rlib below it.
     links: bool,
+    /// The crate files it would send, by hash if one was taken since the
+    /// file last changed, with their size in kB.
+    inputs: Vec<(Option<Hash>, u64)>,
+}
+
+/// The crate files a job that reads `reads` sends of `crates`, paths
+/// relative to `cwd`: see `Portable::inputs`.
+fn inputs(hashes: &Hashes, cwd: &str, crates: &[ArcStr], reads: &Reads) -> Vec<(Option<Hash>, u64)> {
+    let cwd = Path::new(cwd);
+    let mut files = Vec::with_capacity(crates.len());
+    for krate in crates {
+        let mut add = |path: &Path| {
+            if let Some((hash, len)) = hashes.known(path) {
+                files.push((hash, len.div_ceil(1024)));
+            }
+        };
+        match remote::crate_files(remote::absolute(cwd, krate), reads) {
+            CrateFiles::One(path) => add(&path),
+            CrateFiles::Late { rlib, meta } => {
+                add(&rlib);
+                add(&meta);
+            }
+        }
+    }
+    files
+}
+
+/// The crate files this box believes another box holds, by hash with
+/// their size in kB and when a job last used them there, kept to the
+/// box's cache size least recently used first, as the box keeps them.
+#[derive(Default)]
+struct Held {
+    files: HashMap<Hash, (u64, u64)>,
+    /// Uses, oldest first; one whose file was used again since is stale.
+    order: VecDeque<(u64, Hash)>,
+    kb: u64,
+    uses: u64,
+}
+
+impl Held {
+    /// A job there used `kept`, on a box that keeps `cap_kb`.
+    fn used(&mut self, kept: &[(Hash, u64)], cap_kb: u64) {
+        for &(hash, kb) in kept {
+            self.uses += 1;
+            let old = self.files.insert(hash, (kb, self.uses));
+            self.kb = self.kb + kb - old.map_or(0, |(kb, _)| kb);
+            self.order.push_back((self.uses, hash));
+        }
+        while self.kb > cap_kb
+            && let Some((used, hash)) = self.order.pop_front()
+        {
+            if let Some(&(kb, last)) = self.files.get(&hash)
+                && last == used
+            {
+                self.files.remove(&hash);
+                self.kb -= kb;
+            }
+        }
+        if self.order.len() > 2 * self.files.len() + 1024 {
+            let files = &self.files;
+            self.order.retain(|(used, hash)| files.get(hash).is_some_and(|&(_, last)| last == *used));
+        }
+    }
+
+    /// The kB of `inputs` it doesn't hold.
+    fn missing_kb(&self, inputs: &[(Option<Hash>, u64)]) -> u64 {
+        inputs.iter().filter(|(hash, _)| hash.is_none_or(|h| !self.files.contains_key(&h))).map(|(_, kb)| kb).sum()
+    }
 }
 
 struct Waiting {
@@ -729,6 +801,7 @@ struct RemoteBox {
     avail: Vec<u32>,
     /// µs until the first of those jobs is predicted to end.
     unseen_left_us: Option<u64>,
+    held: Held,
     /// It answered busy, so its state is stale until this version.
     busy_until: Option<u64>,
     /// When its state arrived, which its predictions count from.
@@ -1054,9 +1127,10 @@ impl Sched {
         let pred = self.stats.predict(&unit.exact, &unit.coarse);
         let pinned = self.mismatches.get(&unit.exact).is_some_and(|n| *n >= PIN_AFTER);
         let portable = match remote {
-            Some(Want { key, target, links }) if !pinned => {
-                self.graph.inputs(&unit.deps).map(|crates| Portable { key, target, crates, links })
-            }
+            Some(Want { key, target, reads, cwd }) if !pinned => self.graph.inputs(&unit.deps).map(|crates| {
+                let inputs = inputs(&self.setup.hashes, &cwd, &crates, &reads);
+                Portable { key, target, crates, links: reads != Reads::Metadata, inputs }
+            }),
             _ => None,
         };
         self.queue.push(Waiting { unit, build, pred, rank_mi, portable, since: Instant::now(), reply });
@@ -1106,10 +1180,14 @@ impl Sched {
         let Some(r) = self.take_running(job) else { return };
         let Place::Remote { remote, .. } = r.place else { return };
         match outcome {
-            RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer }) => {
+            RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer, kept }) => {
                 self.mismatches.remove(&unit.exact);
                 let run = timed(r.at, &ran, measured, linker_waited_us, ran.maxrss_kb, Origin::Sent(transfer));
                 self.stats.record(unit, &run);
+                let rb = &mut self.remotes[remote];
+                if let Some((state, _)) = &rb.state {
+                    rb.held.used(&kept, state.cache_gb << 20);
+                }
             }
             RemoteOutcome::Busy { version } => {
                 let rb = &mut self.remotes[remote];
@@ -1130,6 +1208,7 @@ impl Sched {
                     state: None,
                     avail: Vec::new(),
                     unseen_left_us: None,
+                    held: Held::default(),
                     busy_until: None,
                     seen: Instant::now(),
                 });
@@ -1468,6 +1547,7 @@ impl Sched {
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Some((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
                     let cpus = state.classes.iter().map(|c| c.cpus as u64).sum();
+                    let missing_kb = away.map_or(0, |p| rb.held.missing_kb(&p.inputs));
                     for (k, &at) in places.classes.iter().enumerate() {
                         // A busy class is worth waiting for if it finishes the
                         // job sooner than anywhere free.
@@ -1483,7 +1563,7 @@ impl Sched {
                         let spot = Spot::new(&w.pred, w.unit.codegen_units, at, true, cpus);
                         let load_c = if waits { state.load_c } else { load_there[r] };
                         let run_us = self.run_us(&w.pred, &spot, load_c, waits);
-                        let copy_us = self.stats.copy_us(&w.unit, at, links).unwrap_or(REMOTE_OVERHEAD_US);
+                        let copy_us = self.stats.copy_us(&w.unit, at, links, missing_kb);
                         cands.push(Cand { run_us, frees_in_us, copy_us, spot, place });
                     }
                 }
@@ -1519,7 +1599,8 @@ impl Sched {
                     let waits = rb.avail.iter().all(|&n| n == 0);
                     let load_c = if waits { state.load_c } else { load_there[r] };
                     let run_us = self.run_us(&w.pred, &spot, load_c, waits);
-                    let copy_us = self.stats.copy_us(&w.unit, places.all, links).unwrap_or(REMOTE_OVERHEAD_US);
+                    let missing_kb = away.map_or(0, |p| rb.held.missing_kb(&p.inputs));
+                    let copy_us = self.stats.copy_us(&w.unit, places.all, links, missing_kb);
                     // A busy box is worth waiting for if it finishes the job
                     // sooner than anywhere free; with no history to say so,
                     // the job doesn't wait for one.
@@ -1837,8 +1918,9 @@ impl Sched {
                 let (_, mean) = spread_rates(state.classes.iter().map(|c| (c.rate, c.cpus as u64)));
                 let copy_ms = |links| {
                     let mut at = std::iter::once(places.all).chain(places.classes.iter().copied());
-                    at.find_map(|at| self.stats.place_copy_us(at, links)).map(|us| us / 1000)
+                    at.find_map(|at| self.stats.sends(at, links).0).map(|us| us / 1000)
                 };
+                let (_, mb_per_s) = self.stats.sends(places.all, true);
                 Some(BoxStatus {
                     name: rb.name.clone(),
                     profile: state.profile.clone(),
@@ -1848,6 +1930,7 @@ impl Sched {
                     thread_speed_c: speed_c(mean, places.all, state.load_c),
                     library_copy_ms: copy_ms(false),
                     link_copy_ms: copy_ms(true),
+                    mb_per_s: mb_per_s.round() as u32,
                     sent: self.running.iter().filter(there).count() as u32,
                 })
             })
@@ -2099,13 +2182,14 @@ mod test {
         tokens_per_cpu: f64,
         /// Counts the tasks runnable on the box, whatever runs there.
         runnable: Box<dyn Fn() -> Result<u32> + Send + Sync>,
+        hashes: Arc<Hashes>,
     }
 
     /// An idle box with `capacity_kb` that nothing else uses, and a token
     /// per CPU.
     fn room(capacity_kb: u64) -> Room {
         let memory = Box::new(move || Ok(BoxMemory { capacity_kb, used_kb: 0 }));
-        Room { memory, tokens_per_cpu: 1., runnable: Box::new(|| Ok(0)) }
+        Room { memory, tokens_per_cpu: 1., runnable: Box::new(|| Ok(0)), hashes: Arc::new(Hashes::default()) }
     }
 
     /// A scheduler on the state in `dir`, in the default profile.
@@ -2116,6 +2200,7 @@ mod test {
             allowed: (0..4).collect(),
             memory: room.memory,
             runnable: room.runnable,
+            hashes: room.hashes,
             tokens_per_cpu: room.tokens_per_cpu,
             calibration_seconds: 4,
             decay: Decay::default(),
@@ -2307,12 +2392,12 @@ mod test {
     fn remote_box(calib_us: u64, cpus: u32, free: u32, version: u64) -> (NPath, BoxState) {
         let toolchains = vec![Toolchain { key: "c h".into(), targets: vec!["h".into()] }];
         let classes = vec![ClassState { rate: rate(calib_us), cpus, free, frees_in_ms: (free > 0).then_some(0) }];
-        let state = BoxState { profile: "default".into(), version, toolchains, load_c: 0, classes };
+        let state = BoxState { profile: "default".into(), version, toolchains, cache_gb: 16, load_c: 0, classes };
         (NPath::from("/farm/b/jobs"), state)
     }
 
     fn want() -> Option<Want> {
-        Some(Want { key: "c h".into(), target: None, links: false })
+        Some(Want { key: "c h".into(), target: None, reads: Reads::Metadata, cwd: "/".into() })
     }
 
     #[tokio::test]
@@ -2376,10 +2461,10 @@ mod test {
     async fn remote_needs_a_matching_toolchain_and_a_free_slot() -> Result<()> {
         let h = Harness::start("nomatch", vec![class(1000, &[0, 1])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;
         h.tx.send(Msg::Farm { name: "full".into(), state: Some(remote_box(200, 4, 0, 1)) })?;
-        let other = Some(Want { key: "other h".into(), target: None, links: false });
+        let other = Some(Want { key: "other h".into(), target: None, reads: Reads::Metadata, cwd: "/".into() });
         h.farm(remote_box(200, 4, 4, 1));
         assert!(matches!(admitted(h.submit_with("big", other)).await?, Admission::Slot(_)));
-        let target = Some(Want { key: "c h".into(), target: Some("wasm32".into()), links: false });
+        let target = Some(Want { key: "c h".into(), target: Some("wasm32".into()), ..want().unwrap() });
         assert!(matches!(admitted(h.submit_with("big", target)).await?, Admission::Slot(_)));
         Ok(())
     }
@@ -2489,7 +2574,7 @@ mod test {
         let memory =
             Box::new(move || Ok(BoxMemory { capacity_kb: 1000, used_kb: used.load(Ordering::Relaxed) }));
         let costs = [("small", 10, 100), ("big", 10, 600)];
-        let room = Room { memory, tokens_per_cpu: 1., runnable: Box::new(|| Ok(0)) };
+        let room = Room { memory, runnable: Box::new(|| Ok(0)), ..room(0) };
         let h = Harness::start_with("others", vec![class(1000, &[0, 1, 2, 3])], room, &costs, &[])?;
         let small = slot(h.submit("small")).await?;
         let mut big = h.submit("big");
@@ -2590,7 +2675,7 @@ mod test {
         let ran = Ran { wall_us, maxrss_kb: 1, front: None };
         let measured = Measured { tokens_us: wall_us, load_c: 0 };
         let transfer = Transfer { sent_kb: 1, copy_ms, links: false };
-        r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us: 0, transfer }));
+        r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us: 0, transfer, kept: vec![] }));
         while let Ok(msg) = rx.try_recv() {
             s.handle(msg).unwrap();
         }
@@ -2651,6 +2736,51 @@ mod test {
         drop(s);
         fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_goes_to_the_box_that_holds_its_inputs() -> Result<()> {
+        let dir = scratch("follow-inputs");
+        let hashes = Arc::new(Hashes::default());
+        let room = Room { hashes: hashes.clone(), ..room(u64::MAX) };
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], room, &[], &[])?;
+        // Below the job, 50 MB of metadata, which c holds and b doesn't.
+        let meta = dir.join("libdep.rmeta");
+        std::fs::File::create(&meta)?.set_len(50 << 20)?;
+        let (hash, len) = hashes.get(&meta)?;
+        s.graph.record(&unit("dep", &[]));
+        let mut job = unit("job", &[]);
+        job.deps = vec![crate::protocol::Dep { id: "dep".into(), file: Some(meta.to_str().unwrap().into()) }];
+        // 5 s here, 1 s on b or c.
+        history(&mut s, "job", 5_000_000, 100);
+        for (name, jobs) in [("b", "/farm/b/jobs"), ("c", "/farm/c/jobs")] {
+            let (_, state) = remote_box(200, 4, 4, 1);
+            s.farm(name.into(), Some((NPath::from(jobs), state)));
+        }
+        s.remotes[1].held.used(&[(hash, len.div_ceil(1024))], 16 << 20);
+        let (reply, mut rx) = oneshot::channel();
+        s.submit(job, 1, want(), reply);
+        for w in &mut s.queue {
+            w.since -= GATHER;
+        }
+        s.dispatch();
+        match rx.try_recv() {
+            Ok(Admission::Remote(r)) => assert_eq!(r.jobs, NPath::from("/farm/c/jobs")),
+            _ => bail!("not sent"),
+        }
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn what_a_box_holds_is_kept_to_its_cache_size_least_recently_used_first() {
+        let h = |n: u8| Hash([n; 32]);
+        let mut held = Held::default();
+        held.used(&[(h(1), 40), (h(2), 40)], 100);
+        held.used(&[(h(1), 40)], 100);
+        held.used(&[(h(3), 40)], 100);
+        assert_eq!(held.missing_kb(&[(Some(h(1)), 40), (Some(h(2)), 40), (Some(h(3)), 40), (None, 5)]), 45);
     }
 
     #[tokio::test]
@@ -3056,7 +3186,8 @@ mod test {
             bail!("not sent remote");
         };
         let transfer = Transfer { sent_kb: 300, copy_ms: 40, links: false };
-        r.finish(RemoteOutcome::Done(SentRun { ran: ran(), measured: Measured::default(), linker_waited_us: 0, transfer }));
+        let measured = Measured::default();
+        r.finish(RemoteOutcome::Done(SentRun { ran: ran(), measured, linker_waited_us: 0, transfer, kept: vec![] }));
         let st = h.status().await;
         let unit = |key: &str| st.units.iter().find(|u| u.key == key).unwrap();
         let runs = |key: &str| {

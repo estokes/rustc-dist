@@ -94,6 +94,18 @@ pub struct Staged {
     blobs: HashMap<Hash, ArcStr>,
 }
 
+impl Staged {
+    /// The crate files among its inputs, by hash with their size in kB.
+    fn crates(&self) -> impl Iterator<Item = (Hash, u64)> + '_ {
+        let late = self.late.iter().flat_map(|l| &l.rlibs).flat_map(|r| {
+            let meta = Path::new(r.path.as_str()).with_extension("rmeta");
+            [(r.hash, PathBuf::from(r.path.as_str())), (r.meta, meta)]
+        });
+        let files = self.files.iter().filter(|f| kept(&f.path)).map(|f| (f.hash, PathBuf::from(f.path.as_str())));
+        files.chain(late).filter_map(|(hash, path)| Some((hash, fs::metadata(path).ok()?.len().div_ceil(1024))))
+    }
+}
+
 /// `p` made absolute against `cwd`, with `.` and `..` resolved.
 pub fn absolute(cwd: &Path, p: &str) -> PathBuf {
     let mut out = PathBuf::from("/");
@@ -150,6 +162,38 @@ fn utf8(path: &Path) -> Result<ArcStr> {
     path.to_str().map(ArcStr::from).with_context(|| format_compact!("{} is not utf-8", path.display()))
 }
 
+/// Whether a server keeps the file at `path`, an output or an input, in
+/// its store: crate files, which later jobs read.
+pub fn kept(path: &str) -> bool {
+    [".rlib", ".rmeta", ".so"].iter().any(|ext| path.ends_with(ext))
+}
+
+/// What a job sends of a crate below it.
+pub enum CrateFiles {
+    One(PathBuf),
+    /// The rlib, which may come late, and the metadata that stands in for
+    /// it until then.
+    Late { rlib: PathBuf, meta: PathBuf },
+}
+
+/// What a job that reads `reads` sends of the crate named by `path`, its
+/// `.rmeta`, `.rlib` or `.so`. A job that links reads the rlib, which may
+/// come late if there is metadata to stand in for it.
+pub fn crate_files(path: PathBuf, reads: &Reads) -> CrateFiles {
+    let rlib = match path.extension() {
+        Some(e) if e == "rmeta" || e == "rlib" => path.with_extension("rlib"),
+        _ => return CrateFiles::One(path),
+    };
+    match reads {
+        Reads::Metadata => CrateFiles::One(path),
+        Reads::Rlibs => CrateFiles::One(rlib),
+        Reads::RlibsToLink { .. } => {
+            let meta = rlib.with_extension("rmeta");
+            if meta.is_file() { CrateFiles::Late { rlib, meta } } else { CrateFiles::One(rlib) }
+        }
+    }
+}
+
 struct Collect<'a> {
     hashes: &'a Hashes,
     files: Vec<FileEntry>,
@@ -189,22 +233,11 @@ impl<'a> Collect<'a> {
         Ok(())
     }
 
-    /// A crate below the job, named by its `.rmeta`, `.rlib` or `.so`. A
-    /// job that links reads the rlib, which may come late if there is
-    /// metadata to stand in for it.
+    /// A crate below the job: see `crate_files`.
     fn krate(&mut self, path: PathBuf, reads: &Reads) -> Result<()> {
-        let rlib = match path.extension() {
-            Some(e) if e == "rmeta" || e == "rlib" => path.with_extension("rlib"),
-            _ => return self.file(path),
-        };
-        match reads {
-            Reads::Metadata => self.file(path),
-            Reads::Rlibs => self.file(rlib),
-            Reads::RlibsToLink { .. } => {
-                let meta = rlib.with_extension("rmeta");
-                if !meta.is_file() {
-                    return self.file(rlib);
-                }
+        match crate_files(path, reads) {
+            CrateFiles::One(path) => self.file(path),
+            CrateFiles::Late { rlib, meta } => {
                 if !self.seen.insert(rlib.clone()) {
                     return Ok(());
                 }
@@ -336,12 +369,14 @@ pub enum Outcome {
     Exit { code: i32, ran: Ran, measured: Measured, moved: Moved },
 }
 
-/// How rustc ended on the server.
+/// How rustc ended on the server, and the crate files it built there, by
+/// hash with their size in kB.
 struct Exited {
     code: i32,
     ran: Ran,
     linker_waited_us: u64,
     measured: Measured,
+    built: Vec<(Hash, u64)>,
 }
 
 /// What moving a job's files took that compiling didn't.
@@ -350,6 +385,9 @@ pub struct Moved {
     pub bytes: u64,
     /// How long the linker waited for rlibs still on their way.
     pub linker_waited_us: u64,
+    /// The crate files the server holds after the job, by hash with their
+    /// size in kB: its inputs, and the libraries it built.
+    pub kept: Vec<(Hash, u64)>,
 }
 
 /// Run a staged job on the box listening at `jobs`. `sink` gets rustc's
@@ -400,7 +438,7 @@ pub async fn run(
     });
     let mut receiving = pin!(receive(&con, &jobs, staged, hashes, &mut sink));
     let mut sending_done = false;
-    let Exited { code, ran, linker_waited_us, measured } = loop {
+    let Exited { code, ran, linker_waited_us, measured, built } = loop {
         tokio::select! {
             exit = &mut receiving => break exit.context("receiving outputs")?,
             r = &mut sending, if !sending_done => {
@@ -416,7 +454,8 @@ pub async fn run(
             }
         }
     };
-    let moved = Moved { bytes: sent.load(Ordering::Relaxed), linker_waited_us };
+    let kept = staged.crates().chain(built).collect();
+    let moved = Moved { bytes: sent.load(Ordering::Relaxed), linker_waited_us, kept };
     Ok(Outcome::Exit { code, ran, measured, moved })
 }
 
@@ -442,6 +481,7 @@ struct Writing {
     tmp: PathBuf,
     file: File,
     hasher: blake3::Hasher,
+    len: u64,
 }
 
 /// The server's next message. A send that finds the channel closed marks
@@ -463,6 +503,7 @@ async fn receive(
     sink: &mut impl FnMut(Event) -> Result<()>,
 ) -> Result<Exited> {
     let mut writing: Option<Writing> = None;
+    let mut built = Vec::new();
     loop {
         match next(con).await? {
             FromServer::Output { path, mode, data, last } => {
@@ -473,16 +514,21 @@ async fn receive(
                     }
                     let tmp = dest.with_extension(format_compact!("rustc-dist-{}", std::process::id()).as_str());
                     let file = File::create(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?;
-                    writing = Some(Writing { dest, tmp, file, hasher: blake3::Hasher::new() });
+                    writing = Some(Writing { dest, tmp, file, hasher: blake3::Hasher::new(), len: 0 });
                 }
                 let w = writing.as_mut().ok_or_else(|| anyhow!("no output open"))?;
                 w.file.write_all(&data)?;
                 w.hasher.update(&data);
+                w.len += data.len() as u64;
                 if last {
                     let w = writing.take().expect("open");
                     w.file.set_permissions(fs::Permissions::from_mode(mode))?;
                     fs::rename(&w.tmp, &w.dest).with_context(|| format_compact!("writing {}", w.dest.display()))?;
-                    hashes.insert(&w.dest, Hash(*w.hasher.finalize().as_bytes()))?;
+                    let hash = Hash(*w.hasher.finalize().as_bytes());
+                    hashes.insert(&w.dest, hash)?;
+                    if kept(path.as_str()) {
+                        built.push((hash, w.len.div_ceil(1024)));
+                    }
                 }
             }
             FromServer::Stderr(line) => {
@@ -491,7 +537,7 @@ async fn receive(
             }
             FromServer::Stdout(data) => sink(Event::Stdout(data))?,
             FromServer::Exit { code, ran, linker_waited_us, measured } => {
-                return Ok(Exited { code, ran, linker_waited_us, measured });
+                return Ok(Exited { code, ran, linker_waited_us, measured, built });
             }
             FromServer::Failed(why) => bail!("{jobs}: {why}"),
             m => bail!("{jobs}: unexpected {m:?}"),

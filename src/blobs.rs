@@ -96,6 +96,15 @@ impl Hashes {
         Ok((hash, stamp.len))
     }
 
+    /// The size of the file at `path` and, if it was hashed since it last
+    /// changed, its hash; none if there is no such file. It reads no file.
+    pub fn known(&self, path: &Path) -> Option<(Option<Hash>, u64)> {
+        let meta = fs::metadata(path).ok().filter(|m| m.is_file())?;
+        let stamp = Stamp::of(&meta);
+        let hash = self.0.lock().get(path).filter(|(s, _)| *s == stamp).map(|(_, h)| *h);
+        Some((hash, stamp.len))
+    }
+
     /// The hash of a file just written, so it needn't be read again.
     pub fn insert(&self, path: &Path, hash: Hash) -> Result<()> {
         let meta = fs::metadata(path).with_context(|| format_compact!("stat {}", path.display()))?;

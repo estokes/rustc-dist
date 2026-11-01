@@ -36,8 +36,8 @@ const LIST_EVERY: Duration = Duration::from_secs(1);
 /// The status columns a box's state is published in. A change updates the
 /// columns it touches in one batch, which subscribers get whole, so a box
 /// never sees half of another's state.
-pub const STATE: [&str; 8] =
-    ["profile", "version", "toolchains", "load", "cpus", "class GIPS", "free", "frees in ms"];
+pub const STATE: [&str; 9] =
+    ["profile", "version", "toolchains", "cache GB", "load", "cpus", "class GIPS", "free", "frees in ms"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pack)]
 pub struct ClassState {
@@ -61,6 +61,8 @@ pub struct BoxState {
     /// answer to an offer names the first version that reflects it.
     pub version: u64,
     pub toolchains: Vec<Toolchain>,
+    /// How many GB of crate files it keeps for later jobs.
+    pub cache_gb: u64,
     /// Runnable tasks per CPU, in hundredths.
     pub load_c: u32,
     pub classes: Vec<ClassState>,
@@ -73,6 +75,7 @@ impl BoxState {
             self.profile.clone().into(),
             self.version.into(),
             self.toolchains.iter().map(|t| (t.key.clone(), t.targets.clone())).collect::<Vec<_>>().into(),
+            self.cache_gb.into(),
             (self.load_c as f64 / 100.).into(),
             per_class(|c| i64::from(c.cpus).into()),
             per_class(|c| (c.rate as f64 / 1000.).into()),
@@ -82,7 +85,7 @@ impl BoxState {
     }
 
     fn from_columns(columns: &[Value]) -> Result<Self> {
-        let [profile, version, toolchains, load, cpus, rates, free, frees_in] = columns else {
+        let [profile, version, toolchains, cache_gb, load, cpus, rates, free, frees_in] = columns else {
             bail!("{} state columns", columns.len());
         };
         fn cast<T: FromValue>(v: &Value) -> Result<T> {
@@ -116,6 +119,7 @@ impl BoxState {
             profile: cast(profile)?,
             version: cast(version)?,
             toolchains: toolchains.into_iter().map(|(key, targets)| Toolchain { key, targets }).collect(),
+            cache_gb: cast(cache_gb)?,
             load_c: (load * 100.).round().clamp(0., u32::MAX as f64) as u32,
             classes,
         })
@@ -179,6 +183,7 @@ pub struct Member {
     pub base: Path,
     pub name: ArcStr,
     pub toolchains: Vec<Toolchain>,
+    pub cache_gb: u64,
 }
 
 /// Another box being watched: its state columns as they last arrived.
@@ -205,6 +210,7 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
         profile: load.profile.clone(),
         version: load.version,
         toolchains: m.toolchains.clone(),
+        cache_gb: m.cache_gb,
         load_c: load.load_c,
         classes: load.classes.clone(),
     };
@@ -319,6 +325,7 @@ mod test {
             profile: "default".into(),
             version,
             toolchains: vec![Toolchain { key: "c h".into(), targets: vec!["h".into(), "wasm32".into()] }],
+            cache_gb: 64,
             load_c: 37,
             classes: vec![
                 ClassState { rate: 6960, cpus: 30, free, frees_in_ms: None },
@@ -342,7 +349,7 @@ mod test {
         let s = state(7, 0);
         assert_eq!(BoxState::from_columns(&s.columns()).unwrap(), s);
         let mut short = s.columns();
-        short[6] = Value::from(vec![1i64]);
+        short[7] = Value::from(vec![1i64]);
         assert!(BoxState::from_columns(&short).is_err());
     }
 
@@ -356,6 +363,7 @@ mod test {
             base: base.clone(),
             name: name.into(),
             toolchains: state(0, 0).toolchains,
+            cache_gb: 64,
         };
         let load = |version, free| {
             let s = state(version, free);

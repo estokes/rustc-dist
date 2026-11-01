@@ -55,6 +55,7 @@ async fn server(dir: &Path) -> Result<ServerBox> {
         allowed,
         memory: Box::new(|| sys::box_memory(0.5)),
         runnable: Box::new(sys::runnable),
+        hashes: triomphe::Arc::new(Hashes::default()),
         tokens_per_cpu: 1.5,
         calibration_seconds: 4,
         decay: Decay::default(),
@@ -357,7 +358,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     let lib_crates: Vec<ArcStr> = unit.deps.iter().filter_map(|d| d.file.clone()).collect();
     let hashes = Hashes::default();
     let (outcome, events) = send(&b, &lib, &lib_crates, &hashes, None).await?;
-    let Outcome::Exit { code: 0, ran, measured, .. } = outcome else { bail!("remote rustc failed") };
+    let Outcome::Exit { code: 0, ran, measured, moved } = outcome else { bail!("remote rustc failed") };
     let front = ran.front.context("app prints an .rmeta line")?;
     assert!(0 < front.wall_us && front.wall_us < ran.wall_us, "{ran:?}");
     // It held its one token at least from when rustc started to its exit,
@@ -372,6 +373,14 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     }
     let dep_info = fs::read_to_string(deps.join("app-a1.d"))?;
     assert!(dep_info.contains("app/src/data.txt"), "{dep_info}");
+    // The server holds the crate files it read and the ones it built.
+    let cwd = Path::new(lib.0.cwd.as_str());
+    let read = lib_crates.iter().map(|c| remote::absolute(cwd, c));
+    for f in read.chain([deps.join("libapp-a1.rlib"), deps.join("libapp-a1.rmeta")]) {
+        let (hash, len) = hashes.get(&f)?;
+        assert!(moved.kept.contains(&(hash, len.div_ceil(1024))), "{} is held", f.display());
+    }
+    assert!(!moved.kept.iter().any(|(h, _)| *h == hashes.get(&deps.join("app-a1.d")).unwrap().0), "dep-info isn't");
     // Everything is in the store now, outputs too, so a second run sends
     // nothing and builds the same outputs.
     let blobs = blob_count(&b.store_dir);

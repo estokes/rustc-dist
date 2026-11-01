@@ -2,7 +2,7 @@ use crate::{
     blobs::{self, Hash, Store, Upload},
     link::{self, Gate},
     protocol::{self, Front, Ran},
-    remote::{CHUNK, FileEntry, FromServer, Late, Rlib, SYSTEM, ToServer},
+    remote::{self, CHUNK, FileEntry, FromServer, Late, Rlib, SYSTEM, ToServer},
     sched::{Answer, Msg, Slot},
     sys,
     toolchain::Installed,
@@ -519,7 +519,7 @@ async fn send_artifact(con: &Connection, store: &Store, root: &Path, line: &[u8]
             break;
         }
     }
-    if [".rlib", ".rmeta", ".so"].iter().any(|ext| path.ends_with(ext)) {
+    if remote::kept(&path) {
         store.adopt(&host, &Hash(*hasher.finalize().as_bytes()))?;
     }
     Ok(())

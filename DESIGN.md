@@ -273,13 +273,29 @@ scale.
 
 A sent run's time is everything the client waits for, from offering the job to
 its last output. Its part other than compiling (staging and sending inputs,
-the linker waiting for late rlibs, receiving outputs) is its own term,
-predicted from the unit's own recent sends to that place, else those of every
-job there that links as it does or doesn't (a job that links sends every rlib
-below it, so its sends take far longer), else 200 ms, and added in full. Its weights halve every `copy_half_life_s`, an hour
-by default, since the network a laptop is on changes as it moves. The server reports the token-µs and load it
-measured, counted from when rustc started, so time waiting for inputs isn't
-counted as the job's.
+the linker waiting for late rlibs, receiving outputs) is its own term, added
+in full. It depends most on the bytes the box lacks, so a job whose inputs the
+box already holds, such as crates it just built, is cheap to send there:
+
+- At submit, the client finds the crate files the job would send (its
+  `.rmeta`s, or the rlibs a job that links reads) with their sizes, and their
+  hashes where it took them since the files last changed. It reads no file.
+- For each box it keeps a view of the crate files the box holds: what jobs
+  sent there read and the libraries they built there, which the server keeps,
+  trimmed least recently used first to the cache size the box publishes, as
+  the server trims its store. A file whose hash isn't known counts as
+  missing everywhere.
+- The term is the unit's own sends to that place on average, else those of
+  every job there that links as it does or doesn't (a job that links sends
+  every rlib below it), else a guess of 200 ms, adjusted for the kB the box
+  lacks now against the kB those sends moved, at the µs per kB a line through
+  the sends there shows, drawn toward 50 MB/s as much as one send 100 MB from
+  their mean would draw it.
+
+Its weights halve every `copy_half_life_s`, an hour by default, since the
+network a laptop is on changes as it moves. The server reports the token-µs and
+load it measured, counted from when rustc started, so time waiting for inputs
+isn't counted as the job's.
 
 The table is per daemon, persisted under `$XDG_STATE_HOME` (`jobs.hdr`). Its
 key is crate name plus the `-C metadata` hash, cargo's identity for a unit
@@ -417,7 +433,7 @@ work, so build times say nothing yet; placement is all that was checked.
 ### Farm
 
 A daemon whose config has `base` (say `/build`) joins the farm. The farm's
-netidx namespace is under the protocol version, `BASE/vN` (`/build/v13`), so
+netidx namespace is under the protocol version, `BASE/vN` (`/build/v14`), so
 boxes of different versions never see each other:
 
 - `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
@@ -433,8 +449,9 @@ daemon and its clients: changing any of them bumps it. A daemon that a client
 of another version connects to exits, so systemd starts the binary that
 client came from.
 
-A box's state is eight columns of its status row, each its own value:
-`profile`, `version` (a counter), `toolchains`, `load` (runnable
+A box's state is nine columns of its status row, each its own value:
+`profile`, `version` (a counter), `toolchains`, `cache GB` (what its store
+keeps), `load` (runnable
 tasks per CPU), and per class (as arrays) `cpus`, `class GIPS` (calibrated G
 instructions/s), `free` tokens, and `frees in ms`, until its next token is
 predicted to free. A change updates the columns it touches in
@@ -482,7 +499,7 @@ class shows its speed idle and at the load now, this box's jobs, other boxes'
 jobs and free tokens; heavy jobs, their threads and each one's speed now;
 each other box, its load, its classes' and threads' speeds as this box has
 learned them, the time jobs sent there spend moving files, for libraries and
-for jobs that link, and its free tokens. Every unit the box has run is listed with its rank and work in
+for jobs that link, the MB per second its sends moved at, and its free tokens. Every unit the box has run is listed with its rank and work in
 seconds on one thread of the fastest class idle, its front end's share, its
 width, its predicted time here now and its measured wall time, and runs split
 three ways: this box's builds run here, this box's builds run elsewhere, and
@@ -807,10 +824,8 @@ plan's main points, and where the build went past it:
   counts instructions to compare CPUs, and boxes publish calibrated rates as
   starting factors.
 
-Open: a unit's recent sends mix runs that sent 345 MB with runs that sent
-nothing. The client could instead track what it has sent each box and predict
-from the bytes this run would send and the link's measured throughput. Start
-with the per-unit average and see how far off it is.
+A unit's recent sends mixed runs that sent 345 MB with runs that sent
+nothing, so a send is now priced by the bytes the box lacks (see Cost).
 
 Open: placing a job also slows the jobs already on the box. The curves could
 predict that too, but at first a prediction covers only the job being placed.

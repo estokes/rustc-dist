@@ -44,7 +44,7 @@ struct Ctx {
     tx: mpsc::UnboundedSender<Msg>,
     stop: mpsc::Sender<()>,
     keys: Keys,
-    hashes: Hashes,
+    hashes: triomphe::Arc<Hashes>,
     /// Present when this box is part of a farm.
     subscriber: Option<Subscriber>,
     remote_links: bool,
@@ -69,6 +69,7 @@ pub async fn run() -> Result<()> {
     remove_stale_fifos(&dir);
     let state_dir = config::state_dir();
     let profile = classes::current(&state_dir);
+    let hashes = triomphe::Arc::new(Hashes::default());
     let setup = Setup {
         state_dir,
         fifo_dir: dir,
@@ -78,6 +79,7 @@ pub async fn run() -> Result<()> {
             Box::new(move || sys::box_memory(share))
         },
         runnable: Box::new(sys::runnable),
+        hashes: hashes.clone(),
         tokens_per_cpu: cfg.tokens_per_cpu,
         calibration_seconds: cfg.calibration_seconds,
         decay: cfg.decay(),
@@ -101,7 +103,7 @@ pub async fn run() -> Result<()> {
         tx: tx.clone(),
         stop: stop_tx,
         keys: Keys::default(),
-        hashes: Hashes::default(),
+        hashes,
         subscriber,
         remote_links: cfg.remote_links,
     });
@@ -178,7 +180,14 @@ async fn join(
             error!("no longer publishing status: {e:#}");
         }
     });
-    let member = Member { publisher: publisher.clone(), subscriber: subscriber.clone(), base, name, toolchains };
+    let member = Member {
+        publisher: publisher.clone(),
+        subscriber: subscriber.clone(),
+        base,
+        name,
+        toolchains,
+        cache_gb: cfg.cache_gb,
+    };
     tokio::spawn(async move {
         if let Err(e) = farm::run(member, load, tx).await {
             error!("left the farm: {e:#}");
@@ -313,10 +322,11 @@ async fn compile(
     let mut filter_metadata = false;
     let mut failed_remotely = false;
     loop {
-        let remote = want.clone().map(|key| Want {
+        let remote = want.clone().zip(job.as_ref()).map(|(key, j)| Want {
             key,
-            target: job.as_ref().and_then(|j| j.target.clone()),
-            links: job.as_ref().is_some_and(|j| j.reads != Reads::Metadata),
+            target: j.target.clone(),
+            reads: j.reads.clone(),
+            cwd: j.cwd.clone(),
         });
         let Some(admission) = admit(&mut sock, ctx, unit.clone(), build, remote).await? else {
             return Ok(());
@@ -428,7 +438,7 @@ async fn run_remote(
     }
     drop(handle);
     match outcome {
-        Ok(Outcome::Exit { code: 0, ran, measured, moved: Moved { bytes, linker_waited_us } }) => {
+        Ok(Outcome::Exit { code: 0, ran, measured, moved: Moved { bytes, linker_waited_us, kept } }) => {
             for (stderr, data) in held {
                 protocol::send_async(sock, buf, &Reply::Output { stderr, data }).await?;
             }
@@ -445,7 +455,7 @@ async fn run_remote(
                 transfer.sent_kb,
                 linker_waited_us / 1000
             );
-            r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer }));
+            r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer, kept }));
             Ok(Remote::Done)
         }
         Ok(Outcome::Busy { version }) => {

@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 13;
+pub const PROTOCOL: u32 = 14;
 const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under
@@ -194,6 +194,9 @@ pub struct BoxStatus {
     /// on average, and one that links, sending every rlib below it.
     pub library_copy_ms: Option<u64>,
     pub link_copy_ms: Option<u64>,
+    /// The MB per second sends there of jobs that link moved at, as this box
+    /// has learned it, or guesses before any.
+    pub mb_per_s: u32,
     /// Jobs this box has running there.
     pub sent: u32,
 }
