@@ -15,7 +15,7 @@ use crate::{
 use anyhow::{Context, Result};
 use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
-use compact_str::format_compact;
+use compact_str::{CompactString, format_compact};
 use log::{Level, debug, error, info, log_enabled, warn};
 use netidx::path::Path as NPath;
 use netidx_core::atomic_id;
@@ -86,6 +86,7 @@ atomic_id!(JobId);
 
 /// What a job needs to run on another box: a toolchain, how it reads the
 /// crates below it, and the directory their paths are relative to.
+#[derive(Clone)]
 pub struct Want {
     pub key: ArcStr,
     pub target: Option<ArcStr>,
@@ -94,7 +95,8 @@ pub struct Want {
 }
 
 pub enum Msg {
-    Submit { unit: Unit, build: u32, remote: Option<Want>, reply: oneshot::Sender<Admission> },
+    /// `remote` is where it may go besides here, or why nowhere.
+    Submit { unit: Unit, build: u32, remote: Result<Want, &'static str>, reply: oneshot::Sender<Admission> },
     /// With how long its linker waited for files still on their way.
     Finished { job: JobId, unit: Unit, ran: Option<(Ran, u64)> },
     /// A job's processes are `pid` and its descendants.
@@ -741,7 +743,8 @@ struct Waiting {
     build: u32,
     pred: Prediction,
     rank_mi: u64,
-    portable: Option<Portable>,
+    /// Where it may go besides here, or why nowhere.
+    portable: Result<Portable, CompactString>,
     since: Instant,
     reply: oneshot::Sender<Admission>,
 }
@@ -1135,7 +1138,16 @@ impl Sched {
                 }
             }
             Msg::RemoteDone { job, unit, outcome } => self.remote_done(job, &unit, outcome),
-            Msg::Mismatch { unit } => *self.mismatches.entry(unit.exact).or_default() += 1,
+            Msg::Mismatch { unit } => {
+                let n = self.mismatches.entry(unit.exact.clone()).or_default();
+                *n += 1;
+                if *n == PIN_AFTER {
+                    info!(
+                        "keeping {} here until the daemon restarts: it failed on another box and then built here {n} times",
+                        unit.exact
+                    );
+                }
+            }
             Msg::Farm { name, state } => self.farm(name, state),
             Msg::Status { reply } => {
                 let _ = reply.send(self.status());
@@ -1157,17 +1169,21 @@ impl Sched {
         Ok(true)
     }
 
-    fn submit(&mut self, unit: Unit, build: u32, remote: Option<Want>, reply: oneshot::Sender<Admission>) {
+    fn submit(&mut self, unit: Unit, build: u32, remote: Result<Want, &'static str>, reply: oneshot::Sender<Admission>) {
         self.graph.record(&unit);
         let rank_mi = self.graph.rank(&unit.id, &self.stats);
         let pred = self.stats.predict(&unit.exact, &unit.coarse);
         let pinned = self.mismatches.get(&unit.exact).is_some_and(|n| *n >= PIN_AFTER);
         let portable = match remote {
-            Some(Want { key, target, reads, cwd }) if !pinned => self.graph.inputs(&unit.deps).map(|crates| {
-                let inputs = inputs(&self.setup.hashes, &cwd, &crates, &reads);
-                Portable { key, target, crates, links: reads != Reads::Metadata, inputs }
-            }),
-            _ => None,
+            Err(why) => Err(why.into()),
+            Ok(_) if pinned => Err(format_compact!("it failed on another box and then built here {PIN_AFTER} times")),
+            Ok(Want { key, target, reads, cwd }) => match self.graph.inputs(&unit.deps) {
+                Ok(crates) => {
+                    let inputs = inputs(&self.setup.hashes, &cwd, &crates, &reads);
+                    Ok(Portable { key, target, crates, links: reads != Reads::Metadata, inputs })
+                }
+                Err(id) => Err(format_compact!("{id}, a crate below it, was never seen compiling")),
+            },
         };
         self.queue.push(Waiting { unit, build, pred, rank_mi, portable, since: Instant::now(), reply });
     }
@@ -1583,9 +1599,9 @@ impl Sched {
             let fastest_pred = self.stats.predict_at(&w.unit.exact, &w.unit.coarse, fastest_at).0;
             let fastest_us = self.stats.time_us(&fastest_pred, fastest_at, load_here, 1.);
             let away = match &w.portable {
-                None => Err("it can't go to another box"),
-                Some(p) if !w.pred.known || waits_here || fastest_us >= REMOTE_MIN_US => Ok(p),
-                Some(_) => Err("it is short and a token is free here"),
+                Err(why) => Err(why.as_str()),
+                Ok(p) if !w.pred.known || waits_here || fastest_us >= REMOTE_MIN_US => Ok(p),
+                Ok(_) => Err("it is short and a token is free here"),
             };
             let links = away.is_ok_and(|p| p.links);
             cands.clear();
@@ -2415,14 +2431,14 @@ mod test {
             Ok(Self { tx, dir, load })
         }
 
-        fn submit_with(&self, name: &str, remote: Option<Want>) -> oneshot::Receiver<Admission> {
+        fn submit_with(&self, name: &str, remote: Result<Want, &'static str>) -> oneshot::Receiver<Admission> {
             let (reply, rx) = oneshot::channel();
             self.tx.send(Msg::Submit { unit: unit(name, &[]), build: 1, remote, reply }).unwrap();
             rx
         }
 
         fn submit(&self, name: &str) -> oneshot::Receiver<Admission> {
-            self.submit_with(name, None)
+            self.submit_with(name, Err("the wrapper keeps it here"))
         }
 
         fn profile(&self, name: &str) {
@@ -2550,8 +2566,8 @@ mod test {
         (NPath::from("/farm/b/jobs"), state)
     }
 
-    fn want() -> Option<Want> {
-        Some(Want { key: "c h".into(), target: None, reads: Reads::Metadata, cwd: "/".into() })
+    fn want() -> Result<Want, &'static str> {
+        Ok(Want { key: "c h".into(), target: None, reads: Reads::Metadata, cwd: "/".into() })
     }
 
     #[tokio::test]
@@ -2615,10 +2631,10 @@ mod test {
     async fn remote_needs_a_matching_toolchain_and_a_free_slot() -> Result<()> {
         let h = Harness::start("nomatch", vec![class(1000, &[0, 1])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;
         h.tx.send(Msg::Farm { name: "full".into(), state: Some(remote_box(200, 4, 0, 1)) })?;
-        let other = Some(Want { key: "other h".into(), target: None, reads: Reads::Metadata, cwd: "/".into() });
+        let other = Ok(Want { key: "other h".into(), target: None, reads: Reads::Metadata, cwd: "/".into() });
         h.farm(remote_box(200, 4, 4, 1));
         assert!(matches!(admitted(h.submit_with("big", other)).await?, Admission::Slot(_)));
-        let target = Some(Want { key: "c h".into(), target: Some("wasm32".into()), ..want().unwrap() });
+        let target = Ok(Want { key: "c h".into(), target: Some("wasm32".into()), ..want().unwrap() });
         assert!(matches!(admitted(h.submit_with("big", target)).await?, Admission::Slot(_)));
         Ok(())
     }
@@ -2940,7 +2956,7 @@ mod test {
         let (reply, _rx) = oneshot::channel();
         s.submit(unit("job", &[]), 1, want(), reply);
         let (reply, _rx) = oneshot::channel();
-        s.submit(unit("stays", &[]), 1, None, reply);
+        s.submit(unit("stays", &[]), 1, Err("the wrapper keeps it here"), reply);
         let cand = |start_us, copy_us, run_us, place, basis| Cand {
             start_us,
             copy_us,
@@ -2954,7 +2970,7 @@ mod test {
         let b = Place::Remote { remote: 0, class: None, shown_in: None };
         let cands = [cand(0, 0, 5_000_000, here, Basis::Place), cand(250_000, 400_000, 1_000_000, b, Basis::Size)];
         let (job, stays) = (&s.queue[0], &s.queue[1]);
-        let away = job.portable.as_ref().context("portable")?;
+        let away = job.portable.as_ref().map_err(|why| anyhow::anyhow!("{why}"))?;
         assert_eq!(
             s.placement(job, 1_000_000, true, Ok(away), &cands, 1).as_str(),
             "job (never ran; 1.00 s on one thread of the fastest class here): here/all 0.00+0.00+5.00 [own] \
@@ -2965,6 +2981,29 @@ mod test {
             "stays (never ran; 1.00 s on one thread of the fastest class here): *b/all 0.25+0.40+1.00 [est]; \
              not here: its memory doesn't fit; no other box: it can't go to another box"
         );
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_that_cant_go_to_another_box_says_why() -> Result<()> {
+        let dir = scratch("why-here");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], room(u64::MAX), &[], &[])?;
+        let why = |s: &mut Sched, job: Unit| {
+            let (reply, _rx) = oneshot::channel();
+            s.submit(job, 1, want(), reply);
+            let w = s.queue.pop().expect("queued");
+            w.portable.err().map(|why| why.to_string())
+        };
+        let mut job = unit("job", &[]);
+        job.deps = vec![crate::protocol::Dep { id: "dep-x1".into(), file: Some("/t/libdep-x1.rmeta".into()) }];
+        assert_eq!(why(&mut s, job).as_deref(), Some("dep-x1, a crate below it, was never seen compiling"));
+        assert_eq!(why(&mut s, unit("flaky", &[])), None);
+        for _ in 0..PIN_AFTER {
+            s.handle(Msg::Mismatch { unit: unit("flaky", &[]) })?;
+        }
+        assert_eq!(why(&mut s, unit("flaky", &[])).as_deref(), Some("it failed on another box and then built here 2 times"));
         drop(s);
         fs::remove_dir_all(&dir)?;
         Ok(())
@@ -3058,7 +3097,7 @@ mod test {
             .iter()
             .map(|name| {
                 let (reply, rx) = oneshot::channel();
-                s.submit(unit(name, &[]), 1, portable.then(|| want().unwrap()), reply);
+                s.submit(unit(name, &[]), 1, if portable { want() } else { Err("the wrapper keeps it here") }, reply);
                 rx
             })
             .collect();

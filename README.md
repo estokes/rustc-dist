@@ -231,7 +231,12 @@ A job runs only on the box that started it if it:
 - links, and `remote_links` is off;
 - is named in a project's `local` list, or failed remotely and then built
   locally twice;
+- depends on a crate the daemon never saw compile, so it can't tell what to
+  send;
 - needs a toolchain no other box has.
+
+The placement log (see above) says which, and a job that fails on another box
+is logged as a warning with the box and its first error.
 
 ## Security
 

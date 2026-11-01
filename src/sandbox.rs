@@ -12,7 +12,7 @@ use arcstr::ArcStr;
 use bytes::Bytes;
 use compact_str::format_compact;
 use futures::{StreamExt, future::OptionFuture};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use netidx::{
     path::Path as NPath,
     publisher::{PublishFlags, Publisher, Value},
@@ -113,7 +113,7 @@ pub async fn listen(publisher: Publisher, path: NPath, server: Arc<Server>) -> R
                     match connected.await {
                         Ok(Ok(con)) => {
                             if let Err(e) = serve(server, con).await {
-                                debug!("a client's channel closed: {e:#}");
+                                info!("a client's channel closed: {e:#}");
                             }
                         }
                         Ok(Err(e)) => warn!("a client failed to connect: {e:#}"),
@@ -206,14 +206,16 @@ async fn take(
             bail!("no toolchain {key}");
         };
         let (answer, admitted) = oneshot::channel();
+        let exact = unit.exact.clone();
         server.tx.send(Msg::Offer { unit, class, reply: answer }).map_err(|_| anyhow!("scheduler stopped"))?;
         let Answer { slot, version } = admitted.await?;
         let Some(slot) = slot else {
             return reply.send(FromServer::Busy { version }).await;
         };
         reply.send(FromServer::Accepted { version }).await?;
-        if let Some((ran, linker_waited_us)) = job(&server, &reply, &mut inbox, tc, &slot).await? {
-            slot.finish(ran, linker_waited_us);
+        match job(&server, &reply, &mut inbox, tc, &slot).await? {
+            Some((ran, linker_waited_us)) => slot.finish(ran, linker_waited_us),
+            None => info!("{exact}, another box's job, failed here"),
         }
         Ok(())
     };

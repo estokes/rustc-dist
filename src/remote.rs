@@ -7,7 +7,7 @@ use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
 use compact_str::format_compact;
 use futures::{Stream, StreamExt, stream};
-use log::debug;
+use log::warn;
 use netidx::{path::Path as NPath, subscriber::Subscriber};
 use netidx_core::atomic_id;
 use netidx_derive::Pack;
@@ -133,7 +133,7 @@ impl Link {
                 break e;
             }
         };
-        debug!("the channel to {} failed: {e:#}", self.jobs);
+        warn!("the channel to {} failed: {e:#}", self.jobs);
         *self.exchanges.lock() = None;
     }
 
@@ -528,8 +528,9 @@ impl<'a> Collect<'a> {
 
 /// What a job reads: its sources (the files its last dep-info lists, and
 /// everything in the directories they came from, so a new module is
-/// found), its build script's output, native library directories, and
-/// `crates`, the crate files below it.
+/// found), its package's `Cargo.toml`, which proc macros read without
+/// dep-info listing it, its build script's output, native library
+/// directories, and `crates`, the crate files below it.
 pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
     let cwd = PathBuf::from(job.cwd.as_str());
     let at = |p: &str| absolute(&cwd, p);
@@ -560,6 +561,9 @@ pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
             let root = manifest.clone().context("no CARGO_MANIFEST_DIR")?;
             c.walk(&root, true)?;
         }
+    }
+    if let Some(toml) = manifest.as_ref().map(|m| m.join("Cargo.toml")).filter(|t| t.is_file()) {
+        c.file(toml)?;
     }
     for src in &job.paths.sources {
         c.file(at(src))?;
@@ -953,6 +957,39 @@ mod test {
         let staged = stage(&job, &[], &Hashes::default())?;
         let names: Vec<&str> = staged.files.iter().filter_map(|f| f.path.rsplit_once('/')).map(|(_, n)| n).collect();
         assert_eq!(names, ["lib.rs"]);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_packages_manifest_is_sent_since_proc_macros_read_it() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-manifest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a/src"))?;
+        fs::create_dir_all(dir.join("target/deps"))?;
+        fs::write(dir.join("a/src/lib.rs"), "pub fn f() {}\n")?;
+        fs::write(dir.join("a/Cargo.toml"), "[package]\nname = \"a\"\n")?;
+        let deps = dir.join("target/deps");
+        fs::write(deps.join("a-x1.d"), format!("{0}/liba-x1.rmeta: a/src/lib.rs\n", deps.display()))?;
+        let args = [
+            "rustc", "--crate-name", "a", "--crate-type", "lib", "--edition", "2021", "a/src/lib.rs",
+            "--emit=dep-info,metadata,link", "-C", "extra-filename=-x1", "--out-dir", deps.to_str().unwrap(),
+        ];
+        let Invocation::Compile(c) = argv::classify(&args, None) else { panic!("not a compile") };
+        let portable = c.portable.expect("portable");
+        let job = Job {
+            rustc: "rustc".into(),
+            args: args[1..].iter().map(|a| ArcStr::from(*a)).collect(),
+            env: vec![("CARGO_MANIFEST_DIR".into(), ArcStr::from(dir.join("a").to_str().unwrap()))],
+            cwd: ArcStr::from(dir.to_str().unwrap()),
+            target: None,
+            paths: portable.paths,
+            reads: portable.reads,
+        };
+        let staged = stage(&job, &[], &Hashes::default())?;
+        let mut names: Vec<&str> = staged.files.iter().filter_map(|f| f.path.rsplit_once('/')).map(|(_, n)| n).collect();
+        names.sort();
+        assert_eq!(names, ["Cargo.toml", "lib.rs"]);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

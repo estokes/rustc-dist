@@ -211,9 +211,9 @@ impl Graph {
     /// of indirect dependencies too. Each is found from the crate above it
     /// as this job has it, so in the job's own target directory. A proc
     /// macro's dependencies are linked into its `.so`, and rustc never loads
-    /// them. None if a crate below it was never seen compiling, so its
-    /// dependencies are unknown.
-    pub fn inputs(&self, deps: &[Dep]) -> Option<Vec<ArcStr>> {
+    /// them. A crate below it that was never seen compiling, whose
+    /// dependencies are unknown, is the error.
+    pub fn inputs(&self, deps: &[Dep]) -> Result<Vec<ArcStr>, ArcStr> {
         let mut files = Vec::new();
         let mut seen: LPooled<HashMap<ArcStr, ()>> = LPooled::take();
         let mut stack: LPooled<Vec<(ArcStr, ArcStr)>> = LPooled::take();
@@ -224,8 +224,8 @@ impl Graph {
                 continue;
             }
             if !file.ends_with(".so") {
-                let dir = file.rsplit_once('/')?.0;
-                for e in &self.nodes.get(&id)?.deps {
+                let dir = file.rsplit_once('/').map_or("", |(d, _)| d);
+                for e in &self.nodes.get(&id).ok_or_else(|| id.clone())?.deps {
                     let Some(rel) = &e.file else { continue };
                     if !seen.contains_key(&e.id) {
                         resolve(dir, rel, &mut path);
@@ -235,7 +235,7 @@ impl Graph {
             }
             files.push(file);
         }
-        Some(files)
+        Ok(files)
     }
 
     /// Every node with its rank and job key, for `status`.
@@ -381,7 +381,7 @@ mod test {
         files.sort();
         assert_eq!(files, ["/t/libitoa.rmeta", "/t/liblibc.rmeta", "/t/libregex.rmeta", "/t/libregex_syntax.rmeta"]);
         let unknown = unit("x", &["never_built"]);
-        assert!(g.inputs(&unknown.deps).is_none());
+        assert_eq!(g.inputs(&unknown.deps), Err(ArcStr::from("never_built")), "the crate never seen is named");
     }
 
     #[test]

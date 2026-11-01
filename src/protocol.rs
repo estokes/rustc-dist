@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use bytes::{BufMut, Bytes, BytesMut};
+use compact_str::{CompactString, format_compact};
 use netidx_core::pack::Pack;
 use netidx_derive::Pack;
 use serde::Deserialize;
@@ -162,6 +163,29 @@ struct Artifact {
 pub fn artifact(line: &[u8]) -> Result<ArcStr> {
     let a: Artifact = serde_json::from_slice(line).context("artifact line")?;
     Ok(a.artifact.into())
+}
+
+#[derive(Deserialize)]
+struct Diagnostic {
+    level: String,
+    message: String,
+    #[serde(default)]
+    children: Vec<Note>,
+}
+
+#[derive(Deserialize)]
+struct Note {
+    message: String,
+}
+
+/// If a line of rustc's JSON stderr is an error, its message and first
+/// note, which is where a proc macro's panic message goes.
+pub fn error_message(line: &[u8]) -> Option<CompactString> {
+    let d: Diagnostic = serde_json::from_slice(line).ok()?;
+    (d.level == "error").then(|| match d.children.first() {
+        Some(n) => format_compact!("{}: {}", d.message, n.message),
+        None => d.message.into(),
+    })
 }
 
 /// Whether a line of rustc's JSON stderr announces its `.rmeta`.
@@ -424,4 +448,21 @@ pub async fn recv_async<T: Pack>(
     buf.resize(body_len(header)?, 0);
     r.read_exact(buf).await?;
     unframe(buf)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn an_errors_message_takes_its_first_note_where_a_proc_macro_panic_goes() {
+        let panicked = br#"{"$message_type":"diagnostic","message":"proc macro panicked","level":"error","spans":[],"children":[{"message":"message: failed to read Cargo.toml","level":"help","spans":[],"children":[]}],"rendered":"error: proc macro panicked"}"#;
+        assert_eq!(error_message(panicked).as_deref(), Some("proc macro panicked: message: failed to read Cargo.toml"));
+        let plain = br#"{"$message_type":"diagnostic","message":"mismatched types","level":"error","spans":[],"children":[]}"#;
+        assert_eq!(error_message(plain).as_deref(), Some("mismatched types"));
+        let warning = br#"{"$message_type":"diagnostic","message":"unused variable","level":"warning","spans":[],"children":[]}"#;
+        assert_eq!(error_message(warning), None);
+        assert_eq!(error_message(br#"{"$message_type":"artifact","artifact":"/t/liba.rmeta","emit":"metadata"}"#), None);
+        assert_eq!(error_message(b"linker failed"), None);
+    }
 }

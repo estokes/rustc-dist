@@ -709,10 +709,20 @@ same box has little to send: on a warm box, a binary sends its own sources.
 Any remote failure (non-zero exit, staging or sandbox error, dropped
 connection) reruns on a local slot, and the held-back diagnostics are
 discarded. If the rmeta line was already forwarded, the wrapper drops it from
-the rerun's output. A unit that fails remotely and then builds locally twice is
-kept local until the daemon restarts. Typical causes are proc macros that read
-the network or the environment (sqlx), or an include of a file the client
-never sent. Real compile errors get compiled twice. They usually fail fast.
+the rerun's output. A remote failure is logged as a warning with the box and
+rustc's first error, with its first note, where a proc macro's panic message
+goes. A unit that fails remotely and then builds locally twice is kept local
+until the daemon restarts, which is logged too, and the placement log gives
+that as the reason it can't go. Typical causes are proc macros that read the
+network or the environment (sqlx), or an include of a file the client never
+sent. Real compile errors get compiled twice. They usually fail fast.
+
+Staging sends the package's `Cargo.toml`, which dep-info never lists, since
+proc macros read it. On 2026-11-01 every graphix_package crate failed this
+way on ryouko: graphix-derive's `defpackage!` reads the package manifest to
+find its dependencies, panicked without it, and the crates were kept local
+within minutes of each restart, as several lanes built each. The failure was
+logged only at debug, so nothing showed why.
 
 ## Config
 

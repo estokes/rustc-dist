@@ -125,7 +125,7 @@ pub async fn run() -> Result<()> {
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = serve(sock, &ctx).await {
-                            debug!("connection: {e:#}");
+                            info!("a wrapper's connection: {e:#}");
                         }
                     });
                 }
@@ -285,7 +285,13 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
 
 /// Wait for the scheduler to place a job. None if cargo killed the
 /// wrapper meanwhile.
-async fn admit(sock: &mut UnixStream, ctx: &Ctx, unit: Unit, build: u32, remote: Option<Want>) -> Result<Option<Admission>> {
+async fn admit(
+    sock: &mut UnixStream,
+    ctx: &Ctx,
+    unit: Unit,
+    build: u32,
+    remote: Result<Want, &'static str>,
+) -> Result<Option<Admission>> {
     let (reply, mut admitted) = oneshot::channel();
     ctx.tx.send(Msg::Submit { unit, build, remote, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
     loop {
@@ -334,31 +340,28 @@ async fn compile(
     build: u32,
     job: Option<Job>,
 ) -> Result<()> {
+    // Where it may go besides here, or why nowhere.
     let mut want = match (&job, &ctx.links) {
-        (Some(job), Some(_)) if job.reads == Reads::Metadata || ctx.remote_links => {
+        (None, _) => Err("the wrapper keeps it here"),
+        (_, None) => Err("this box isn't in a farm"),
+        (Some(job), _) if job.reads != Reads::Metadata && !ctx.remote_links => Err("remote_links is off"),
+        (Some(job), Some(_)) => {
             let keys = &ctx.keys;
             let rustc = PathBuf::from(job.rustc.as_str());
             match task::block_in_place(|| keys.key(&rustc)) {
-                Ok(key) => Some(key),
+                Ok(key) => Ok(Want { key, target: job.target.clone(), reads: job.reads.clone(), cwd: job.cwd.clone() }),
                 Err(e) => {
                     warn!("{e:#}");
-                    None
+                    Err("its toolchain is unknown")
                 }
             }
         }
-        _ => None,
     };
     // Set once a remote run failed after passing cargo an rmeta notice.
     let mut filter_metadata = false;
     let mut failed_remotely = false;
     loop {
-        let remote = want.clone().zip(job.as_ref()).map(|(key, j)| Want {
-            key,
-            target: j.target.clone(),
-            reads: j.reads.clone(),
-            cwd: j.cwd.clone(),
-        });
-        let Some(admission) = admit(&mut sock, ctx, unit.clone(), build, remote).await? else {
+        let Some(admission) = admit(&mut sock, ctx, unit.clone(), build, want.clone()).await? else {
             return Ok(());
         };
         match admission {
@@ -395,7 +398,7 @@ async fn compile(
                         task::spawn_blocking(move || {
                             for c in &crates {
                                 if let Err(e) = hashes.get(Path::new(c.as_str())) {
-                                    debug!("hashing {c}: {e:#}");
+                                    info!("hashing {c}: {e:#}");
                                 }
                             }
                         });
@@ -411,11 +414,11 @@ async fn compile(
                     Ok(Remote::Failed { forwarded_metadata }) => {
                         filter_metadata |= forwarded_metadata;
                         failed_remotely = true;
-                        want = None;
+                        want = Err("it failed on another box just now");
                     }
                     Err(e) => {
                         warn!("{}: {e:#}", unit.exact);
-                        want = None;
+                        want = Err("sending it failed just now");
                     }
                 }
             }
@@ -525,10 +528,16 @@ async fn run_remote(
             Ok(Remote::Busy)
         }
         Ok((_, Outcome::Exit { code, .. })) => {
-            debug!("{} exited {code} remotely, building it here", r.unit().exact);
-            for (_, line) in held.iter().filter(|(stderr, _)| *stderr).take(5) {
-                debug!("remote stderr: {}", String::from_utf8_lossy(line).trim_end());
-            }
+            let mut stderr = held.iter().filter(|(stderr, _)| *stderr).map(|(_, line)| line);
+            let why = stderr.clone().find_map(|line| protocol::error_message(line)).or_else(|| {
+                stderr.next().map(|line| String::from_utf8_lossy(line).trim_end().into())
+            });
+            warn!(
+                "{} exited {code} on {}, building it here: {}",
+                r.unit().exact,
+                r.jobs,
+                why.as_deref().unwrap_or("it printed nothing")
+            );
             r.finish(RemoteOutcome::Failed);
             Ok(Remote::Failed { forwarded_metadata })
         }
