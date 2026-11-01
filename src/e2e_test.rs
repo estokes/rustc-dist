@@ -12,7 +12,7 @@ use crate::{
     sched::{Msg, Sched, Setup},
     stats::Decay,
     sys,
-    toolchain,
+    toolchain::{self, Toolchains},
 };
 use anyhow::{Context, Result, bail};
 use arcstr::ArcStr;
@@ -31,11 +31,11 @@ use tokio::{
     time,
 };
 
-struct ServerBox {
-    _net: InternalOnly,
+pub(crate) struct ServerBox {
+    pub(crate) net: InternalOnly,
     subscriber: netidx::subscriber::Subscriber,
     links: Links,
-    jobs: NPath,
+    pub(crate) jobs: NPath,
     tx: mpsc::UnboundedSender<Msg>,
     store_dir: PathBuf,
 }
@@ -49,7 +49,12 @@ impl Drop for ServerBox {
 /// The zstd level both sides compress at.
 const LEVEL: i32 = 1;
 
-async fn server(dir: &Path) -> Result<ServerBox> {
+pub(crate) async fn server(dir: &Path) -> Result<ServerBox> {
+    server_with(dir, toolchain::installed()).await
+}
+
+/// A server box that serves `toolchains`.
+async fn server_with(dir: &Path, toolchains: Toolchains) -> Result<ServerBox> {
     let net = InternalOnly::new().await?;
     let state = dir.join("state");
     let allowed = sys::allowed_cpus()?;
@@ -71,11 +76,11 @@ async fn server(dir: &Path) -> Result<ServerBox> {
     tokio::spawn(Sched::new(setup, Profile::DEFAULT, load, tx.clone())?.run(rx));
     let store_dir = dir.join("blobs");
     let store = Store::open(store_dir.clone(), 1 << 30)?;
-    let server = Arc::new(Server::new(store, dir.join("jobs"), toolchain::installed(), tx.clone(), LEVEL)?);
+    let server = Arc::new(Server::new(store, dir.join("jobs"), toolchains, tx.clone(), LEVEL)?);
     let jobs = NPath::from("/test/rustc-dist/b/jobs");
     tokio::spawn(sandbox::listen(net.publisher().clone(), jobs.clone(), server).await?);
     let (subscriber, links) = (net.subscriber().clone(), Links::new(net.subscriber().clone()));
-    Ok(ServerBox { subscriber, links, _net: net, jobs, tx, store_dir })
+    Ok(ServerBox { subscriber, links, net, jobs, tx, store_dir })
 }
 
 fn rustc() -> PathBuf {
@@ -204,10 +209,14 @@ struct Manual {
 
 impl Manual {
     /// Offer the job, which reads `crates`, to `b`, and send its manifest.
-    async fn offer(b: &ServerBox, (job, unit): &(Job, Unit), crates: &[ArcStr]) -> Result<Self> {
+    async fn offer(b: &ServerBox, job: &(Job, Unit), crates: &[ArcStr]) -> Result<Self> {
+        Self::offer_for(b, job, crates, toolchain::key_of(Path::new(job.0.rustc.as_str()))?).await
+    }
+
+    /// Offer the job for the toolchain `key`.
+    async fn offer_for(b: &ServerBox, (job, unit): &(Job, Unit), crates: &[ArcStr], key: ArcStr) -> Result<Self> {
         let staged = remote::stage(job, crates, &Hashes::default())?;
         let (out, mut inbox) = b.links.get(&b.jobs).await?.open()?;
-        let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
         out.send(ToServer::Offer { unit: unit.clone(), key, target: None, class: None })?;
         out.flush().await?;
         let FromServer::Accepted { .. } = inbox.recv().await? else { bail!("not accepted") };
@@ -250,12 +259,26 @@ impl Manual {
         }
     }
 
-    /// Wait for rustc to print an error.
-    async fn error(&mut self) -> Result<()> {
+    /// The lines rustc printed on stderr from now until the job ended, and
+    /// its exit code, or why it failed.
+    async fn ending(&mut self) -> Result<(Vec<Bytes>, Result<i32, ArcStr>)> {
+        let mut printed = Vec::new();
         loop {
             match self.inbox.recv().await? {
-                FromServer::Stderr(line) if line.windows(7).any(|w| w == b"\"error\"") => return Ok(()),
-                FromServer::Exit { .. } | FromServer::Failed(_) => bail!("ended without an error"),
+                FromServer::Stderr(line) => printed.push(line),
+                FromServer::Exit { code, .. } => return Ok((printed, Ok(code))),
+                FromServer::Failed(why) => return Ok((printed, Err(why))),
+                _ => (),
+            }
+        }
+    }
+
+    /// Wait for rustc to print a line holding `text`.
+    async fn printed(&mut self, text: &str) -> Result<()> {
+        loop {
+            match self.inbox.recv().await? {
+                FromServer::Stderr(line) if line.windows(text.len()).any(|w| w == text.as_bytes()) => return Ok(()),
+                FromServer::Exit { .. } | FromServer::Failed(_) => bail!("ended without printing {text}"),
                 _ => (),
             }
         }
@@ -269,7 +292,7 @@ fn blob(dir: &Path, h: &Hash) -> PathBuf {
 }
 
 /// Wait up to `secs` for `done`.
-async fn until(secs: u64, what: &str, mut done: impl FnMut() -> bool) -> Result<()> {
+pub(crate) async fn until(secs: u64, what: &str, mut done: impl FnMut() -> bool) -> Result<()> {
     for _ in 0..secs * 10 {
         if done() {
             return Ok(());
@@ -280,7 +303,7 @@ async fn until(secs: u64, what: &str, mut done: impl FnMut() -> bool) -> Result<
 }
 
 /// How many other boxes' jobs `b` serves.
-async fn serving(b: &ServerBox) -> Result<u32> {
+pub(crate) async fn serving(b: &ServerBox) -> Result<u32> {
     let (reply, status) = oneshot::channel();
     b.tx.send(Msg::Status { reply })?;
     let st = status.await?;
@@ -288,7 +311,7 @@ async fn serving(b: &ServerBox) -> Result<u32> {
 }
 
 /// The processes whose command line names `path`.
-fn running(path: &Path) -> Vec<u32> {
+pub(crate) fn running(path: &Path) -> Vec<u32> {
     let needle = path.as_os_str().as_bytes();
     let Ok(procs) = fs::read_dir("/proc") else { return vec![] };
     procs
@@ -303,7 +326,7 @@ fn running(path: &Path) -> Vec<u32> {
 
 /// A library that never finishes compiling: its static spins in const
 /// eval.
-fn endless(dir: &Path) -> Result<(Job, Unit)> {
+pub(crate) fn endless(dir: &Path) -> Result<(Job, Unit)> {
     fs::create_dir_all(dir.join("spin/src"))?;
     fs::create_dir_all(dir.join("target/deps"))?;
     fs::write(
@@ -466,7 +489,52 @@ async fn a_box_answers_a_heartbeat() -> Result<()> {
     let b = server(&dir.join("box")).await?;
     let us = remote::heartbeat(&b.links, &b.jobs, 1024, LEVEL).await?;
     assert!(us > 0 && us < 10_000_000, "{us}");
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_toolchain_rustup_changes_is_refused_at_the_offer_before_the_run_and_after_it() -> Result<()> {
+    use toolchain::test::{fake_rustup_home, install};
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-rustup-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let home = fake_rustup_home("e2e");
+    install(&home, "a", "c1");
+    let b = server_with(&dir.join("box"), Toolchains::read(home.clone())).await?;
+    let lib = endless(&dir.join("ws"))?;
+    let c1 = ArcStr::from("c1 h");
+    let within = |what| move |_| anyhow::anyhow!("{what} took over 30 s");
+    let offered = Manual::offer_for(&b, &lib, &[], c1.clone()).await?;
+    drop(offered);
+    // Updated between two offers: the second gets no toolchain.
+    install(&home, "a", "c2");
+    let (out, mut inbox) = b.links.get(&b.jobs).await?.open()?;
+    out.send(ToServer::Offer { unit: lib.1.clone(), key: c1.clone(), target: None, class: None })?;
+    out.flush().await?;
+    let reply = inbox.recv().await?;
+    assert!(matches!(&reply, FromServer::Failed(why) if why.contains("no toolchain c1 h")), "{reply:?}");
+    // Updated after the offer, before the run: no rustc runs.
+    install(&home, "a", "c1");
+    let mut m = Manual::offer_for(&b, &lib, &[], c1.clone()).await?;
+    m.send(&m.now).await?;
+    install(&home, "a", "c2");
+    m.run().await?;
+    let (printed, ended) = time::timeout(Duration::from_secs(30), m.ending()).await.map_err(within("the job"))??;
+    assert!(printed.is_empty() && ended.as_ref().is_err_and(|why| why.contains("before")), "{printed:?} {ended:?}");
+    // Updated while c1 runs: the job fails rather than exit 0.
+    install(&home, "a", "c1");
+    let mut m = Manual::offer_for(&b, &lib, &[], c1.clone()).await?;
+    m.send(&m.now).await?;
+    m.run().await?;
+    time::timeout(Duration::from_secs(30), m.printed("c1 ran")).await.map_err(within("starting c1"))??;
+    install(&home, "a", "c2");
+    let (_, ended) = time::timeout(Duration::from_secs(30), m.ending()).await.map_err(within("the job"))??;
+    assert!(ended.as_ref().is_err_and(|why| why.contains("while")), "{ended:?}");
+    drop(b);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&home);
     Ok(())
 }
 
@@ -514,7 +582,7 @@ async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Res
     let same = b.links.get(&b.jobs).await?;
     assert!(Arc::ptr_eq(&link, &same) && !link.failed());
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -555,7 +623,7 @@ async fn a_running_sandbox_is_killed_when_its_client_drops_the_job_or_the_channe
         }
     }
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -582,7 +650,7 @@ async fn a_channel_that_fails_is_replaced() -> Result<()> {
     let Outcome::Exit { code: 0, .. } = outcome else { bail!("failed: {:?}", stderr(&events)) };
     assert!(!Arc::ptr_eq(&link, &b.links.get(&b.jobs).await?));
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -612,7 +680,7 @@ async fn jobs_sent_together_send_a_blob_they_share_once() -> Result<()> {
     let (one, two) = (bytes(one)?, bytes(two)?);
     assert!(one.max(two) >= big, "{one} {two}");
     assert!(one + two < big * 3 / 2, "both sent it: {one} {two}");
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -638,7 +706,7 @@ async fn a_late_rlib_comes_through_another_jobs_upload_even_when_that_job_fails_
         let broken = sender.starts_with("broken");
         if broken {
             // a's rustc fails before a's client sends the rlib.
-            a.error().await?;
+            a.printed("\"error\"").await?;
         }
         time::sleep(Duration::from_secs(1)).await;
         a.send(&a.later).await?;
@@ -648,7 +716,7 @@ async fn a_late_rlib_comes_through_another_jobs_upload_even_when_that_job_fails_
         assert_eq!(code, 0, "linked against a's upload, as the stand-in has no code");
     }
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -681,7 +749,7 @@ async fn a_job_that_needs_another_jobs_late_rlib_before_rustc_starts_has_its_own
     assert_eq!(code, 0);
     drop(a);
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -730,7 +798,7 @@ async fn late_rlibs_are_stored_as_they_come_while_the_job_waits_for_another_jobs
     assert_eq!(code, 0);
     drop(sender);
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -756,7 +824,7 @@ async fn a_file_that_compresses_goes_small_and_its_output_comes_back_whole() -> 
     let at = rlib.windows(28).position(|w| w == &text.as_bytes()[..28]).context("the rlib lacks the text")?;
     assert_eq!(&rlib[at..at + text.len()], text.as_bytes());
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 

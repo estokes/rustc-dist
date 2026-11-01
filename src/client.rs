@@ -2,8 +2,9 @@ use crate::{
     config, sys,
     protocol::{self, Ask, OtherProtocol, PROTOCOL, Reply, STOP},
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use bytes::BytesMut;
+use compact_str::format_compact;
 use std::{
     env,
     fs::OpenOptions,
@@ -20,27 +21,53 @@ const GIVE_UP: Duration = Duration::from_secs(30);
 /// the failures before it don't count toward giving up.
 const HELD: Duration = Duration::from_secs(1);
 const RETRY: Duration = Duration::from_millis(50);
+/// How many daemon restarts one ask follows.
+pub const RESTARTS: u32 = 5;
+
+/// The daemon restarts one ask has followed, at most `RESTARTS`.
+#[derive(Default)]
+pub struct Restarts(u32);
+
+impl Restarts {
+    /// Follow one more restart, which showed as `lost`, unless the ask has
+    /// followed `RESTARTS` already.
+    pub fn follow(&mut self, lost: Error) -> Result<()> {
+        if self.0 == RESTARTS {
+            return Err(lost.context(format_compact!("gave up after following {RESTARTS} restarts of the rustc-dist daemon")));
+        }
+        self.0 += 1;
+        Ok(())
+    }
+}
 
 /// Send `ask` and return the daemon's reply, following the daemon
 /// through restarts. With `spawn`, start the daemon if none is running.
 pub fn request(ask: &Ask, spawn: bool, buf: &mut BytesMut) -> Result<(UnixStream, Reply)> {
-    follow(|| connect(spawn), ask, buf, GIVE_UP)?.context("the rustc-dist daemon is not running")
+    request_after(ask, spawn, buf, &mut Restarts::default())
+}
+
+/// As `request`, for an ask that has followed `restarts` already.
+pub fn request_after(ask: &Ask, spawn: bool, buf: &mut BytesMut, restarts: &mut Restarts) -> Result<(UnixStream, Reply)> {
+    follow(|| connect(spawn), ask, buf, GIVE_UP, restarts)?.context("the rustc-dist daemon is not running")
 }
 
 /// Send `ask` to the daemon if one is running, and return its reply.
 pub fn request_running(ask: &Ask, buf: &mut BytesMut) -> Result<Option<Reply>> {
-    Ok(follow(|| connect(false), ask, buf, GIVE_UP)?.map(|(_, reply)| reply))
+    Ok(follow(|| connect(false), ask, buf, GIVE_UP, &mut Restarts::default())?.map(|(_, reply)| reply))
 }
 
 /// Ask through each connection `connect` makes until a daemon answers.
-/// It gives up once failures have gone on for `give_up`, counting from the
-/// first since an ask the daemon held, so a restart is followed however
-/// long the ask waited before it. None if `connect` finds no daemon.
+/// An ask the daemon held before it failed met a restart, which counts
+/// toward `restarts`. It gives up once failures have gone on for `give_up`,
+/// counting from the first since such a restart, so a restart is followed
+/// however long the ask waited before it. None if `connect` finds no
+/// daemon.
 fn follow(
     mut connect: impl FnMut() -> Result<Option<UnixStream>>,
     ask: &Ask,
     buf: &mut BytesMut,
     give_up: Duration,
+    restarts: &mut Restarts,
 ) -> Result<Option<(UnixStream, Reply)>> {
     let mut failing_since = None;
     loop {
@@ -54,9 +81,9 @@ fn follow(
         };
         let now = Instant::now();
         if now - asked >= HELD {
-            failing_since = None;
-        }
-        if now - *failing_since.get_or_insert(now) >= give_up {
+            restarts.follow(failed)?;
+            failing_since = Some(now);
+        } else if now - *failing_since.get_or_insert(now) >= give_up {
             return Err(failed);
         }
         thread::sleep(RETRY);
@@ -180,9 +207,21 @@ mod test {
             (Duration::ZERO, Says::HangsUp),
             (Duration::ZERO, Says::Reply(Reply::Done)),
         ];
-        let reply = follow(daemon(answers.into_iter()), &Ask::Status, &mut BytesMut::new(), Duration::from_millis(300))?;
+        let reply = follow(daemon(answers.into_iter()), &Ask::Status, &mut BytesMut::new(), Duration::from_millis(300), &mut Restarts::default())?;
         assert!(matches!(reply, Some((_, Reply::Done))), "{reply:?}");
         Ok(())
+    }
+
+    #[test]
+    fn a_daemon_that_dies_each_time_it_holds_the_ask_counts_toward_the_restarts_it_follows() {
+        let mut restarts = Restarts::default();
+        for _ in 1..RESTARTS {
+            restarts.follow(anyhow!("an earlier restart")).unwrap();
+        }
+        let held = HELD + Duration::from_millis(50);
+        let dying = daemon(iter::repeat_with(move || (held, Says::HangsUp)).take(3));
+        let e = follow(dying, &Ask::Status, &mut BytesMut::new(), Duration::from_millis(300), &mut restarts).unwrap_err();
+        assert!(format!("{e:#}").contains(&format!("gave up after following {RESTARTS} restarts")), "{e:#}");
     }
 
     #[test]
@@ -190,11 +229,11 @@ mod test {
         let give_up = Duration::from_millis(300);
         let start = Instant::now();
         let hangs_up = daemon(iter::repeat_with(|| (Duration::ZERO, Says::HangsUp)));
-        let e = follow(hangs_up, &Ask::Status, &mut BytesMut::new(), give_up).unwrap_err();
+        let e = follow(hangs_up, &Ask::Status, &mut BytesMut::new(), give_up, &mut Restarts::default()).unwrap_err();
         assert!(start.elapsed() >= give_up && start.elapsed() < HELD, "gave up after {:?}: {e:#}", start.elapsed());
         let start = Instant::now();
         let restarting = daemon(iter::repeat_with(|| (Duration::ZERO, Says::Reply(Reply::Restarting))));
-        let e = follow(restarting, &Ask::Status, &mut BytesMut::new(), give_up).unwrap_err();
+        let e = follow(restarting, &Ask::Status, &mut BytesMut::new(), give_up, &mut Restarts::default()).unwrap_err();
         assert!(start.elapsed() >= give_up, "{e:#}");
         assert_eq!(e.to_string(), "the rustc-dist daemon kept restarting");
     }
@@ -203,7 +242,7 @@ mod test {
     fn a_daemon_of_another_protocol_fails_the_ask_at_once() {
         let start = Instant::now();
         let refuses = daemon(iter::repeat_with(|| (Duration::ZERO, Says::Refuses)));
-        let e = follow(refuses, &Ask::Status, &mut BytesMut::new(), Duration::from_secs(5)).unwrap_err();
+        let e = follow(refuses, &Ask::Status, &mut BytesMut::new(), Duration::from_secs(5), &mut Restarts::default()).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(1), "retried for {:?}", start.elapsed());
         let other = e.downcast_ref::<OtherProtocol>().expect("the daemon's protocol");
         assert_eq!(other.daemon, PROTOCOL);

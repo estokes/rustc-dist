@@ -15,20 +15,20 @@ use crate::{
 use anyhow::{Result, bail};
 use compact_str::format_compact;
 use arcstr::ArcStr;
-use futures::{StreamExt, channel::mpsc as fmpsc};
+use futures::{Stream, StreamExt, channel::mpsc as fmpsc, stream};
 use log::{info, warn};
 use netidx::{
     path::Path,
     publisher::{FromValue, Publisher, UpdateBatch, Val, Value},
-    resolver_client::ChangeTracker,
+    resolver_client::{ChangeTracker, ResolverRead},
     subscriber::{Dval, Event, SubId, Subscriber, UpdateChan, UpdatesFlags},
 };
 use netidx_derive::Pack;
-use poolshark::local::LPooled;
-use std::{collections::HashMap, time::Duration};
+use poolshark::{global::GPooled, local::LPooled};
+use std::{collections::HashMap, pin::pin, time::Duration};
 use tokio::{
     sync::{mpsc, watch},
-    time,
+    time::{self, MissedTickBehavior},
 };
 
 /// How often a changed load is republished, so a busy build doesn't send
@@ -207,9 +207,77 @@ impl Watched {
     }
 }
 
+/// Lists the boxes in the farm.
+trait Lister {
+    /// Their status rows, if those changed since it was last asked.
+    async fn changed(&mut self) -> Result<Option<GPooled<Vec<Path>>>>;
+}
+
+/// Lists the rows of the status table through the resolver.
+struct Rows {
+    resolver: ResolverRead,
+    table: Path,
+    tracker: ChangeTracker,
+}
+
+impl Rows {
+    fn new(subscriber: &Subscriber, base: &Path) -> Self {
+        let table = status_table(base);
+        Self { resolver: subscriber.resolver(), tracker: ChangeTracker::new(table.clone()), table }
+    }
+}
+
+impl Lister for Rows {
+    async fn changed(&mut self) -> Result<Option<GPooled<Vec<Path>>>> {
+        let listed = async {
+            if !self.resolver.check_changed(&mut self.tracker).await? {
+                return Ok(None);
+            }
+            Ok(Some(self.resolver.list(self.table.clone()).await?))
+        }
+        .await;
+        // The tracker may have taken in a change whose listing failed.
+        if listed.is_err() {
+            self.tracker = ChangeTracker::new(self.table.clone());
+        }
+        listed
+    }
+}
+
+/// Each listing `lister` gives that changed, asking it every `every`. An
+/// error is logged and asked again at the next look, and a slow answer
+/// delays the looks after it rather than bunching them up.
+fn listings(lister: impl Lister, every: Duration) -> impl Stream<Item = GPooled<Vec<Path>>> {
+    let mut tick = time::interval(every);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    stream::unfold((lister, tick), |(mut lister, mut tick)| async move {
+        loop {
+            tick.tick().await;
+            match lister.changed().await {
+                Ok(Some(listed)) => return Some((listed, (lister, tick))),
+                Ok(None) => (),
+                Err(e) => warn!("listing the farm's boxes, trying again: {e:#}"),
+            }
+        }
+    })
+}
+
 /// Publish this box's state and tell the scheduler about every other
 /// box's.
-pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::UnboundedSender<Msg>) -> Result<()> {
+pub async fn run(m: Member, load: watch::Receiver<Load>, tx: mpsc::UnboundedSender<Msg>) -> Result<()> {
+    let rows = Rows::new(&m.subscriber, &m.base);
+    run_with(m, load, tx, listings(rows, LIST_EVERY)).await
+}
+
+/// `run`, learning which boxes are in the farm from `listings`, which the
+/// loop polls beside its other work, so a listing that waits on the
+/// resolver holds up neither publishing nor reading states.
+async fn run_with(
+    m: Member,
+    mut load: watch::Receiver<Load>,
+    tx: mpsc::UnboundedSender<Msg>,
+    listings: impl Stream<Item = GPooled<Vec<Path>>>,
+) -> Result<()> {
     let mut toolchains = toolchain::watch(m.toolchains.clone());
     let mut watching = true;
     let state = |load: &Load, toolchains: &[Toolchain]| BoxState {
@@ -227,12 +295,10 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
         .map(|(col, v)| Cell::publish(&m.publisher, row.append(col), v))
         .collect::<Result<Vec<_>>>()?;
     info!("publishing {row}");
-    let table = status_table(&m.base);
     let (updates_tx, mut updates): (UpdateChan, _) = fmpsc::channel(64);
     let mut boxes: HashMap<ArcStr, Watched> = HashMap::new();
     let mut columns: HashMap<SubId, (ArcStr, usize)> = HashMap::new();
-    let mut tracker = ChangeTracker::new(table.clone());
-    let mut list = time::interval(LIST_EVERY);
+    let mut listings = pin!(listings);
     let mut publish = time::interval(PUBLISH_EVERY);
     let mut changed = false;
     loop {
@@ -287,7 +353,7 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
                     let _ = tx.send(Msg::Farm { name, state });
                 }
             }
-            // CR claude for claude: [bug/high] A resolver error ends the farm for good.
+            // XCR claude for claude: [bug/high] A resolver error ends the farm for good.
             // check_changed and list return Err once netidx's read client gives up on the resolver
             // (four tries with random waits of 1 to 12 s), and `?` ends run: this box's state
             // columns are unpublished as `cells` drops, it stops watching the others, and it stays
@@ -320,23 +386,23 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
             // trouble never holds up publishing or reading states, and Delay or Skip missed list
             // ticks. Also untested: turning the retry back into `?` fails no test (checked); only
             // the state: None on exit is pinned.
-            _ = list.tick() => {
-                let resolver = m.subscriber.resolver();
-                let listing: Result<Option<_>> = async {
-                    if !resolver.check_changed(&mut tracker).await? {
-                        return Ok(None);
-                    }
-                    Ok(Some(resolver.list(table.clone()).await?))
-                }
-                .await;
-                let listed = match listing {
-                    Ok(Some(listed)) => listed,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        warn!("listing the farm's boxes, trying again: {e:#}");
-                        continue;
-                    }
-                };
+            // 2026-11-01 claude: The listing is now a stream (farm::listings over a Lister;
+            // farm::Rows asks the resolver) that run_with's select polls beside its other branches,
+            // so a resolver call that retries for tens of seconds stays pending inside the stream
+            // while the loop goes on publishing this box's state and reading the others'; dropping
+            // the stream when run returns drops any call in flight. Its interval uses
+            // MissedTickBehavior::Delay, so missed looks aren't made back to back, and an error is
+            // logged and asked again at the next look. Rows also forgets its ChangeTracker when a
+            // listing fails, as check_changed may already have taken in the change whose list
+            // failed, which left a join or leave unseen until the table changed again (untested:
+            // InternalOnly can't fail the resolver). Test:
+            // farm::test::boxes_see_each_others_state_as_it_changes_through_resolver_trouble_until_their_farm_task_ends
+            // gives b a Flaky lister that fails its first 3 asks and, once it has listed both
+            // boxes, never answers again; b must still see a, then a's next state, and a must see
+            // b's next state, while b's listing hangs. It fails with an error ending the listing
+            // stream, and with the listing awaited inline in the loop as before (both checked). The
+            // Delay is not pinned by a test. DESIGN's farm paragraph updated.
+            Some(listed) = listings.next() => {
                 let present: Vec<ArcStr> = listed
                     .iter()
                     .filter_map(|p| Path::basename(p).map(ArcStr::from))
@@ -381,6 +447,40 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
 mod test {
     use super::*;
     use netidx::InternalOnly;
+    use std::{
+        future,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    /// Lists through `rows`, but fails its first `fails` asks, and once it
+    /// has listed `stall_at` rows, never answers again, as a resolver that
+    /// is down, noting in `stalled` when it first doesn't.
+    struct Flaky {
+        rows: Rows,
+        fails: u32,
+        stall_at: usize,
+        stalled: Arc<AtomicBool>,
+        listed_enough: bool,
+    }
+
+    impl Lister for Flaky {
+        async fn changed(&mut self) -> Result<Option<GPooled<Vec<Path>>>> {
+            if self.listed_enough {
+                self.stalled.store(true, Ordering::Relaxed);
+                return future::pending().await;
+            }
+            if self.fails > 0 {
+                self.fails -= 1;
+                bail!("the resolver is down");
+            }
+            let listed = self.rows.changed().await?;
+            self.listed_enough = listed.as_ref().is_some_and(|l| l.len() >= self.stall_at);
+            Ok(listed)
+        }
+    }
 
     fn state(version: u64, free: u32) -> BoxState {
         BoxState {
@@ -396,12 +496,12 @@ mod test {
         }
     }
 
-    async fn state_of_a(msgs: &mut mpsc::UnboundedReceiver<Msg>) -> Result<(Path, BoxState)> {
+    async fn state_of(box_name: &str, msgs: &mut mpsc::UnboundedReceiver<Msg>) -> Result<(Path, BoxState)> {
         loop {
             match time::timeout(Duration::from_secs(10), msgs.recv()).await {
-                Ok(Some(Msg::Farm { name, state: Some(state) })) if name == "a" => return Ok(state),
+                Ok(Some(Msg::Farm { name, state: Some(state) })) if name == box_name => return Ok(state),
                 Ok(Some(_)) => continue,
-                _ => bail!("no state from a"),
+                _ => bail!("no state from {box_name}"),
             }
         }
     }
@@ -416,7 +516,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn boxes_see_each_others_state_as_it_changes_until_their_farm_task_ends() -> Result<()> {
+    async fn boxes_see_each_others_state_as_it_changes_through_resolver_trouble_until_their_farm_task_ends()
+    -> Result<()> {
         let net = InternalOnly::new().await?;
         let base = Path::from("/farm");
         let member = |name: &str| Member {
@@ -431,18 +532,36 @@ mod test {
             let s = state(version, free);
             Load { profile: s.profile, version, load_c: s.load_c, classes: s.classes }
         };
+        let every = Duration::from_millis(20);
         let (a_load, a_rx) = watch::channel(load(1, 0));
-        let (a_tx, _a_msgs) = mpsc::unbounded_channel();
-        tokio::spawn(run(member("a"), a_rx, a_tx));
+        let (a_tx, mut a_msgs) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(member("a"), a_rx, a_tx, listings(Rows::new(net.subscriber(), &base), every)));
+        // b's resolver is down for its first asks, and after it has listed
+        // both boxes, for good.
+        let stalled = Arc::new(AtomicBool::new(false));
+        let rows = Rows::new(net.subscriber(), &base);
+        let flaky = Flaky { rows, fails: 3, stall_at: 2, stalled: stalled.clone(), listed_enough: false };
         let (b_load, b_rx) = watch::channel(load(1, 0));
         let (b_tx, mut b_msgs) = mpsc::unbounded_channel();
-        let b = tokio::spawn(run(member("b"), b_rx, b_tx));
-        let (jobs, s) = state_of_a(&mut b_msgs).await?;
+        let b = tokio::spawn(run_with(member("b"), b_rx, b_tx, listings(flaky, every)));
+        let (jobs, s) = state_of("a", &mut b_msgs).await?;
         assert_eq!(jobs, Path::from(format!("/farm/v{PROTOCOL}/api/a/jobs")));
         assert_eq!(s, state(1, 0));
+        time::timeout(Duration::from_secs(10), async {
+            while !stalled.load(Ordering::Relaxed) {
+                time::sleep(every).await;
+            }
+        })
+        .await?;
         a_load.send(load(2, 5))?;
-        let (_, s) = state_of_a(&mut b_msgs).await?;
-        assert_eq!(s, state(2, 5), "the new version and its free tokens arrive together");
+        let (_, s) = state_of("a", &mut b_msgs).await?;
+        assert_eq!(s, state(2, 5), "the new version and its free tokens arrive together, the resolver down or not");
+        b_load.send(load(2, 5))?;
+        loop {
+            if state_of("b", &mut a_msgs).await?.1.version == 2 {
+                break;
+            }
+        }
         drop(b_load);
         b.await??;
         let mut forgot = false;

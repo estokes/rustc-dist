@@ -76,6 +76,11 @@ jobs it holds with `Restarting`; one that dies just hangs up. Either way the
 wrapper connects and asks again, starting the daemon if it must, and gives
 up only once failures that each came within a second of asking have gone on
 for 30 s, so a job that waited long in the queue still follows the restart.
+A job the daemon loses after its first reply is asked for again after a
+quarter second's pause. A wrapper follows at most five restarts, counting
+each ask the daemon held a second or more before failing it and each job lost
+after its first reply; past that it fails, saying why on stderr, so a daemon
+that crash-loops fails the build rather than hang it.
 If a remote run had already passed cargo its `.rmeta` line, the wrapper drops
 that line from the rerun's output, here or on another box.
 
@@ -144,7 +149,8 @@ data compressed swap can still take (`compressed_swap_share`). For zram, that
 is its swap devices' free space; for zswap, the pool limit times the
 compression ratio zswap is getting, or 3:1 until it has stored something,
 less what the pool holds, and never more than the free space of the swap
-behind it, since every page zswap holds keeps a slot there.
+behind it, since every page zswap holds keeps a slot there. Shared pages
+counted as free (below) claim that space first, so it isn't counted twice.
 
 The daemon measures the box rather than trusting its own bookkeeping, so other
 processes count. Use is what RAM holds (`MemTotal - MemAvailable`), which
@@ -592,10 +598,12 @@ run on, so no client pairs one profile's name with another's rates.
 The scheduler publishes after every event, which includes the 100 ms ticks
 that lend tokens while jobs run. A changed state is republished at most every
 100 ms. The daemon lists `BASE/vN/status` for other
-boxes and subscribes to each one's state columns. A resolver error is logged
-and the listing tried again at the next tick. Netidx retries the resolver
-for up to tens of seconds first, and meanwhile the box neither publishes its
-state nor reads the others'. Whenever the farm task ends, the scheduler is
+boxes and subscribes to each one's state columns, looking every second. A
+resolver error is logged and the listing tried again at the next look.
+Netidx retries the resolver for up to tens of seconds first; the listing
+waits beside the farm task's other work, so meanwhile the box goes on
+publishing its state and reading the others', and the looks it missed are
+not made back to back. Whenever the farm task ends, the scheduler is
 told every other box is gone, so it never places jobs by a state that no
 longer changes.
 
@@ -607,8 +615,9 @@ toolchain's rustc (mtime, inode and size) and `lib/rustlib` before asking
 its key. Before it takes a job it looks again, and reads its toolchains
 afresh if one was added, removed or updated, logging a warning for a rustc
 whose key changed, so a job for a key it no longer has gets "no toolchain"
-and its client builds it. A job whose rustc changes while it runs fails the
-same way. The box republishes its toolchains when they change, looking
+and its client builds it. It looks at the job's rustc again just before the
+sandbox starts, since uploading inputs can take minutes, and once more after
+rustc exits: a job whose rustc changed by then fails the same way. The box republishes its toolchains when they change, looking
 every 10 s.
 
 A server admits a remote job only into a free token of the class asked for,
@@ -1273,6 +1282,8 @@ Every number below is a guess. None has been tested on an idle box.
 | a heavy job's spare is taken: lend it | twice what it holds | `src/sched.rs` `Layout::lend` |
 | keep a unit local after remote-fail, local-pass | 2 times | `src/sched.rs` `PIN_AFTER` |
 | cache size | 20 GB | `src/config.rs` `cache_gb` |
+| daemon restarts a wrapper follows | 5 | `src/client.rs` `RESTARTS` |
+| pause before asking again for a job a restart lost | 250 ms | `src/wrapper.rs` `RERUN` |
 
 Experiments, roughly in order:
 

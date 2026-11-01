@@ -325,8 +325,9 @@ async fn admit(
     unless_hung_up(sock, admitted).await?.map(|a| a.context("scheduler stopped")).transpose()
 }
 
-/// `work`'s output, or None if the wrapper hangs up first. A wrapper sends
-/// nothing while it waits for a slot or for a job on another box.
+/// `work`'s output, or None if the wrapper hangs up first, whether or not
+/// it read what it was sent. A wrapper sends nothing while it waits for a
+/// slot or for a job on another box.
 async fn unless_hung_up<T>(sock: &UnixStream, work: impl Future<Output = T>) -> Result<Option<T>> {
     tokio::pin!(work);
     loop {
@@ -338,6 +339,7 @@ async fn unless_hung_up<T>(sock: &UnixStream, work: impl Future<Output = T>) -> 
                     Ok(0) => return Ok(None),
                     Ok(_) => bail!("the wrapper sent data while it waited"),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                    Err(e) if e.kind() == ErrorKind::ConnectionReset => return Ok(None),
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -529,7 +531,7 @@ async fn run_remote(
             }
         }
     };
-    // CR claude for claude: [bug/medium] Nothing here watches the wrapper while the job runs on the
+    // XCR claude for claude: [bug/medium] Nothing here watches the wrapper while the job runs on the
     // other box: admit polls the socket for EOF, this loop doesn't, and `handle` writes to it only
     // on artifact lines. So a wrapper that dies (cargo interrupted) is noticed only at the job's
     // next artifact line: for a binary or test, the end of its link, as its dep-info line comes
@@ -559,6 +561,20 @@ async fn run_remote(
     // #[cfg(test)] constructor for sched::RemoteSlot (its fields are private), a test can call
     // run_remote, drop the wrapper's end, and check that it returns Remote::Gone at once and that
     // serving(&b) drops to 0.
+    // 2026-11-01 claude:
+    // daemon::test::a_remote_job_ends_when_its_wrapper_hangs_up_while_it_is_staged_or_runs drives
+    // run_remote against e2e_test::server (in-process netidx, Ctx::farm from its publisher and a
+    // Links on its subscriber) with sched::RemoteSlot::for_test (a #[cfg(test)] constructor).
+    // Staging: the job's last dep-info is a FIFO, so remote::stage blocks reading it; the wrapper
+    // has hung up, and run_remote must return Remote::Gone within 5 s. Relay: e2e_test::endless runs
+    // in the sandbox until the wrapper end is dropped; run_remote must return Gone within 5 s,
+    // serving(&b) drop to 0 and the sandbox die. It fails with the staging unless_hung_up turned
+    // into a plain await, and with the relay's (each checked). Writing it found a gap: a wrapper
+    // that hangs up with output unread (here the early dep-info artifact line, as when cargo kills a
+    // wrapper) gives the daemon ECONNRESET, not EOF, so unless_hung_up returned Err, compile logged
+    // 'sending it failed just now' and queued the job again here. unless_hung_up now treats
+    // ConnectionReset as a hang-up; waiting_ends_when_the_wrapper_hangs_up gained that case and
+    // fails without it (checked), as does the run_remote test.
     let (from_wrapper, mut to_wrapper) = sock.split();
     let relay = async {
         loop {
@@ -648,7 +664,10 @@ async fn run_remote(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::protocol::OtherProtocol;
+    use crate::{
+        e2e_test::{self, running, serving, until},
+        protocol::OtherProtocol,
+    };
     use std::{ffi::CString, future, io::Write, os::unix::ffi::OsStrExt, process};
 
     /// A connection's context, how it stops the daemon, and what it tells the
@@ -695,6 +714,64 @@ mod test {
         };
         let (waited, ()) = tokio::join!(unless_hung_up(&daemon, future::pending::<()>()), hangs_up);
         assert_eq!(waited?, None, "a wait for a slot, or for a job on another box, ends with its wrapper");
+        let (mut daemon, wrapper) = UnixStream::pair()?;
+        daemon.write_all(b"an artifact line\n").await?;
+        let hangs_up_unread = async move {
+            time::sleep(Duration::from_millis(50)).await;
+            drop(wrapper);
+        };
+        let (waited, ()) = tokio::join!(unless_hung_up(&daemon, future::pending::<()>()), hangs_up_unread);
+        assert_eq!(waited?, None, "a wrapper that hangs up with output unread is gone too");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_remote_job_ends_when_its_wrapper_hangs_up_while_it_is_staged_or_runs() -> Result<()> {
+        let dir = scratch("remote-gone")?;
+        let b = e2e_test::server(&dir.join("box")).await?;
+        let (ctx, _stopped, _msgs) = ctx();
+        let links = Arc::new(Links::new(b.net.subscriber().clone()));
+        let _ = ctx.farm.set(Farm { links, publisher: b.net.publisher().clone() });
+        let ws = dir.join("ws");
+        let (job, unit) = e2e_test::endless(&ws)?;
+        let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
+        let job = triomphe::Arc::new(job);
+        let slot = || RemoteSlot::for_test(b.jobs.clone(), key.clone(), unit.clone(), ctx.tx.clone());
+        let gone = |r: Result<Result<Remote>, time::error::Elapsed>| matches!(r, Ok(Ok(Remote::Gone)));
+        // Staging reads the last dep-info first: a FIFO, which holds it up
+        // until something opens it for writing.
+        let dep_info = remote::absolute(Path::new(job.cwd.as_str()), &job.paths.dep_info);
+        mkfifo(&dep_info)?;
+        let (mut sock, wrapper) = UnixStream::pair()?;
+        let mut buf = BytesMut::new();
+        drop(wrapper);
+        let staged = time::timeout(Duration::from_secs(5), run_remote(&mut sock, &mut buf, &ctx, &job, slot())).await;
+        let fifo = dep_info.clone();
+        task::spawn_blocking(move || OpenOptions::new().write(true).open(fifo)).await??;
+        fs::remove_file(&dep_info)?;
+        assert!(gone(staged), "staging went on after the wrapper hung up");
+        // Running there, which it does until stopped.
+        let (mut sock, wrapper) = UnixStream::pair()?;
+        let run = run_remote(&mut sock, &mut buf, &ctx, &job, slot());
+        tokio::pin!(run);
+        tokio::select! {
+            _ = &mut run => bail!("the job ended before its sandbox started"),
+            started = until(60, "starting the sandbox", || !running(&ws).is_empty()) => started?,
+        }
+        assert_eq!(serving(&b).await?, 1);
+        drop(wrapper);
+        // Hanging up without reading the dep-info line it was sent, as a
+        // wrapper cargo kills may.
+        assert!(gone(time::timeout(Duration::from_secs(5), run).await), "the job went on after the wrapper hung up");
+        let mut tries = 0;
+        while serving(&b).await? > 0 {
+            tries += 1;
+            assert!(tries < 100, "the box still serves the job");
+            time::sleep(Duration::from_millis(100)).await;
+        }
+        until(10, "killing the sandbox", || running(&ws).is_empty()).await?;
+        drop(b);
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 
@@ -705,12 +782,19 @@ mod test {
         Ok(dir)
     }
 
+    fn mkfifo(at: &Path) -> Result<()> {
+        let path = CString::new(at.as_os_str().as_bytes())?;
+        if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error()).with_context(|| format_compact!("mkfifo {}", at.display()));
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_dead_daemons_fifos_go_and_nothing_else() -> Result<()> {
         let dir = scratch("fifos")?;
         let fifo = dir.join("job-3-17");
-        let path = CString::new(fifo.as_os_str().as_bytes())?;
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "{}", io::Error::last_os_error());
+        mkfifo(&fifo)?;
         fs::write(dir.join("lock"), "")?;
         remove_stale_fifos(&dir);
         assert!(!fifo.exists(), "the FIFO goes");

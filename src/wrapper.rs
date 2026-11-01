@@ -1,6 +1,7 @@
 use crate::{
     argv::{self, Compile, Invocation},
-    client, config,
+    client::{self, Restarts},
+    config,
     protocol::{self, Ask, Finished, Front, Job, Ran, Reply},
     remote, sys,
 };
@@ -19,13 +20,18 @@ use std::{
     },
     path::Path,
     process::{self, Command, ExitStatus, Stdio},
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
 
 /// Environment another box must not inherit: jobservers, the wrapper
 /// itself, and library preloading.
 const LOCAL_ENV: &[&str] =
     &["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "PATH", "TMPDIR"];
+
+/// The pause before asking again for a job a daemon restart lost after its
+/// first reply.
+const RERUN: Duration = Duration::from_millis(250);
 
 pub fn run(args: Vec<OsString>) -> Result<()> {
     if args.is_empty() {
@@ -43,7 +49,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         }
     };
     let mut buf = BytesMut::new();
-    let request = |ask: &Ask, buf: &mut BytesMut| client::request(ask, true, buf);
+    let request = |ask: &Ask, buf: &mut BytesMut, restarts: &mut Restarts| client::request_after(ask, true, buf, restarts);
     match answer(&ask, &mut buf, request, &mut io::stderr(), &mut io::stdout())? {
         Answer::Trivial => Err(exec(&args)),
         Answer::Slot { mut sock, cpus, jobserver, filter_metadata } => {
@@ -68,20 +74,22 @@ enum Answer {
 
 /// Ask with `request` until a daemon answers, printing a remote run's
 /// output to `err` and `out` meanwhile. A daemon that goes away mid-job, or
-/// sends the job back while it restarts, is asked again through `request`,
-/// which follows the restart. Cargo gets one rmeta line, however many runs
-/// print one.
+/// sends the job back while it restarts, is asked again through `request`
+/// after a pause, which follows the restart. Each such loss counts as a
+/// restart the ask followed, as do those `request` follows. Cargo gets one
+/// rmeta line, however many runs print one.
 fn answer(
     ask: &Ask,
     buf: &mut BytesMut,
-    mut request: impl FnMut(&Ask, &mut BytesMut) -> Result<(UnixStream, Reply)>,
+    mut request: impl FnMut(&Ask, &mut BytesMut, &mut Restarts) -> Result<(UnixStream, Reply)>,
     err: &mut impl Write,
     out: &mut impl Write,
 ) -> Result<Answer> {
     let mut printed_metadata = false;
+    let mut restarts = Restarts::default();
     loop {
-        let (mut sock, mut reply) = request(ask, buf)?;
-        loop {
+        let (mut sock, mut reply) = request(ask, buf, &mut restarts)?;
+        let lost = loop {
             match reply {
                 Reply::Trivial => return Ok(Answer::Trivial),
                 Reply::Slot { cpus, jobserver, filter_metadata } => {
@@ -98,10 +106,10 @@ fn answer(
                 Reply::Output { stderr: false, data } => out.write_all(&data)?,
                 Reply::Exit(code) => return Ok(Answer::Exited(code)),
                 Reply::Refused(why) => bail!("the rustc-dist daemon can't run this compile: {why}"),
-                Reply::Restarting => break,
+                Reply::Restarting => break anyhow!("the rustc-dist daemon sent the job back as it restarted"),
                 Reply::Status(_) | Reply::Done => bail!("unexpected reply from the daemon"),
             }
-            // CR claude for claude: [bug/medium] Once the first reply is in, the wrapper can't follow a
+            // XCR claude for claude: [bug/medium] Once the first reply is in, the wrapper can't follow a
             // daemon restart. A remote job whose daemon exits while it streams (main's shutdown_timeout
             // drops the connection tasks once daemon::run returns) ends here with "the daemon went away
             // mid-job", and one that failed on another box after forwarding its rmeta line, then met a
@@ -132,12 +140,29 @@ fn answer(
             // bound, e.g. give up after a few reruns that followed a reply (each one redoes the job),
             // saying so on stderr. A test with daemons() that always lose the job after its first reply
             // would pin it.
+            // 2026-11-01 claude: client::Restarts counts the daemon restarts one ask follows, at most
+            // client::RESTARTS (5), then fails with 'gave up after following 5 restarts of the
+            // rustc-dist daemon: <how the last showed>', which main prints on stderr as cargo's compile
+            // fails. wrapper::answer owns one and counts each job lost after its first reply
+            // (Restarting or an io error), pausing RERUN (250 ms) before asking again; it hands the
+            // same Restarts to its request (client::request_after), whose follow counts each ask the
+            // daemon held 1 s or more before failing it, so a daemon crash-looping on long cycles no
+            // longer resets the give-up clock forever. Tests:
+            // wrapper::test::a_daemon_that_always_loses_the_job_after_its_first_reply_is_followed_only_so_far
+            // (daemons that always hang up after one rmeta line: RESTARTS + 1 asks, at least RESTARTS
+            // pauses, one rmeta line to cargo, and restarts counted inside request share the limit)
+            // fails without the count in answer and without the pause (both checked);
+            // client::test::a_daemon_that_dies_each_time_it_holds_the_ask_counts_toward_the_restarts_it_follows
+            // fails without the count in follow (checked). DESIGN's Wrapper protocol and guesses table
+            // updated. No message changes.
             reply = match protocol::recv(&mut sock, buf) {
                 Ok(reply) => reply,
-                Err(e) if e.downcast_ref::<io::Error>().is_some() => break,
+                Err(e) if e.downcast_ref::<io::Error>().is_some() => break e.context("the rustc-dist daemon went away mid-job"),
                 Err(e) => return Err(e.context("reading the daemon's reply")),
             };
-        }
+        };
+        restarts.follow(lost)?;
+        thread::sleep(RERUN);
     }
 }
 
@@ -249,6 +274,7 @@ fn exit_as(status: ExitStatus) -> ! {
 mod test {
     use super::*;
     use bytes::Bytes;
+    use std::iter;
 
     #[test]
     fn a_compile_reports_its_time_and_front_end() -> Result<()> {
@@ -291,9 +317,11 @@ mod test {
     }
 
     /// Daemons that each send their replies, in turn, and hang up.
-    fn daemons(said: Vec<Vec<Reply>>) -> impl FnMut(&Ask, &mut BytesMut) -> Result<(UnixStream, Reply)> {
+    fn daemons(
+        said: impl IntoIterator<Item = Vec<Reply>>,
+    ) -> impl FnMut(&Ask, &mut BytesMut, &mut Restarts) -> Result<(UnixStream, Reply)> {
         let mut said = said.into_iter();
-        move |_, buf| {
+        move |_, buf, _| {
             let mut replies = said.next().context("asked once too often")?.into_iter();
             let first = replies.next().context("no reply")?;
             let (ours, mut theirs) = UnixStream::pair()?;
@@ -326,6 +354,40 @@ mod test {
             matches!(after_restart, Answer::Slot { filter_metadata: true, .. }),
             "a rerun here after a restart drops the rmeta line cargo already has"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_daemon_that_always_loses_the_job_after_its_first_reply_is_followed_only_so_far() -> Result<()> {
+        let losing = || daemons(iter::repeat_with(|| vec![line(RMETA)]).take(client::RESTARTS as usize + 3));
+        let (start, mut asked, mut err) = (Instant::now(), 0, Vec::new());
+        let mut daemon = losing();
+        let counted = |ask: &Ask, buf: &mut BytesMut, restarts: &mut Restarts| {
+            asked += 1;
+            daemon(ask, buf, restarts)
+        };
+        let Err(e) = answer(&Ask::Probe, &mut BytesMut::new(), counted, &mut err, &mut Vec::new()) else {
+            bail!("answered")
+        };
+        let gave_up = format!("gave up after following {} restarts", client::RESTARTS);
+        assert!(format!("{e:#}").contains(&gave_up), "{e:#}");
+        assert_eq!(asked, client::RESTARTS + 1);
+        assert!(start.elapsed() >= RERUN * client::RESTARTS, "asked again without a pause: {:?}", start.elapsed());
+        assert_eq!(String::from_utf8(err)?, format!("{RMETA}\n"), "cargo gets one rmeta line");
+        // Restarts the request followed, as while the ask was queued, count
+        // toward the same limit.
+        let (mut asked, mut daemon) = (0, losing());
+        let queued_through_one = |ask: &Ask, buf: &mut BytesMut, restarts: &mut Restarts| {
+            asked += 1;
+            restarts.follow(anyhow!("lost while queued"))?;
+            daemon(ask, buf, restarts)
+        };
+        let Err(e) = answer(&Ask::Probe, &mut BytesMut::new(), queued_through_one, &mut Vec::new(), &mut Vec::new())
+        else {
+            bail!("answered")
+        };
+        assert!(format!("{e:#}").contains(&gave_up), "{e:#}");
+        assert_eq!(asked, client::RESTARTS / 2 + 1);
         Ok(())
     }
 }

@@ -306,6 +306,13 @@ impl RemoteSlot {
     pub fn finish(mut self, outcome: RemoteOutcome) {
         self.outcome = Some(outcome);
     }
+
+    /// A slot on the box at `jobs` for a job of `unit` that reads no
+    /// crates, which tells `tx` how it went.
+    #[cfg(test)]
+    pub fn for_test(jobs: NPath, key: ArcStr, unit: Unit, tx: mpsc::UnboundedSender<Msg>) -> Self {
+        Self { jobs, class: None, key, target: None, crates: Vec::new(), job: JobId::new(), unit, outcome: None, tx }
+    }
 }
 
 impl Drop for RemoteSlot {
