@@ -76,6 +76,11 @@ jobs it holds with `Restarting`; one that dies just hangs up. Either way the
 wrapper connects and asks again, starting the daemon if it must, and gives
 up only once failures that each came within a second of asking have gone on
 for 30 s, so a job that waited long in the queue still follows the restart.
+A job the daemon loses after its first reply is asked for again after a
+quarter second's pause. A wrapper follows at most five restarts, counting
+each ask the daemon held a second or more before failing it and each job lost
+after its first reply; past that it fails, saying why on stderr, so a daemon
+that crash-loops fails the build rather than hang it.
 If a remote run had already passed cargo its `.rmeta` line, the wrapper drops
 that line from the rerun's output, here or on another box.
 
@@ -1272,6 +1277,8 @@ Every number below is a guess. None has been tested on an idle box.
 | a heavy job's spare is taken: lend it | twice what it holds | `src/sched.rs` `Layout::lend` |
 | keep a unit local after remote-fail, local-pass | 2 times | `src/sched.rs` `PIN_AFTER` |
 | cache size | 20 GB | `src/config.rs` `cache_gb` |
+| daemon restarts a wrapper follows | 5 | `src/client.rs` `RESTARTS` |
+| pause before asking again for a job a restart lost | 250 ms | `src/wrapper.rs` `RERUN` |
 
 Experiments, roughly in order:
 
