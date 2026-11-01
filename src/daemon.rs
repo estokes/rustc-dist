@@ -313,7 +313,11 @@ async fn compile(
     let mut filter_metadata = false;
     let mut failed_remotely = false;
     loop {
-        let remote = want.clone().map(|key| Want { key, target: job.as_ref().and_then(|j| j.target.clone()) });
+        let remote = want.clone().map(|key| Want {
+            key,
+            target: job.as_ref().and_then(|j| j.target.clone()),
+            links: job.as_ref().is_some_and(|j| j.reads != Reads::Metadata),
+        });
         let Some(admission) = admit(&mut sock, ctx, unit.clone(), build, remote).await? else {
             return Ok(());
         };
@@ -430,7 +434,8 @@ async fn run_remote(
             }
             protocol::send_async(sock, buf, &Reply::Exit(0)).await?;
             let copy_us = (start.elapsed().as_micros() as u64).saturating_sub(ran.wall_us) + linker_waited_us;
-            let transfer = Transfer { sent_kb: bytes / 1024, copy_ms: copy_us / 1000 };
+            let links = job.reads != Reads::Metadata;
+            let transfer = Transfer { sent_kb: bytes / 1024, copy_ms: copy_us / 1000, links };
             info!(
                 "{} on {}: compiled in {} ms, moving files took {} ms ({} kB sent, linker waited {} ms)",
                 r.unit().exact,

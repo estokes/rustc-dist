@@ -34,10 +34,10 @@ const KEEP_S: f64 = 60. * 86_400.;
 /// Predicted size, in millions of instructions, of a job when nothing at
 /// all has been recorded.
 const UNKNOWN_COST_MI: u64 = 1000;
-const MAGIC: &[u8; 8] = b"rdstats6";
-/// A table from before copy times decayed on their own, whose cells count
-/// no sent runs.
-const UNSENT_MAGIC: &[u8; 8] = b"rdstats5";
+const MAGIC: &[u8; 8] = b"rdstats7";
+/// A table from before sends were kept by whether jobs link: its places'
+/// sends, of both kinds together, are dropped, and units keep their own.
+const UNSPLIT_MAGIC: &[u8; 8] = b"rdstats6";
 /// A table from before runs were timed, read as seed history.
 const OLD_MAGIC: &[u8; 8] = b"rdstats4";
 /// Where seed history ran: calibrated at one instruction per µs, so its
@@ -121,6 +121,8 @@ pub struct Transfer {
     /// The time it spent other than compiling: staging and sending inputs,
     /// its linker waiting for rlibs, receiving the last outputs.
     pub copy_ms: u64,
+    /// It linked, so it sent every rlib below it.
+    pub links: bool,
 }
 
 /// How a run went.
@@ -183,7 +185,9 @@ struct Place {
     fast: u64,
     rate: u64,
     curve: [Bucket; BUCKETS.len()],
-    copies: Copies,
+    /// Every unit's sends there, of jobs that read only metadata and of
+    /// jobs that link, which send every rlib below them.
+    copies: [Copies; 2],
     /// The factor at each bucket's load, as of the last `refresh`.
     factors: [f64; BUCKETS.len()],
 }
@@ -195,7 +199,7 @@ impl Place {
             fast: fast.max(1),
             rate: rate.max(1),
             curve: Default::default(),
-            copies: Copies::default(),
+            copies: Default::default(),
             factors: [1.; BUCKETS.len()],
         };
         p.refresh(0., 1.);
@@ -517,8 +521,9 @@ impl Stats {
     }
 
     /// Predicted µs a run of `unit` sent to `place` spends other than
-    /// compiling: from its own sends there, else every unit's, if any.
-    pub fn copy_us(&self, unit: &Unit, place: PlaceId) -> Option<u64> {
+    /// compiling: from its own sends there, else those of every job there
+    /// that links as it does or doesn't, if any.
+    pub fn copy_us(&self, unit: &Unit, place: PlaceId, links: bool) -> Option<u64> {
         let (now, half_life_s) = (self.now, self.decay.copy_half_life_s);
         let (mut sent, mut copy_us) = (0., 0.);
         for c in self.exact.get(&unit.exact).iter().flat_map(|r| &r.cells).filter(|c| c.place == place) {
@@ -526,13 +531,14 @@ impl Stats {
             sent += c.sent * k;
             copy_us += c.copy_us * k;
         }
-        if sent > 0. { Some((copy_us / sent) as u64) } else { self.place_copy_us(place) }
+        if sent > 0. { Some((copy_us / sent) as u64) } else { self.place_copy_us(place, links) }
     }
 
     /// Predicted µs a run sent to `place` spends other than compiling, from
-    /// every unit's sends there, if any.
-    pub fn place_copy_us(&self, place: PlaceId) -> Option<u64> {
-        let c = &self.places[place.0 as usize].copies;
+    /// the sends there of every job that links, or of every job that
+    /// doesn't, if any.
+    pub fn place_copy_us(&self, place: PlaceId, links: bool) -> Option<u64> {
+        let c = &self.places[place.0 as usize].copies[usize::from(links)];
         let k = keep(c.at, self.now, self.decay.copy_half_life_s);
         (c.runs * k > 0.).then(|| (c.copy_us / c.runs) as u64)
     }
@@ -618,8 +624,8 @@ impl Stats {
             r.count(run.mem_kb, run.wall_us / 1000, run.origin);
         }
         let place = &mut self.places[run.place.0 as usize];
-        if let Origin::Sent(_) = run.origin {
-            let c = &mut place.copies;
+        if let Origin::Sent(t) = run.origin {
+            let c = &mut place.copies[usize::from(t.links)];
             let k = keep(c.at, now, decay.copy_half_life_s);
             (c.runs, c.copy_us, c.at) = (c.runs * k + 1., c.copy_us * k + copy_us, now);
         }
@@ -674,7 +680,7 @@ impl Stats {
         r.read_exact(&mut magic)?;
         let mut stats = match &magic {
             MAGIC => Self::read(&mut r, decay, true)?,
-            UNSENT_MAGIC => Self::read(&mut r, decay, false)?,
+            UNSPLIT_MAGIC => Self::read(&mut r, decay, false)?,
             OLD_MAGIC => Self::read_old(&mut r, decay)?,
             _ => bail!("{} is not a stats file", path.display()),
         };
@@ -683,9 +689,8 @@ impl Stats {
         Ok(stats)
     }
 
-    /// Without `sent`, a cell's runs count as sent if they spent time
-    /// moving files.
-    fn read(r: &mut impl Read, decay: Decay, sent: bool) -> Result<Self> {
+    /// Without `split`, each place has one set of sends, of both kinds.
+    fn read(r: &mut impl Read, decay: Decay, split: bool) -> Result<Self> {
         let mut stats = Self::new(decay);
         stats.places.clear();
         stats.by_key.clear();
@@ -696,7 +701,12 @@ impl Stats {
             for b in &mut p.curve {
                 *b = Bucket { at: read_f64(r)?, time_us: read_f64(r)?, calibrated_us: read_f64(r)? };
             }
-            p.copies = Copies { at: read_f64(r)?, runs: read_f64(r)?, copy_us: read_f64(r)? };
+            for kind in 0..if split { 2 } else { 1 } {
+                let c = Copies { at: read_f64(r)?, runs: read_f64(r)?, copy_us: read_f64(r)? };
+                if split {
+                    p.copies[kind] = c;
+                }
+            }
             stats.places.push(p);
             stats.by_key.insert(key, PlaceId(i));
         }
@@ -729,15 +739,11 @@ impl Stats {
                         sent: 0.,
                         copy_us: 0.,
                     };
-                    for s in cell.speed() {
+                    for s in cell.speed().into_iter() {
                         *s = read_f64(r)?;
                     }
-                    if sent {
-                        cell.sent = read_f64(r)?;
-                    }
-                    cell.copy_us = read_f64(r)?;
-                    if !sent && cell.copy_us > 0. {
-                        cell.sent = cell.runs;
+                    for s in cell.copies() {
+                        *s = read_f64(r)?;
                     }
                     rec.cells.push(cell);
                 }
@@ -802,8 +808,10 @@ impl Stats {
                     w.write_all(&x.to_be_bytes())?;
                 }
             }
-            for x in [p.copies.at, p.copies.runs, p.copies.copy_us] {
-                w.write_all(&x.to_be_bytes())?;
+            for c in &p.copies {
+                for x in [c.at, c.runs, c.copy_us] {
+                    w.write_all(&x.to_be_bytes())?;
+                }
             }
         }
         let mut ser = V2Serializer::new();
@@ -1003,7 +1011,7 @@ mod test {
     fn copy_times_follow_their_own_shorter_half_life() {
         let mut s = Stats::new(Decay::default());
         let there = s.place("b/all", 1000, 1000);
-        let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms }), ..run(there, 0, 100) };
+        let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms, links: false }), ..run(there, 0, 100) };
         // 10 s to move its files on a slow link, then 1 s two hours later:
         // the old one counts a quarter.
         s.set_now(0.);
@@ -1011,9 +1019,9 @@ mod test {
         s.set_now(2. * 3600.);
         s.record(&unit("a:1", "a"), &sent(1000));
         let want = (10. * 0.25 + 1.) / 1.25 * 1e6;
-        let got = s.copy_us(&unit("a:1", "a"), there).unwrap() as f64;
+        let got = s.copy_us(&unit("a:1", "a"), there, false).unwrap() as f64;
         assert!((got - want).abs() < want * 0.01, "{got} {want}");
-        let every = s.copy_us(&unit("b:1", "b"), there).unwrap() as f64;
+        let every = s.copy_us(&unit("b:1", "b"), there, false).unwrap() as f64;
         assert!((every - want).abs() < want * 0.01, "every unit's too: {every}");
         // Its size counts both runs nearly alike.
         let p = predict(&s, &unit("a:1", "a"));
@@ -1037,15 +1045,20 @@ mod test {
     }
 
     #[test]
-    fn copies_come_from_the_units_own_sends_then_every_units() {
+    fn copies_come_from_the_units_own_sends_then_those_of_jobs_that_link_as_it_does() {
         let mut s = Stats::new(Decay::default());
         let there = s.place("b/all", 1000, 1000);
-        let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms }), ..run(there, 0, 100) };
-        assert_eq!(s.copy_us(&unit("a:1", "a"), there), None);
-        s.record(&unit("a:1", "a"), &sent(300));
-        s.record(&unit("b:1", "b"), &sent(100));
-        assert_eq!(s.copy_us(&unit("a:1", "a"), there), Some(300_000));
-        assert_eq!(s.copy_us(&unit("c:1", "c"), there), Some(200_000));
+        let sent = |copy_ms, links| Run {
+            origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms, links }),
+            ..run(there, 0, 100)
+        };
+        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false), None);
+        s.record(&unit("a:1", "a"), &sent(300, false));
+        s.record(&unit("b:1", "b"), &sent(100, false));
+        s.record(&unit("bin:1", "bin"), &sent(9000, true));
+        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false), Some(300_000));
+        assert_eq!(s.copy_us(&unit("c:1", "c"), there, false), Some(200_000), "libraries'");
+        assert_eq!(s.copy_us(&unit("c:1", "c"), there, true), Some(9_000_000), "links'");
     }
 
     #[test]
@@ -1056,7 +1069,7 @@ mod test {
         let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/all", 3000, 2000));
         s.record(&unit("a:1", "a"), &run(a, 0, 1234));
         s.record(&unit("a:1", "a"), &Run { origin: Origin::Served, ..run(b, 0, 2000) });
-        let sent = Origin::Sent(Transfer { sent_kb: 2048, copy_ms: 70 });
+        let sent = Origin::Sent(Transfer { sent_kb: 2048, copy_ms: 70, links: true });
         s.record(&unit("b:1", "b"), &Run { front_us: Some(30_000), tokens_us: 230_000, origin: sent, ..run(b, 100, 99) });
         s.save(&path)?;
         assert!(!s.dirty);
@@ -1075,7 +1088,9 @@ mod test {
         let (_, b1) = t.units().find(|(k, _)| k.as_str() == "b:1").unwrap();
         assert_eq!(b1.runs, [0, 1, 0]);
         assert_eq!(b1.copy_ms, Some(70));
-        assert_eq!(t.copy_us(&unit("b:1", "b"), b), Some(70_000));
+        assert_eq!(t.copy_us(&unit("b:1", "b"), b, true), Some(70_000));
+        assert_eq!(t.copy_us(&unit("c:1", "c"), b, true), Some(70_000), "links' sends were saved");
+        assert_eq!(t.copy_us(&unit("c:1", "c"), b, false), None);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

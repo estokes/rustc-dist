@@ -195,10 +195,11 @@ fn status() -> Result<()> {
             let sep = if classes.is_empty() { "" } else { ", " };
             classes.push_str(&format_compact!("{sep}{} cpus at {:.2}", c.cpus, hundredths(c.speed_c)));
         }
-        let copy: CompactString = match b.copy_s() {
-            Some(s) => format_compact!("{s:.2} s moving files"),
-            None => "nothing sent yet".into(),
+        let seconds = |s: Option<f64>| -> CompactString {
+            s.map_or_else(|| "-".into(), |s| format_compact!("{s:.2} s"))
         };
+        let (library, link) = b.copy_s();
+        let copy = format_compact!("moving files {} for a library, {} for a link", seconds(library), seconds(link));
         writeln!(
             out,
             "box {}: profile {}, load {:.2}; light jobs on {classes}; heavy {} threads at {:.2} each; \

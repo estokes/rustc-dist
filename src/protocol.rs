@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 12;
+pub const PROTOCOL: u32 = 13;
 const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under
@@ -158,6 +158,9 @@ pub struct Status {
     pub switching: Switching,
     /// Runnable tasks per CPU, in hundredths.
     pub load_c: u32,
+    /// The speed the others are hundredths of, in the calibration load's
+    /// instructions per µs, which every box's calibration counts alike.
+    pub base_rate: u64,
     /// Light jobs, pinned to one class each.
     pub classes: Vec<ClassStatus>,
     pub spread: SpreadStatus,
@@ -187,8 +190,10 @@ pub struct BoxStatus {
     /// A heavy job's threads there, and each one's speed now.
     pub threads: u32,
     pub thread_speed_c: u32,
-    /// What a job sent there spends moving files, on average.
-    pub copy_ms: Option<u64>,
+    /// What a job sent there that reads only metadata spends moving files,
+    /// on average, and one that links, sending every rlib below it.
+    pub library_copy_ms: Option<u64>,
+    pub link_copy_ms: Option<u64>,
     /// Jobs this box has running there.
     pub sent: u32,
 }
@@ -275,6 +280,14 @@ pub fn hundredths(c: u32) -> f64 {
     c as f64 / 100.
 }
 
+impl Status {
+    /// A speed in G instructions of the calibration load per second, which
+    /// compares across boxes.
+    pub fn g_per_s(&self, speed_c: u32) -> f64 {
+        hundredths(speed_c) * self.base_rate as f64 / 1000.
+    }
+}
+
 fn secs(ms: u64) -> f64 {
     ms as f64 / 1000.
 }
@@ -322,8 +335,9 @@ impl BoxStatus {
         self.classes.iter().map(|c| c.free).sum()
     }
 
-    pub fn copy_s(&self) -> Option<f64> {
-        self.copy_ms.map(secs)
+    /// Seconds moving files for a library and for a job that links.
+    pub fn copy_s(&self) -> (Option<f64>, Option<f64>) {
+        (self.library_copy_ms.map(secs), self.link_copy_ms.map(secs))
     }
 }
 

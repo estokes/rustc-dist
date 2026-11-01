@@ -86,6 +86,8 @@ atomic_id!(JobId);
 pub struct Want {
     pub key: ArcStr,
     pub target: Option<ArcStr>,
+    /// It links, so it sends every rlib below it.
+    pub links: bool,
 }
 
 pub enum Msg {
@@ -643,6 +645,7 @@ struct Portable {
     key: ArcStr,
     target: Option<ArcStr>,
     crates: Vec<ArcStr>,
+    links: bool,
 }
 
 struct Waiting {
@@ -1051,8 +1054,8 @@ impl Sched {
         let pred = self.stats.predict(&unit.exact, &unit.coarse);
         let pinned = self.mismatches.get(&unit.exact).is_some_and(|n| *n >= PIN_AFTER);
         let portable = match remote {
-            Some(Want { key, target }) if !pinned => {
-                self.graph.inputs(&unit.deps).map(|crates| Portable { key, target, crates })
+            Some(Want { key, target, links }) if !pinned => {
+                self.graph.inputs(&unit.deps).map(|crates| Portable { key, target, crates, links })
             }
             _ => None,
         };
@@ -1451,6 +1454,7 @@ impl Sched {
                 .portable
                 .as_ref()
                 .filter(|_| !w.pred.known || waits_here || fastest_us >= REMOTE_MIN_US);
+            let links = away.is_some_and(|p| p.links);
             let picked = if light(&w.pred) {
                 let local = if fits { held.len() } else { 0 };
                 cands.clear();
@@ -1479,7 +1483,7 @@ impl Sched {
                         let spot = Spot::new(&w.pred, w.unit.codegen_units, at, true, cpus);
                         let load_c = if waits { state.load_c } else { load_there[r] };
                         let run_us = self.run_us(&w.pred, &spot, load_c, waits);
-                        let copy_us = self.stats.copy_us(&w.unit, at).unwrap_or(REMOTE_OVERHEAD_US);
+                        let copy_us = self.stats.copy_us(&w.unit, at, links).unwrap_or(REMOTE_OVERHEAD_US);
                         cands.push(Cand { run_us, frees_in_us, copy_us, spot, place });
                     }
                 }
@@ -1515,7 +1519,7 @@ impl Sched {
                     let waits = rb.avail.iter().all(|&n| n == 0);
                     let load_c = if waits { state.load_c } else { load_there[r] };
                     let run_us = self.run_us(&w.pred, &spot, load_c, waits);
-                    let copy_us = self.stats.copy_us(&w.unit, places.all).unwrap_or(REMOTE_OVERHEAD_US);
+                    let copy_us = self.stats.copy_us(&w.unit, places.all, links).unwrap_or(REMOTE_OVERHEAD_US);
                     // A busy box is worth waiting for if it finishes the job
                     // sooner than anywhere free; with no history to say so,
                     // the job doesn't wait for one.
@@ -1831,9 +1835,10 @@ impl Sched {
                     .map(|(c, &at)| BoxClass { cpus: c.cpus, speed_c: speed_c(c.rate, at, state.load_c), free: c.free })
                     .collect();
                 let (_, mean) = spread_rates(state.classes.iter().map(|c| (c.rate, c.cpus as u64)));
-                let copy_us = self.stats.place_copy_us(places.all).or_else(|| {
-                    places.classes.iter().find_map(|&at| self.stats.place_copy_us(at))
-                });
+                let copy_ms = |links| {
+                    let mut at = std::iter::once(places.all).chain(places.classes.iter().copied());
+                    at.find_map(|at| self.stats.place_copy_us(at, links)).map(|us| us / 1000)
+                };
                 Some(BoxStatus {
                     name: rb.name.clone(),
                     profile: state.profile.clone(),
@@ -1841,7 +1846,8 @@ impl Sched {
                     classes,
                     threads: state.classes.iter().map(|c| c.cpus).sum(),
                     thread_speed_c: speed_c(mean, places.all, state.load_c),
-                    copy_ms: copy_us.map(|us| us / 1000),
+                    library_copy_ms: copy_ms(false),
+                    link_copy_ms: copy_ms(true),
                     sent: self.running.iter().filter(there).count() as u32,
                 })
             })
@@ -1855,6 +1861,7 @@ impl Sched {
                 Switch::Calibrating { profile, .. } => Switching::Calibrating(profile.name().clone()),
             },
             load_c: self.load_c,
+            base_rate: base.round() as u64,
             classes: layout
                 .classes
                 .iter()
@@ -2305,7 +2312,7 @@ mod test {
     }
 
     fn want() -> Option<Want> {
-        Some(Want { key: "c h".into(), target: None })
+        Some(Want { key: "c h".into(), target: None, links: false })
     }
 
     #[tokio::test]
@@ -2369,10 +2376,10 @@ mod test {
     async fn remote_needs_a_matching_toolchain_and_a_free_slot() -> Result<()> {
         let h = Harness::start("nomatch", vec![class(1000, &[0, 1])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;
         h.tx.send(Msg::Farm { name: "full".into(), state: Some(remote_box(200, 4, 0, 1)) })?;
-        let other = Some(Want { key: "other h".into(), target: None });
+        let other = Some(Want { key: "other h".into(), target: None, links: false });
         h.farm(remote_box(200, 4, 4, 1));
         assert!(matches!(admitted(h.submit_with("big", other)).await?, Admission::Slot(_)));
-        let target = Some(Want { key: "c h".into(), target: Some("wasm32".into()) });
+        let target = Some(Want { key: "c h".into(), target: Some("wasm32".into()), links: false });
         assert!(matches!(admitted(h.submit_with("big", target)).await?, Admission::Slot(_)));
         Ok(())
     }
@@ -2582,7 +2589,7 @@ mod test {
         let wall_us = wall_ms * 1000;
         let ran = Ran { wall_us, maxrss_kb: 1, front: None };
         let measured = Measured { tokens_us: wall_us, load_c: 0 };
-        let transfer = Transfer { sent_kb: 1, copy_ms };
+        let transfer = Transfer { sent_kb: 1, copy_ms, links: false };
         r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us: 0, transfer }));
         while let Ok(msg) = rx.try_recv() {
             s.handle(msg).unwrap();
@@ -2615,6 +2622,32 @@ mod test {
         history(&mut s, "big", 5_000_000, 100);
         assert!(run_on_b(&mut s, &mut rx, "big", 1000, 10_000));
         assert!(!run_on_b(&mut s, &mut rx, "big", 1000, 10_000), "it stays here");
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_librarys_first_send_is_not_charged_what_links_took() -> Result<()> {
+        let dir = scratch("copy-kinds");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], room(u64::MAX), &[], &[])?;
+        // 5 s here, 1 s there; binaries sent there took 10 s moving rlibs.
+        s.farm("b".into(), Some(remote_box(200, 4, 4, 1)));
+        history(&mut s, "lib", 5_000_000, 100);
+        let at = s.remotes[0].state.as_ref().unwrap().1.classes[0];
+        let transfer = Transfer { sent_kb: 300_000, copy_ms: 10_000, links: true };
+        let run = Run {
+            place: at,
+            load_c: 0,
+            wall_us: 1_000_000,
+            front_us: None,
+            tokens_us: 1_000_000,
+            mem_kb: 1,
+            origin: Origin::Sent(transfer),
+        };
+        s.stats.record(&unit("bin", &[]), &run);
+        let mut rx = place(&mut s, &["lib"], true);
+        assert!(matches!(rx[0].try_recv(), Ok(Admission::Remote(_))), "sent despite the binaries' 10 s");
         drop(s);
         fs::remove_dir_all(&dir)?;
         Ok(())
@@ -3022,7 +3055,7 @@ mod test {
         let Admission::Remote(r) = admitted(h.submit_with("big", want())).await? else {
             bail!("not sent remote");
         };
-        let transfer = Transfer { sent_kb: 300, copy_ms: 40 };
+        let transfer = Transfer { sent_kb: 300, copy_ms: 40, links: false };
         r.finish(RemoteOutcome::Done(SentRun { ran: ran(), measured: Measured::default(), linker_waited_us: 0, transfer }));
         let st = h.status().await;
         let unit = |key: &str| st.units.iter().find(|u| u.key == key).unwrap();

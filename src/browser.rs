@@ -4,7 +4,7 @@
 
 use crate::{
     farm::Cell,
-    protocol::{ClassStatus, Status, Switching, gib, hundredths},
+    protocol::{ClassStatus, Status, Switching, gib},
     sched::Msg,
 };
 use anyhow::Result;
@@ -117,8 +117,9 @@ impl Board {
         };
         let per_class =
             |f: fn(&ClassStatus) -> u32| Value::from(st.classes.iter().map(|c| i64::from(f(c))).collect::<Vec<_>>());
-        let speeds =
-            |f: fn(&ClassStatus) -> u32| Value::from(st.classes.iter().map(|c| hundredths(f(c))).collect::<Vec<_>>());
+        let speeds = |f: fn(&ClassStatus) -> u32| {
+            Value::from(st.classes.iter().map(|c| round(st.g_per_s(f(c)), 2)).collect::<Vec<_>>())
+        };
         let sum = |f: fn(&ClassStatus) -> u32| st.classes.iter().map(f).sum::<u32>();
         let figures: [(&'static str, Value); 16] = [
             ("switching", switching),
@@ -128,7 +129,7 @@ impl Board {
             ("class speed", speeds(|c| c.speed_c)),
             ("class idle speed", speeds(|c| c.idle_speed_c)),
             ("heavy threads", st.spread.threads.into()),
-            ("heavy thread speed", hundredths(st.spread.thread_speed_c).into()),
+            ("heavy thread speed", round(st.g_per_s(st.spread.thread_speed_c), 2).into()),
             ("class running", per_class(|c| c.running)),
             ("class serving", per_class(|c| c.serving)),
             ("lent", per_class(|c| c.lent)),
@@ -185,6 +186,7 @@ mod test {
             profile: "default".into(),
             switching: Switching::No,
             load_c: 75,
+            base_rate: 4000,
             classes: vec![
                 ClassStatus { cpus: 4, idle_speed_c: 100, speed_c: 90, running: 1, serving: 0, lent: 0, free: 5 },
                 ClassStatus { cpus: 8, idle_speed_c: 40, speed_c: 35, running: 0, serving: 2, lent: 1, free: 9 },
@@ -233,7 +235,9 @@ mod test {
         show(&mut board, &publisher, &status(both)).await?;
         assert_eq!(value(&net, "/farm/status/a/waiting").await?, Value::from(7u32));
         assert_eq!(value(&net, "/farm/status/a/running").await?, Value::from(2u32));
-        assert_eq!(value(&net, "/farm/status/a/class speed").await?, Value::from(vec![0.9, 0.35]));
+        // In G instructions of the calibration load per second, so boxes
+        // compare.
+        assert_eq!(value(&net, "/farm/status/a/class speed").await?, Value::from(vec![3.6, 1.4]));
         for column in net.subscriber().resolver().list(Path::from("/farm/status/a")).await?.iter() {
             let below = net.subscriber().resolver().list(column.clone()).await?;
             assert!(below.is_empty(), "{column} is a directory, not a column");

@@ -274,8 +274,9 @@ scale.
 A sent run's time is everything the client waits for, from offering the job to
 its last output. Its part other than compiling (staging and sending inputs,
 the linker waiting for late rlibs, receiving outputs) is its own term,
-predicted from the unit's recent sends to that place, else every unit's, else
-200 ms, and added in full. Its weights halve every `copy_half_life_s`, an hour
+predicted from the unit's own recent sends to that place, else those of every
+job there that links as it does or doesn't (a job that links sends every rlib
+below it, so its sends take far longer), else 200 ms, and added in full. Its weights halve every `copy_half_life_s`, an hour
 by default, since the network a laptop is on changes as it moves. The server reports the token-µs and load it
 measured, counted from when rustc started, so time waiting for inputs isn't
 counted as the job's.
@@ -416,7 +417,7 @@ work, so build times say nothing yet; placement is all that was checked.
 ### Farm
 
 A daemon whose config has `base` (say `/build`) joins the farm. The farm's
-netidx namespace is under the protocol version, `BASE/vN` (`/build/v12`), so
+netidx namespace is under the protocol version, `BASE/vN` (`/build/v13`), so
 boxes of different versions never see each other:
 
 - `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
@@ -480,8 +481,8 @@ idle: its calibrated rate over the factor it has learned with no load. Each
 class shows its speed idle and at the load now, this box's jobs, other boxes'
 jobs and free tokens; heavy jobs, their threads and each one's speed now;
 each other box, its load, its classes' and threads' speeds as this box has
-learned them, the time jobs sent there spend moving files, and its free
-tokens. Every unit the box has run is listed with its rank and work in
+learned them, the time jobs sent there spend moving files, for libraries and
+for jobs that link, and its free tokens. Every unit the box has run is listed with its rank and work in
 seconds on one thread of the fastest class idle, its front end's share, its
 width, its predicted time here now and its measured wall time, and runs split
 three ways: this box's builds run here, this box's builds run elsewhere, and
@@ -491,8 +492,11 @@ files and the MB they sent.
 
 In a farm each box also publishes what `status` shows, for the netidx browser.
 Beside its state columns, its status row has figures for people: jobs
-`waiting`, `running` and `serving`, `load`, per class `class speed` now and
-`class idle speed`, `heavy threads` and `heavy thread speed`, per class
+`waiting`, `running` and `serving`, per class `class speed` now and
+`class idle speed`, `heavy threads` and `heavy thread speed`, speeds in G
+instructions of the calibration load per second (calibrated rate over learned
+factor), which compare across boxes where `status`'s relative ones don't, per
+class
 `class running`, `class serving` and tokens `lent`, `finishing` under the last
 profile, memory
 (`mem GiB`, `mem growth GiB` predicted from running jobs, `mem cap GiB`) and
