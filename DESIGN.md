@@ -366,10 +366,20 @@ the unit nor its crate has run before), if it is predicted to take at least
 local class has a free slot left, or its predicted memory doesn't fit. A job
 with history chooses among local classes as above, and goes to another box
 instead if it would finish there sooner, counting the time its sends there
-spend moving files (see Cost). A job with no history has nothing to predict
-with, so it takes free capacity: the fastest local class with a token, else the
-fastest other box with one free, else it waits for the local class expected to
-free first.
+spend moving files (see Cost). That includes a box with no token free, from
+when it predicts one frees: with the laptop busy running tests, a job waits for
+another box rather than start here and take longer. A job waiting for a box
+adds its predicted time over the class's CPUs to that class's wait for jobs
+placed after it, as on this box. When jobs from here took the tokens a box
+shows free, before its state counts them, the next frees when the first of
+those jobs is predicted to end. A job that waits for a token is predicted at
+the load there now, its own threads left out, since it takes over from a job
+that ends; one that starts now adds them.
+
+A job with no history has no size to say waiting pays: it goes where it
+finishes soonest of the places with a token free, here or another box, else
+waits for this box's. Its size is the median of every unit's, so what decides
+is how fast each place runs now, its load included.
 
 A job is local-only if:
 
@@ -702,7 +712,7 @@ libraries and linker, kept so by the sysadmin.
 
 - A heavy job with history also considers a box with no token free, starting
   when that box predicts its next token frees, and waits for it if it
-  finishes there soonest (built 2026-10-31). It is offered once the box shows
+  finishes there soonest (built 2026-10-31; light jobs too, 2026-11-01). It is offered once the box shows
   a free token; until then no other job from here takes that box's tokens,
   since none show free.
 - Each job's predicted transfer time replaced the flat 200 ms in Stage 5.

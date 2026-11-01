@@ -524,11 +524,6 @@ impl Layout {
         self.leases.iter().filter(|l| l.pinned.is_none()).map(|l| l.lent[class]).sum()
     }
 
-    /// The fastest calibrated rate and the mean over CPUs.
-    fn spread_rates(&self) -> (u64, u64) {
-        spread_rates(self.classes.iter().map(|c| (c.rate, c.cpus.len() as u64)))
-    }
-
     /// Classes by their calibrated rate, fastest first.
     fn by_speed(&self) -> LPooled<Vec<usize>> {
         let mut order: LPooled<Vec<usize>> = LPooled::take();
@@ -724,6 +719,8 @@ struct RemoteBox {
     /// what its state shows free, less what jobs sent there that it doesn't
     /// show yet hold.
     avail: Vec<u32>,
+    /// µs until the first of those jobs is predicted to end.
+    unseen_left_us: Option<u64>,
     /// It answered busy, so its state is stale until this version.
     busy_until: Option<u64>,
     /// When its state arrived, which its predictions count from.
@@ -731,10 +728,17 @@ struct RemoteBox {
 }
 
 impl RemoteBox {
-    /// µs until its state predicts a token frees, if it can say.
-    fn frees_in_us(&self, now: Instant) -> Option<u64> {
+    /// µs until a token of class `k`, which has none for jobs from here,
+    /// is predicted to free: as its state says, or, if the tokens it shows
+    /// free went to jobs from here it doesn't show yet, when the first of
+    /// those ends.
+    fn frees_in_us(&self, k: usize, now: Instant) -> Option<u64> {
         let (state, _) = self.state.as_ref()?;
-        let ms = state.classes.iter().filter_map(|c| c.frees_in_ms).min()?;
+        let class = state.classes.get(k)?;
+        if class.free > 0 {
+            return self.unseen_left_us;
+        }
+        let ms = class.frees_in_ms?;
         Some((ms as u64 * 1000).saturating_sub(now.duration_since(self.seen).as_micros() as u64))
     }
 
@@ -777,11 +781,6 @@ fn spread_rates(classes: impl Iterator<Item = (u64, u64)>) -> (u64, u64) {
         cpus += n;
     }
     (fast, (sum / cpus.max(1)).max(1))
-}
-
-/// `spread_rates` of another box's published classes.
-fn state_rates(classes: &[ClassState]) -> (u64, u64) {
-    spread_rates(classes.iter().map(|c| (c.rate, c.cpus as u64)))
 }
 
 /// Whether a job runs pinned to one class.
@@ -1095,6 +1094,7 @@ impl Sched {
                     jobs: NPath::root(),
                     state: None,
                     avail: Vec::new(),
+                    unseen_left_us: None,
                     busy_until: None,
                     seen: Instant::now(),
                 });
@@ -1331,10 +1331,12 @@ impl Sched {
         }
     }
 
-    /// Predicted µs at `spot` on a box under `load_c`, before the job adds
-    /// its own threads.
-    fn run_us(&self, pred: &Prediction, spot: &Spot, load_c: u32) -> u64 {
-        self.stats.time_us(pred, spot.at, load_c + spot.adds, spot.threads)
+    /// Predicted µs at `spot` on a box under `load_c`: with the job's own
+    /// threads added if it starts now, and not if it waits for a token,
+    /// since it then takes over from a job that ends.
+    fn run_us(&self, pred: &Prediction, spot: &Spot, load_c: u32, waits: bool) -> u64 {
+        let load_c = if waits { load_c } else { load_c + spot.adds };
+        self.stats.time_us(pred, spot.at, load_c, spot.threads)
     }
 
     fn dispatch(&mut self) {
@@ -1380,11 +1382,13 @@ impl Sched {
         // The soonest a job this dispatch places in each class finishes.
         let mut placed_us: LPooled<Vec<u64>> = LPooled::take();
         placed_us.resize(held.len(), u64::MAX);
-        self.count_available();
+        self.count_available(now);
         let fastest = self.layout.by_speed()[0];
         let fastest_rate = self.layout.classes[fastest].rate;
         let id = self.layout.id;
-        let (_, spread_rate) = self.layout.spread_rates();
+        // How much later than its state predicts each class of each box frees
+        // a token, for the jobs this dispatch has set waiting for it.
+        let mut queued: LPooled<HashMap<(usize, usize), u64>> = LPooled::take();
         // Each box's load, counting the jobs this dispatch places there.
         let mut load_here = self.load_c;
         let mut load_there: LPooled<Vec<u32>> = LPooled::take();
@@ -1399,6 +1403,9 @@ impl Sched {
         let mut cands: LPooled<Vec<Cand>> = LPooled::take();
         let mut wide: LPooled<Vec<Wide>> = LPooled::take();
         let mut granted: LPooled<Vec<(usize, Place, u64, PlaceId)>> = LPooled::take();
+        let queue_us = |queued: &HashMap<(usize, usize), u64>, r: usize, k: usize| {
+            queued.get(&(r, k)).copied().unwrap_or(0)
+        };
         for &i in admissible.iter() {
             let w = &self.queue[i];
             let fits = !mem_blocked && (first_here || w.pred.mem_kb <= mem_free);
@@ -1414,32 +1421,41 @@ impl Sched {
                 for k in 0..local {
                     let place = Place::Local { layout: id, class: k };
                     let spot = self.spot(&w.pred, &w.unit, place);
-                    let run_us = self.run_us(&w.pred, &spot, load_here);
+                    let waits = held[k] == 0;
+                    let run_us = self.run_us(&w.pred, &spot, if waits { self.load_c } else { load_here }, waits);
                     cands.push(Cand { run_us, frees_in_us: frees_in[k], copy_us: 0, spot, place });
                 }
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Some((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
                     let cpus = state.classes.iter().map(|c| c.cpus as u64).sum();
                     for (k, &at) in places.classes.iter().enumerate() {
-                        if rb.avail.get(k).is_some_and(|n| *n > 0) {
-                            let place = Place::Remote { remote: r, class: Some(k), shown_in: None };
-                            let spot = Spot::new(&w.pred, &w.unit, at, true, cpus);
-                            let run_us = self.run_us(&w.pred, &spot, load_there[r]);
-                            let copy_us = self.stats.copy_us(&w.unit, at).unwrap_or(REMOTE_OVERHEAD_US);
-                            cands.push(Cand { run_us, frees_in_us: 0, copy_us, spot, place });
-                        }
+                        // A busy class is worth waiting for if it finishes the
+                        // job sooner than anywhere free.
+                        let waits = rb.avail.get(k).is_none_or(|&n| n == 0);
+                        let frees_in_us = match waits {
+                            false => 0,
+                            true => match rb.frees_in_us(k, now) {
+                                Some(t) => t + queue_us(&queued, r, k),
+                                None => continue,
+                            },
+                        };
+                        let place = Place::Remote { remote: r, class: Some(k), shown_in: None };
+                        let spot = Spot::new(&w.pred, &w.unit, at, true, cpus);
+                        let load_c = if waits { state.load_c } else { load_there[r] };
+                        let run_us = self.run_us(&w.pred, &spot, load_c, waits);
+                        let copy_us = self.stats.copy_us(&w.unit, at).unwrap_or(REMOTE_OVERHEAD_US);
+                        cands.push(Cand { run_us, frees_in_us, copy_us, spot, place });
                     }
                 }
                 (!cands.is_empty()).then(|| {
                     let slack_us = time_us(horizon[&w.build].saturating_sub(w.rank_mi), fastest_rate);
                     let c = &cands[choose(&cands, local, slack_us)];
-                    (c.place, c.copy_us + c.run_us, c.spot)
+                    (c.place, c.copy_us + c.run_us, c.spot, None)
                 })
             } else {
                 // Its front end runs first, on one thread, so the short jobs
                 // holding tokens now are gone by the time its codegen wants
                 // them: a box can give it as many threads as it has CPUs.
-                let tokens = held.iter().sum::<u32>() as u64;
                 wide.clear();
                 if fits {
                     // Its first token from the fastest class with one, or it
@@ -1451,32 +1467,39 @@ impl Sched {
                     };
                     let place = Place::Spread { layout: id, class };
                     let spot = self.spot(&w.pred, &w.unit, place);
-                    let run_us = self.run_us(&w.pred, &spot, load_here);
-                    wide.push(Wide { start_us, run_us, spot, capacity: spread_rate * tokens, place });
+                    let waits = held[class] == 0;
+                    let run_us = self.run_us(&w.pred, &spot, if waits { self.load_c } else { load_here }, waits);
+                    wide.push(Wide { start_us, run_us, spot, queue: None, place });
                 }
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Some((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
-                    let avail = rb.avail.iter().sum::<u32>() as u64;
-                    let (_, rate) = state_rates(&state.classes);
                     let cpus = state.classes.iter().map(|c| c.cpus as u64).sum();
                     let place = Place::Remote { remote: r, class: None, shown_in: None };
                     let spot = Spot::new(&w.pred, &w.unit, places.all, false, cpus);
-                    let run_us = self.run_us(&w.pred, &spot, load_there[r]);
+                    let waits = rb.avail.iter().all(|&n| n == 0);
+                    let load_c = if waits { state.load_c } else { load_there[r] };
+                    let run_us = self.run_us(&w.pred, &spot, load_c, waits);
                     let copy_us = self.stats.copy_us(&w.unit, places.all).unwrap_or(REMOTE_OVERHEAD_US);
                     // A busy box is worth waiting for if it finishes the job
                     // sooner than anywhere free; with no history to say so,
-                    // the job takes free capacity.
-                    let start_us = if avail > 0 { Some(0) } else { rb.frees_in_us(now).filter(|_| w.pred.known) };
-                    if let Some(start_us) = start_us {
-                        wide.push(Wide { start_us, run_us: copy_us + run_us, spot, capacity: rate * avail, place });
+                    // the job doesn't wait for one.
+                    let start = match !waits {
+                        true => Some((0, None)),
+                        false if w.pred.known => (0..state.classes.len())
+                            .filter_map(|k| Some((rb.frees_in_us(k, now)? + queue_us(&queued, r, k), Some(k))))
+                            .min(),
+                        false => None,
+                    };
+                    if let Some((start_us, queue)) = start {
+                        wide.push(Wide { start_us, run_us: copy_us + run_us, spot, queue, place });
                     }
                 }
                 (!wide.is_empty()).then(|| {
                     let c = &wide[pick_wide(&wide, w.pred.known)];
-                    (c.place, c.run_us, c.spot)
+                    (c.place, c.run_us, c.spot, c.queue)
                 })
             };
-            let Some((place, run_us, spot)) = picked else {
+            let Some((place, run_us, spot, queue)) = picked else {
                 mem_blocked = true;
                 self.starved = true;
                 continue;
@@ -1490,8 +1513,17 @@ impl Sched {
             match place {
                 Place::Remote { remote, class, .. } => {
                     let RemoteBox { state, avail, .. } = &mut self.remotes[remote];
-                    if class.is_none() && avail.iter().all(|&n| n == 0) {
-                        // It waits for a token there to free.
+                    let waits = match class {
+                        Some(k) => avail.get(k).is_none_or(|&n| n == 0),
+                        None => avail.iter().all(|&n| n == 0),
+                    };
+                    if waits {
+                        // It waits for a token there to free. Jobs after it
+                        // see the queue it joins there.
+                        if let (Some(k), Some((state, _))) = (class.or(queue), state.as_ref()) {
+                            let cpus = state.classes.get(k).map_or(1, |c| c.cpus as u64).max(1);
+                            *queued.entry((remote, k)).or_default() += run_us / cpus;
+                        }
                         self.starved = true;
                         continue;
                     }
@@ -1500,6 +1532,8 @@ impl Sched {
                         (None, Some((state, _))) => take_fastest(avail, &state.classes, 1),
                         (None, None) => (),
                     }
+                    let unseen = &mut self.remotes[remote].unseen_left_us;
+                    *unseen = Some(unseen.map_or(run_us, |t| t.min(run_us)));
                     load_there[remote] += spot.adds;
                     granted.push((i, place, run_us, spot.at));
                 }
@@ -1545,19 +1579,25 @@ impl Sched {
 
     /// What each box has free for jobs from here: the free tokens its state
     /// shows, less those that jobs sent there it doesn't show yet hold.
-    fn count_available(&mut self) {
+    fn count_available(&mut self, now: Instant) {
         for rb in &mut self.remotes {
             rb.avail.clear();
+            rb.unseen_left_us = None;
             if let Some((state, _)) = &rb.state {
                 rb.avail.extend(state.classes.iter().map(|c| c.free));
             }
         }
         for r in &self.running {
             let Place::Remote { remote, class, shown_in } = r.place else { continue };
-            let RemoteBox { state: Some((state, _)), avail, .. } = &mut self.remotes[remote] else { continue };
+            let RemoteBox { state: Some((state, _)), avail, unseen_left_us, .. } = &mut self.remotes[remote]
+            else {
+                continue;
+            };
             if shown_in.is_some_and(|v| state.version >= v) {
                 continue;
             }
+            let left = r.left_us(now);
+            *unseen_left_us = Some(unseen_left_us.map_or(left, |t| t.min(left)));
             match class {
                 Some(k) => {
                     if let Some(n) = avail.get_mut(k) {
@@ -1593,7 +1633,7 @@ impl Sched {
             .lease(job, pinned, first, unit.codegen_units, fifo_dir, &cpus, meter.clone())
             .with_context(|| format_compact!("starting {}", unit.exact))?;
         let spot = self.spot(&pred, &unit, place);
-        let (at, run_us) = (spot.at, self.run_us(&pred, &spot, self.load_c));
+        let (at, run_us) = (spot.at, self.run_us(&pred, &spot, self.load_c, false));
         self.running.push(Running {
             job,
             build,
@@ -1857,24 +1897,21 @@ struct Wide {
     start_us: u64,
     run_us: u64,
     spot: Spot,
-    /// The instructions per µs its free tokens there are worth.
-    capacity: u64,
+    /// The class of another box whose next free token it would wait for.
+    queue: Option<usize>,
     place: Place,
 }
 
-/// Where a heavy job runs: where it finishes soonest. With no history to
-/// predict by, this box if it has a token free, else the other box with
-/// the most free capacity, else this box when a token frees.
+/// Where a heavy job runs: where it finishes soonest. A job with no history
+/// has no size to say waiting pays, so it goes where it finishes soonest of
+/// the places with a token free, else waits for this box's.
 fn pick_wide(cands: &[Wide], known: bool) -> usize {
-    if known {
-        return cands.iter().enumerate().min_by_key(|(_, c)| c.start_us + c.run_us).map_or(0, |(i, _)| i);
-    }
-    let here = cands.iter().position(|c| c.place.here());
-    if let Some(i) = here.filter(|&i| cands[i].start_us == 0) {
-        return i;
-    }
-    let away = cands.iter().enumerate().filter(|(_, c)| !c.place.here());
-    away.max_by_key(|(_, c)| c.capacity).map(|(i, _)| i).or(here).unwrap_or(0)
+    let soonest = |free_only: bool| {
+        let open = cands.iter().enumerate().filter(|(_, c)| !free_only || c.start_us == 0);
+        open.min_by_key(|(_, c)| c.start_us + c.run_us).map(|(i, _)| i)
+    };
+    let free = if known { None } else { soonest(true) };
+    free.or_else(|| soonest(false)).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1949,26 +1986,28 @@ mod test {
     }
 
     #[test]
-    fn heavy_jobs_go_where_they_finish_first_or_where_tokens_are_free() {
-        let wide = |start_us, run_us, capacity, here: bool| Wide {
+    fn heavy_jobs_go_where_they_finish_first() {
+        let wide = |start_us, run_us, here: bool| Wide {
             start_us,
             run_us,
             spot: spot(),
-            capacity,
+            queue: None,
             place: if here {
                 Place::Spread { layout: LayoutId::new(), class: 0 }
             } else {
                 Place::Remote { remote: 0, class: None, shown_in: None }
             },
         };
-        // No history: a free token here, else the box with the most free capacity.
-        assert_eq!(pick_wide(&[wide(0, 9000, 10, true), wide(0, 10, 100, false)], false), 0);
-        let waiting = [wide(500, 10, 0, true), wide(0, 10, 10, false), wide(0, 10, 100, false)];
-        assert_eq!(pick_wide(&waiting, false), 2);
-        assert_eq!(pick_wide(&[wide(500, 10, 0, true)], false), 0, "it waits here");
-        // History: wherever it finishes first.
-        assert_eq!(pick_wide(&[wide(0, 9000, 10, true), wide(0, 1000, 100, false)], true), 1);
-        assert_eq!(pick_wide(&[wide(0, 900, 10, true), wide(0, 1000, 100, false)], true), 0);
+        // No history: where it finishes soonest of the places with a token
+        // free, else it waits here.
+        assert_eq!(pick_wide(&[wide(0, 9000, true), wide(0, 10, false)], false), 1);
+        assert_eq!(pick_wide(&[wide(0, 10, true), wide(0, 9000, false)], false), 0);
+        assert_eq!(pick_wide(&[wide(500, 10, true), wide(0, 9000, false)], false), 1, "no size says waiting pays");
+        assert_eq!(pick_wide(&[wide(500, 10, true)], false), 0, "it waits here");
+        // History: wherever it finishes first, waiting included.
+        assert_eq!(pick_wide(&[wide(0, 9000, true), wide(0, 1000, false)], true), 1);
+        assert_eq!(pick_wide(&[wide(0, 900, true), wide(0, 1000, false)], true), 0);
+        assert_eq!(pick_wide(&[wide(0, 9000, true), wide(500, 1000, false)], true), 1, "it waits for the other box");
     }
 
     struct Harness {
@@ -1983,12 +2022,14 @@ mod test {
     struct Room {
         memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
         tokens_per_cpu: f64,
+        /// Tasks runnable on the box, whatever runs there.
+        runnable: u32,
     }
 
     /// An idle box with `capacity_kb` that nothing else uses, and a token
     /// per CPU.
     fn room(capacity_kb: u64) -> Room {
-        Room { memory: Box::new(move || Ok(BoxMemory { capacity_kb, used_kb: 0 })), tokens_per_cpu: 1. }
+        Room { memory: Box::new(move || Ok(BoxMemory { capacity_kb, used_kb: 0 })), tokens_per_cpu: 1., runnable: 0 }
     }
 
     /// A scheduler on the state in `dir`, in the default profile.
@@ -1998,7 +2039,10 @@ mod test {
             fifo_dir: dir.to_path_buf(),
             allowed: (0..4).collect(),
             memory: room.memory,
-            runnable: Box::new(|| Ok(0)),
+            runnable: {
+                let n = room.runnable;
+                Box::new(move || Ok(n))
+            },
             tokens_per_cpu: room.tokens_per_cpu,
             calibration_seconds: 4,
         };
@@ -2324,7 +2368,7 @@ mod test {
         let memory =
             Box::new(move || Ok(BoxMemory { capacity_kb: 1000, used_kb: used.load(Ordering::Relaxed) }));
         let costs = [("small", 10, 100), ("big", 10, 600)];
-        let room = Room { memory, tokens_per_cpu: 1. };
+        let room = Room { memory, tokens_per_cpu: 1., runnable: 0 };
         let h = Harness::start_with("others", vec![class(1000, &[0, 1, 2, 3])], room, &costs, &[])?;
         let small = slot(h.submit("small")).await?;
         let mut big = h.submit("big");
@@ -2744,9 +2788,10 @@ mod test {
 
     #[tokio::test]
     async fn a_job_sent_away_counts_against_the_box_until_its_state_shows_it() -> Result<()> {
-        // 5 s here, 1 s there.
+        // 5 s here, 3.2 s there with its files: too long to wait for the
+        // token the first takes.
         let h = Harness::start("unseen", vec![class(1000, &[0])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;
-        h.farm(remote_box(200, 4, 1, 1));
+        h.farm(remote_box(600, 4, 1, 1));
         let Admission::Remote(sent) = admitted(h.submit_with("big", want())).await? else {
             bail!("not sent remote");
         };
@@ -2754,11 +2799,11 @@ mod test {
         let mut third = h.submit_with("big", want());
         assert!(pending(&mut third).await, "b's one free token is taken");
         sent.accepted(5);
-        h.farm(remote_box(200, 4, 1, 4));
+        h.farm(remote_box(600, 4, 1, 4));
         assert!(pending(&mut third).await, "version 4 doesn't count the job yet");
-        h.farm(remote_box(200, 4, 0, 5));
+        h.farm(remote_box(600, 4, 0, 5));
         assert!(pending(&mut third).await, "version 5 counts it");
-        h.farm(remote_box(200, 4, 1, 6));
+        h.farm(remote_box(600, 4, 1, 6));
         assert!(matches!(admitted(third).await?, Admission::Remote(_)), "another token freed");
         drop((sent, here));
         Ok(())
@@ -2783,6 +2828,56 @@ mod test {
         s.dispatch();
         let [a, b] = &mut replies;
         assert!(matches!((a.try_recv()?, b.try_recv()?), (Admission::Slot(_), Admission::Remote(_))));
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A box `b` with one class, `free` tokens, and one predicted to free in
+    /// `frees_in_ms`.
+    fn busy_box(calib_us: u64, cpus: u32, free: u32, frees_in_ms: u32, version: u64) -> (NPath, BoxState) {
+        let (jobs, mut state) = remote_box(calib_us, cpus, free, version);
+        state.classes[0].frees_in_ms = Some(frees_in_ms);
+        (jobs, state)
+    }
+
+    #[tokio::test]
+    async fn light_jobs_wait_for_a_busy_box_rather_than_run_slower_here() -> Result<()> {
+        let dir = scratch("wait-light");
+        // Tests keep 12.5 tasks per cpu runnable here, so a job takes 12.75
+        // times its calibrated 1 s, and more as more run. b is as fast and
+        // idle but full: a token frees in 1.5 s, and each job takes 1.2 s
+        // there, moving files included.
+        let room = Room { runnable: 50, ..room(u64::MAX) };
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
+        s.farm("b".into(), Some(busy_box(1000, 1, 0, 1500, 1)));
+        history(&mut s, "narrow", 1_000_000, 100);
+        let mut rx = place(&mut s, &["narrow"; 12], true);
+        // The tenth to wait would finish after 1.5 + 9 × 1.2 + 1.2 = 13.5 s:
+        // it and the rest run here, on the 4 tokens free.
+        let here = rx.iter_mut().map(|r| r.try_recv()).filter(|a| matches!(a, Ok(Admission::Slot(_)))).count();
+        assert_eq!(here, 3, "nine wait for b, each behind the ones before it");
+        assert_eq!(s.queue.len(), 9);
+        // b frees a token: the first goes.
+        s.farm("b".into(), Some(remote_box(1000, 1, 1, 2)));
+        s.dispatch();
+        assert_eq!(s.queue.len(), 8);
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_history_goes_where_it_runs_fastest_now() -> Result<()> {
+        let dir = scratch("unknown-load");
+        // A token is free here, but tests keep 12.5 tasks per cpu runnable.
+        let room = Room { runnable: 50, ..room(u64::MAX) };
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
+        s.farm("b".into(), Some(remote_box(1000, 4, 4, 1)));
+        // What other units take says a new one takes 5 s on a cpu.
+        history(&mut s, "other", 5_000_000, 100);
+        let mut rx = place(&mut s, &["new"], true);
+        assert!(matches!(rx[0].try_recv(), Ok(Admission::Remote(_))), "b is idle");
         drop(s);
         fs::remove_dir_all(&dir)?;
         Ok(())
