@@ -29,6 +29,13 @@ use std::{
 const PRIOR_US: f64 = 3_000_000.;
 /// Load buckets, in hundredths of a runnable task per CPU.
 const BUCKETS: [u32; 11] = [0, 25, 50, 75, 100, 150, 200, 300, 400, 600, 800];
+/// Places work out their factors again once the time weights decay to
+/// has moved this many half-lives: a minute at a day's, which moves a
+/// weight a twentieth of a percent.
+const REFRESH_HALF_LIVES: f64 = 1. / 1440.;
+/// A unit's own runs at a place or on a box, or its own sends to a place,
+/// stand for it there while they weigh at least this many fresh ones.
+const OWN_WEIGHT: f64 = 0.5;
 /// The comparisons each load bucket of a place keeps.
 const COMPARISONS_KEPT: usize = 32;
 /// The runs each unit keeps.
@@ -55,7 +62,9 @@ const COPY_US: f64 = 200_000.;
 /// Predicted size, in millions of instructions, of a job when nothing at
 /// all has been recorded.
 const UNKNOWN_COST_MI: u64 = 1000;
-const MAGIC: &[u8; 8] = b"rdstats9";
+const MAGIC: &[u8; 8] = b"rdstat10";
+/// A table whose runs are work at their place's calibration.
+const WORK_MAGIC: &[u8; 8] = b"rdstats9";
 /// A table of decayed sums, read as one sample for each sum.
 const SUMS_MAGIC: &[u8; 8] = b"rdstats8";
 /// A table from before runs were timed, read as seed history.
@@ -95,7 +104,7 @@ fn median(samples: &mut [(f64, f64)]) -> Option<f64> {
 
 /// Push `x` onto `q`, dropping the oldest past `cap`.
 fn push<T>(q: &mut VecDeque<T>, x: T, cap: usize) {
-    if q.len() == cap {
+    while q.len() >= cap {
         q.pop_front();
     }
     q.push_back(x);
@@ -257,25 +266,37 @@ impl Place {
         let mut p = Self {
             key,
             group,
-            fast: fast.max(1),
-            rate: rate.max(1),
+            fast: 1,
+            rate: 1,
             curve: std::array::from_fn(|_| VecDeque::new()),
             sends: [VecDeque::new(), VecDeque::new()],
             factors: [1.; BUCKETS.len()],
             per_kb: [SEND_US_PER_KB; 2],
         };
-        p.refresh(0., 1.);
+        p.recalibrate(fast, rate);
         p
+    }
+
+    /// Start its curve over from a calibration at `fast` and `rate`. Its
+    /// sends say nothing about its CPUs, so they stay.
+    fn recalibrate(&mut self, fast: u64, rate: u64) {
+        (self.fast, self.rate) = (fast.max(1), rate.max(1));
+        for q in &mut self.curve {
+            q.clear();
+        }
+        self.refresh(0., 1.);
     }
 
     /// Work out the factor at each bucket's load as of `now`. A bucket
     /// runs have reached takes the weighted median of their comparisons
     /// and of the starting curve, which counts as `PRIOR_US` and never
     /// ages. Idle is where the calibration ran, so with no runs there it
-    /// keeps the calibration's factor. More load never makes a run faster,
-    /// so buckets that say otherwise are pooled, by the weight of what each
-    /// learned. A bucket between those is interpolated; one past the last
-    /// follows the starting curve's slope.
+    /// keeps the calibration's factor, while every busier bucket learns at
+    /// least that. More load never makes a run faster, so buckets that say
+    /// otherwise are pooled, by the weight of what each learned, and the
+    /// idle anchor, which weighs only `PRIOR_US`, pools into a busier
+    /// bucket that learned less. A bucket between those is interpolated;
+    /// one past the last follows the starting curve's slope.
     fn refresh(&mut self, now: f64, half_life_s: f64) {
         let mut samples: LPooled<Vec<(f64, f64)>> = LPooled::take();
         // Each bucket with a factor, its factor, and the weight behind it.
@@ -295,7 +316,7 @@ impl Place {
                 learned.push((i, prior(load_c) * r, weight));
             }
         }
-        // CR claude for claude: [doc-drift/medium] The idle anchor is pooled away whenever a
+        // XCR claude for claude: [doc-drift/medium] The idle anchor is pooled away whenever a
         // busier bucket learned a factor below the calibration: the anchor weighs only
         // PRIOR_US, so pool adjacent violators averages it into that bucket's much
         // heavier mean. Probe (a temporary test, `cargo test --bin rustc-dist
@@ -314,6 +335,14 @@ impl Place {
         // 2026-11-01 claude: Eric ruled (2026-11-01): monotonicity wins (a): fix the docs
         // to say the anchor holds only while busier buckets learn at least the
         // calibration, and add a test for the case below it.
+        // 2026-11-01 claude: Per the ruling, the code is unchanged. Place::refresh's doc and
+        // DESIGN.md's Cost section (the curve paragraph and the washu-chan 0.42 example) now
+        // say that the idle anchor holds only while every busier bucket learns at least the
+        // calibration, and that one which learns less pools the anchor most of the way down.
+        // Pin: a_busy_factor_below_the_calibration_pools_the_idle_anchor_into_it (a runs at
+        // 2 tasks per CPU in 0.4 of b's idle time; factor(a, 0) == factor(a, 200) < 0.9,
+        // curve monotone). It passes on the old code by design, and fails if bucket 0 is
+        // left out of the pooling.
         non_decreasing(&mut learned);
         for (j, f) in self.factors.iter_mut().enumerate() {
             let (lo, a) = learned.iter().rev().find(|l| l.0 <= j).map_or((0, prior(0)), |l| (l.0, l.1));
@@ -380,11 +409,31 @@ impl Place {
     }
 }
 
-/// A unit's run at a place: its work counted at the place's calibrated
-/// speed, which the place's factor at the run's load divides into the
+/// A unit's run at a place, as measured: its front end's µs, and its µs
+/// and token-µs after that. The place's calibrated speed now makes that
+/// work, which the place's factor at the run's load divides into the
 /// unit's size.
 #[derive(Clone, Copy)]
 struct RunSample {
+    place: PlaceId,
+    at: f64,
+    load_c: u32,
+    front_us: f64,
+    rest_us: f64,
+    tokens_us: f64,
+}
+
+impl RunSample {
+    /// Its front end's work and the rest's, in millions of instructions,
+    /// at `p`'s calibrated speed.
+    fn work_mi(&self, p: &Place) -> (f64, f64) {
+        (self.front_us * p.fast as f64 / 1e6, self.tokens_us * p.rate as f64 / 1e6)
+    }
+}
+
+/// A run as tables before rdstat10 kept it: its work at its place's
+/// calibration, with the µs and token-µs after its front end.
+struct WorkSample {
     place: PlaceId,
     at: f64,
     load_c: u32,
@@ -392,6 +441,23 @@ struct RunSample {
     rest_mi: f64,
     rest_us: f64,
     tokens_us: f64,
+}
+
+impl WorkSample {
+    /// The run that takes its work at its place's calibration, as wide.
+    fn measured(self, places: &[Place]) -> RunSample {
+        let p = &places[self.place.0 as usize];
+        let tokens_us = self.rest_mi * 1e6 / p.rate as f64;
+        let rest_us = if self.tokens_us > 0. { self.rest_us * tokens_us / self.tokens_us } else { 0. };
+        RunSample {
+            place: self.place,
+            at: self.at,
+            load_c: self.load_c,
+            front_us: self.front_mi * 1e6 / p.fast as f64,
+            rest_us,
+            tokens_us,
+        }
+    }
 }
 
 /// One of a unit's sends to a place.
@@ -462,7 +528,7 @@ impl Record {
             self.sent_kb.saturating_record(t.sent_kb.max(1));
         }
         self.runs[origin.index()] += 1;
-        // CR claude for claude: [bug/medium] Halving with `count / 2` drops every value
+        // XCR claude for claude: [bug/medium] Halving with `count / 2` drops every value
         // recorded once, and those are mostly the tail, so admission's p90 peak loses
         // its high runs at each halving. Probe (a temporary test, `cargo test --bin
         // rustc-dist zz_probe`): 255 runs of one unit, 229 at 500_000 kB and 26 from
@@ -473,16 +539,18 @@ impl Record {
         // (status medians). Fix: round up, `(count + 1) / 2`, which keeps every value
         // (an old singleton then never fades, which errs high for a peak), or replace
         // the histograms with the kept samples (stats-03). (stats-02)
+        // 2026-11-01 claude: Halving is now the free fn halved, which halves the count
+        // at or above each value, rounding up, rather than each value's own count.
+        // Every quantile stays where it was to within one run, the total halves, and
+        // the highest value stays. That is better than rounding each count up, which
+        // keeps every singleton forever (26 singletons out of 154 hold p90 in the tail
+        // for good). Regression: halving_a_units_histograms_keeps_their_quantiles,
+        // which is the probe plus a fade check. With count / 2, p90 drops to about
+        // 501_759 at the 256th run; with per-value div_ceil it stays at 962_559 four
+        // halvings later.
         if self.mem_kb.len() >= HALVE_AT {
             for h in self.all() {
-                let mut half = Histogram::new_from(h);
-                for v in h.iter_recorded() {
-                    let n = v.count_at_value() / 2;
-                    if n > 0 {
-                        half.record_n(v.value_iterated_to(), n).expect("same bounds");
-                    }
-                }
-                *h = half;
+                *h = halved(h);
             }
         }
     }
@@ -493,10 +561,11 @@ impl Record {
             (LPooled::take(), LPooled::take(), LPooled::take());
         let mut runs = 0.;
         for r in self.runs_kept.iter().filter(|r| counts(r)) {
-            let (k, m) = (keep(r.at, now, half_life_s), places[r.place.0 as usize].factor(r.load_c));
+            let p = &places[r.place.0 as usize];
+            let (k, m, (front_mi, rest_mi)) = (keep(r.at, now, half_life_s), p.factor(r.load_c), r.work_mi(p));
             runs += k;
-            front.push((r.front_mi / m, k));
-            rest.push((r.rest_mi / m, k));
+            front.push((front_mi / m, k));
+            rest.push((rest_mi / m, k));
             let w = if r.rest_us > 0. { (r.tokens_us / r.rest_us).max(1.) } else { 1. };
             width.push((w, k));
         }
@@ -566,6 +635,23 @@ fn histogram(high: u64) -> Histogram<u32> {
     Histogram::new_with_bounds(1, high, 2).expect("histogram bounds")
 }
 
+/// `h` at half its count: half the count at or above each value, rounded
+/// up, so every quantile stays where it was, to within one run, and the
+/// highest value stays.
+fn halved(h: &Histogram<u32>) -> Histogram<u32> {
+    let mut half = Histogram::new_from(h);
+    let mut above = h.len();
+    for v in h.iter_recorded() {
+        let rest = above - u64::from(v.count_at_value());
+        let n = above.div_ceil(2) - rest.div_ceil(2);
+        if n > 0 {
+            half.record_n(v.value_iterated_to(), n as u32).expect("same bounds");
+        }
+        above = rest;
+    }
+    half
+}
+
 pub struct Stats {
     places: Vec<Place>,
     by_key: HashMap<ArcStr, PlaceId>,
@@ -576,12 +662,15 @@ pub struct Stats {
     global_mem: Histogram<u32>,
     /// Seconds since the epoch, which weights decay to: see `set_now`.
     now: f64,
+    /// The `now` every place's factors were last worked out at.
+    refreshed: f64,
     decay: Decay,
     pub dirty: bool,
 }
 
 impl Stats {
     pub fn new(decay: Decay) -> Self {
+        let now = now_s();
         let mut stats = Self {
             places: Vec::new(),
             by_key: HashMap::new(),
@@ -589,7 +678,8 @@ impl Stats {
             coarse: HashMap::new(),
             global_cost: histogram(1_000_000_000),
             global_mem: histogram(1 << 30),
-            now: now_s(),
+            now,
+            refreshed: now,
             decay,
             dirty: false,
         };
@@ -597,28 +687,42 @@ impl Stats {
         stats
     }
 
-    /// Age every weight to `now`, seconds since the epoch.
+    /// Age every weight to `now`, seconds since the epoch. Places work out
+    /// their factors again once `now` is `REFRESH_HALF_LIVES` from where
+    /// they last did.
     pub fn set_now(&mut self, now: f64) {
         self.now = now;
-        // CR claude for claude: [perf/low] Sched::run calls this before every event (each
+        // XCR claude for claude: [perf/low] Sched::run calls this before every event (each
         // message, the 100 ms token sample, the 250 ms measure), and each call reruns
         // every place's eleven bucket medians: on this box 14 places, each bucket up to
         // 32 comparisons with a powf and a sort, hundreds of times a second during a
         // build. Weights halve per day, so nothing moves between calls. Refresh only
         // once `now` has moved a minute or so past the last refresh; Place::learn
         // already refreshes the place it teaches. (stats-08)
-        for p in &mut self.places {
-            p.refresh(now, self.decay.half_life_s);
+        // 2026-11-01 claude: Stats keeps `refreshed`. set_now refreshes every place only once now is
+        // REFRESH_HALF_LIVES (1/1440, a minute at the default day) of half_life_s from
+        // it, in either direction, and rebuild_global resets it. It is a share of the
+        // half-life, not a fixed minute, because half_life_s is configurable down to 60
+        // s. Place::learn still refreshes the place it teaches. No test measures the
+        // saving. old_runs_stop_counting_as_they_age and
+        // a_units_runs_at_a_place_give_way_... fail if a jump of a day or more stops
+        // refreshing.
+        if (now - self.refreshed).abs() >= REFRESH_HALF_LIVES * self.decay.half_life_s {
+            self.refreshed = now;
+            for p in &mut self.places {
+                p.refresh(now, self.decay.half_life_s);
+            }
         }
     }
 
     /// The place `key`, calibrated at `fast` instructions per µs for a
     /// front end and `rate` per CPU. A place whose calibration changed
-    /// starts over from it.
+    /// starts its curve over from it, reads its runs at the new rates, and
+    /// keeps its sends.
     pub fn place(&mut self, key: &str, fast: u64, rate: u64) -> PlaceId {
         if let Some(&id) = self.by_key.get(key) {
             let p = &mut self.places[id.0 as usize];
-            // CR claude for claude: [bug/medium] A recalibrated place reads its old runs at
+            // XCR claude for claude: [bug/medium] A recalibrated place reads its old runs at
             // the new rate. RunSample keeps work (front_us * fast, tokens_us * rate) at the
             // calibration current when it ran, and Record::size divides that by the
             // place's factor now. This reset puts the factor back to the starting curve
@@ -638,8 +742,22 @@ impl Stats {
             // 2026-11-01 claude: Eric ruled (2026-11-01): store measured µs in each run and
             // apply the place's current rates when sizing; keep sends across a
             // recalibration (a).
+            // 2026-11-01 claude: RunSample now keeps measured µs (front_us, rest_us,
+            // tokens_us) and RunSample::work_mi applies the place's current fast and rate,
+            // in Record::size and for global_cost. Stats::place calls Place::recalibrate,
+            // which clears only the curve, so the sends and µs per kB stay. The table is
+            // now rdstat10 (8 bytes: rdstats10 does not fit MAGIC's [u8; 8]). An rdstats9
+            // table loads through read_work_run, and rdstats8 sums and rdstats4 seed runs
+            // through WorkSample::measured: each run becomes the µs its work takes at its
+            // place's saved calibration, at the same width, so it predicts what rdstats9
+            // did. Regression:
+            // a_recalibrated_place_reads_its_runs_at_its_new_rates_and_keeps_its_sends
+            // (fails on the old code: 500_000 after recalibrating; and 200_020, the guess,
+            // if the sends are dropped), and
+            // a_table_of_work_at_calibrated_speeds_loads_as_measured_runs for the rdstats9
+            // conversion, seed width included.
             if (p.fast, p.rate) != (fast.max(1), rate.max(1)) {
-                *p = Place::new(p.key.clone(), fast, rate);
+                p.recalibrate(fast, rate);
                 self.dirty = true;
             }
             return id;
@@ -668,19 +786,19 @@ impl Stats {
 
     /// Predicted µs a run of `unit` sent to `place`, where it must send
     /// `missing_kb`, spends other than compiling: the weighted median of
-    /// its own recent sends there, else those of every job there that
-    /// links as it does or doesn't, else a guess, each adjusted for
-    /// sending more or fewer kB than it did at the µs per kB sends there
-    /// show.
+    /// its own sends there while they weigh at least `OWN_WEIGHT` fresh
+    /// sends, else of those of every job there that links as it does or
+    /// doesn't, else a guess, each adjusted for sending more or fewer kB
+    /// than it did at the µs per kB sends there show.
     pub fn copy_us(&self, unit: &Unit, place: PlaceId, links: bool, missing_kb: u64) -> u64 {
-        let (now, half_life_s) = (self.now, self.decay.copy_half_life_s);
+        let half_life_s = self.decay.copy_half_life_s;
         let p = &self.places[place.0 as usize];
         let per_kb = p.per_kb[usize::from(links)];
-        let at = |s: &Send| (s.copy_us + per_kb * (missing_kb as f64 - s.kb), keep(s.at, now, half_life_s));
+        let at = |s: &Send, now: f64| (s.copy_us + per_kb * (missing_kb as f64 - s.kb), keep(s.at, now, half_life_s));
         let mut samples: LPooled<Vec<(f64, f64)>> = LPooled::take();
         let own = self.exact.get(&unit.exact).into_iter().flat_map(|r| &r.sends).filter(|s| s.place == place);
-        samples.extend(own.map(|s| at(&s.send)));
-        // CR claude for claude: [bug/medium] The unit's own sends win whenever it has any,
+        samples.extend(own.map(|s| at(&s.send, self.now)));
+        // XCR claude for claude: [bug/medium] The unit's own sends win whenever it has any,
         // however old: weights only count against each other inside one median, so two
         // sends from yesterday's network outvote 64 fresh sends of its kind, and the
         // copy half-life never hands a unit back to the place's sends. Probe (a
@@ -697,8 +815,22 @@ impl Stats {
         // 2026-11-01 claude: Eric ruled (2026-11-01): fall back by weight, not emptiness
         // (a): use the unit's own sends there only while they weigh at least half a
         // fresh send, else the place's.
-        if samples.is_empty() {
-            samples.extend(p.sends[usize::from(links)].iter().map(at));
+        // 2026-11-01 claude: copy_us uses the unit's own sends only while their weights
+        // sum to at least OWN_WEIGHT (0.5, half a fresh send), and otherwise the place's
+        // sends of that kind. Those are weighed from the newest of them rather than from
+        // now. A median doesn't move when every weight scales, so that is the same answer,
+        // and it never underflows to the guess while the place has sends. Regression:
+        // a_units_own_sends_give_way_to_the_places_as_they_age, which is the probe
+        // (10_000_000 on the old code, 100_000 now). At 50 days it still gives 100_000;
+        // with weights from now it gives 200_020, the guess.
+        if samples.iter().map(|(_, w)| w).sum::<f64>() < OWN_WEIGHT {
+            let sends = &p.sends[usize::from(links)];
+            // A median doesn't move when every weight scales, so weighing
+            // from the newest send gives what weighing from now would, and
+            // still works where weights from now would all round to 0.
+            let newest = sends.iter().map(|s| s.at).fold(f64::NEG_INFINITY, f64::max);
+            samples.clear();
+            samples.extend(sends.iter().map(|s| at(s, newest)));
         }
         median(&mut samples).unwrap_or(COPY_US + per_kb * missing_kb as f64).max(0.) as u64
     }
@@ -727,16 +859,17 @@ impl Stats {
         self.dirty = true;
     }
 
-    /// The prediction for a unit at `place`: from its runs there if it has
-    /// any, else from its runs elsewhere on that box, so a box is judged by
-    /// how long the unit took on it; each run counts at that place's factor
-    /// for the load it saw, so the prediction follows the load there now.
-    /// Only a unit that never ran on the box is predicted from its size.
+    /// The prediction for a unit at `place`: from its runs there while
+    /// they weigh at least `OWN_WEIGHT` fresh runs, else from its runs on
+    /// that box while those do, so a box is judged by how long the unit
+    /// took on it; each run counts at that place's factor for the load it
+    /// saw, so the prediction follows the load there now. Otherwise it is
+    /// predicted from its size.
     pub fn predict_at(&self, exact: &ArcStr, coarse: &ArcStr, place: PlaceId) -> (Prediction, Basis) {
         let (places, now, half_life_s) = (&self.places, self.now, self.decay.half_life_s);
         let group = &places[place.0 as usize].group;
         if let Some(r) = self.exact.get(exact) {
-            // CR claude for claude: [risk/medium] One run at the place, of any age, decides
+            // XCR claude for claude: [risk/medium] One run at the place, of any age, decides
             // the prediction there: Record::size needs only some weight, so a single run,
             // or one 15 days old at 2^-15 of a fresh run's weight, shadows fifteen fresh
             // runs on other boxes, against DESIGN.md's "no one sample, however long, moves
@@ -750,10 +883,19 @@ impl Stats {
             // 2026-11-01 claude: Eric ruled (2026-11-01): fall back by weight, as
             // (stats-06) (a): use the unit's runs at a place only while they weigh at
             // least half a fresh run, else its runs on the box, else its size.
-            if let Some(s) = r.size(places, now, half_life_s, |s| s.place == place) {
+            // 2026-11-01 claude: predict_at takes Basis::Place only while the unit's runs
+            // there weigh at least OWN_WEIGHT (0.5, half a fresh run), then Basis::Box
+            // under the same rule, then Basis::Size from all its runs. Docs on predict_at
+            // and DESIGN.md's Cost section say so. Regression:
+            // a_units_runs_at_a_place_give_way_to_its_runs_on_the_box_then_its_size_as_they_age.
+            // One starved run on a/p/0 two half-lives old plus 15 fresh runs on c gives
+            // Size (Place on the old code), and two fresh runs on a/p/1 give Box.
+            let enough = |s: &Size| s.runs >= OWN_WEIGHT;
+            if let Some(s) = r.size(places, now, half_life_s, |s| s.place == place).filter(enough) {
                 return (known(r, &s), Basis::Place);
             }
-            if let Some(s) = r.size(places, now, half_life_s, |s| places[s.place.0 as usize].group == *group) {
+            let on_box = |s: &RunSample| places[s.place.0 as usize].group == *group;
+            if let Some(s) = r.size(places, now, half_life_s, on_box).filter(enough) {
                 return (known(r, &s), Basis::Box);
             }
         }
@@ -816,15 +958,7 @@ impl Stats {
             let half_life_s = self.decay.half_life_s;
             self.places[run.place.0 as usize].learn(run.load_c, w, wall_us, calibrated_us, now, half_life_s);
         }
-        let sample = RunSample {
-            place: run.place,
-            at: now,
-            load_c: run.load_c,
-            front_mi: front_us * fast / 1e6,
-            rest_mi: tokens_us * rate / 1e6,
-            rest_us,
-            tokens_us,
-        };
+        let sample = RunSample { place: run.place, at: now, load_c: run.load_c, front_us, rest_us, tokens_us };
         let sent = match run.origin {
             Origin::Sent(t) => Some((t, Send { at: now, copy_us: t.copy_ms as f64 * 1000., kb: t.sent_kb as f64 })),
             Origin::Here | Origin::Served => None,
@@ -841,8 +975,8 @@ impl Stats {
         if let Some((t, send)) = sent {
             place.send(t.links, send, now, self.decay.copy_half_life_s);
         }
-        let m = place.factor(run.load_c);
-        self.global_cost.saturating_record(((sample.front_mi + sample.rest_mi) / m).max(1.) as u64);
+        let ((front_mi, rest_mi), m) = (sample.work_mi(place), place.factor(run.load_c));
+        self.global_cost.saturating_record(((front_mi + rest_mi) / m).max(1.) as u64);
         self.global_mem.saturating_record(run.mem_kb.max(1));
         self.dirty = true;
     }
@@ -851,7 +985,7 @@ impl Stats {
     /// `rest_mi` of work, `width_c` hundredths of a thread wide.
     #[cfg(test)]
     pub fn seed(&mut self, unit: &Unit, front_mi: u64, rest_mi: u64, width_c: u64, mem_kb: u64) {
-        let sample = seed_run(front_mi, rest_mi, width_c, self.now);
+        let sample = seed_run(&self.places, front_mi, rest_mi, width_c, self.now);
         for (map, key) in [(&mut self.exact, &unit.exact), (&mut self.coarse, &unit.coarse)] {
             let r = map.entry(key.clone()).or_insert_with(Record::new);
             push(&mut r.runs_kept, sample, RUNS_KEPT);
@@ -862,12 +996,13 @@ impl Stats {
         self.dirty = true;
     }
 
-    /// Drop samples gone stale, refit every place's sends, and recompute
-    /// the global histograms from every unit's size now.
+    /// Drop samples gone stale and the units they leave with none, refit
+    /// every place's sends, and recompute the global histograms from every
+    /// unit's size now.
     pub fn rebuild_global(&mut self) {
         let now = self.now;
         let fresh = |at: f64| now - at <= KEEP_S;
-        // CR claude for claude: [bug/low] Stale samples go but their Record never does: a
+        // XCR claude for claude: [bug/low] Stale samples go but their Record never does: a
         // unit unrun for KEEP_S keeps its key, histograms (about 46 kB in memory, see
         // stats-03) and run counts in `exact` and `coarse`, and is saved and loaded
         // forever. Stats::units hides it and Stats::predict skips to the coarse key, so
@@ -875,9 +1010,18 @@ impl Stats {
         // hash a dependency bump, feature set or profile makes). DESIGN.md's Cost
         // section says a cell unrun for about 60 days is dropped. Fix: after the
         // retain, remove records whose runs_kept and sends are both empty. (stats-04)
-        for r in self.exact.values_mut().chain(self.coarse.values_mut()) {
-            r.runs_kept.retain(|s| fresh(s.at));
-            r.sends.retain(|s| fresh(s.send.at));
+        // 2026-11-01 claude: rebuild_global now retains each map's records only while
+        // runs_kept or sends still holds a fresh sample, so a unit unrun for KEEP_S goes
+        // with its histograms and counts. That includes rdstats4 records loaded without a
+        // seed run, which predict never used. DESIGN.md's Cost section now says a unit
+        // left with no samples goes. Regression:
+        // a_unit_whose_samples_all_went_stale_is_dropped.
+        for map in [&mut self.exact, &mut self.coarse] {
+            map.retain(|_, r| {
+                r.runs_kept.retain(|s| fresh(s.at));
+                r.sends.retain(|s| fresh(s.send.at));
+                !(r.runs_kept.is_empty() && r.sends.is_empty())
+            });
         }
         for p in &mut self.places {
             for q in &mut p.curve {
@@ -889,6 +1033,7 @@ impl Stats {
             p.fit(now, self.decay.copy_half_life_s);
             p.refresh(now, self.decay.half_life_s);
         }
+        self.refreshed = now;
         let (mut cost, mut mem) = (histogram(1_000_000_000), histogram(1 << 30));
         for r in self.exact.values() {
             if let Some(s) = r.size(&self.places, now, self.decay.half_life_s, |_| true) {
@@ -910,7 +1055,8 @@ impl Stats {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         let mut stats = match &magic {
-            MAGIC => Self::read(&mut r, decay)?,
+            MAGIC => Self::read(&mut r, decay, read_run)?,
+            WORK_MAGIC => Self::read(&mut r, decay, read_work_run)?,
             SUMS_MAGIC => Self::read_sums(&mut r, decay)?,
             OLD_MAGIC => Self::read_old(&mut r, decay)?,
             _ => bail!("{} is not a stats file", path.display()),
@@ -947,11 +1093,11 @@ impl Stats {
     fn read_units(
         &mut self,
         r: &mut impl Read,
-        mut read: impl FnMut(&mut Record, &mut dyn Read, u32) -> Result<()>,
+        mut read: impl FnMut(&mut Record, &mut dyn Read, &[Place]) -> Result<()>,
     ) -> Result<()> {
-        let places = self.places.len() as u32;
+        let Self { places, exact, coarse, .. } = self;
         let mut de = Deserializer::new();
-        for map in [&mut self.exact, &mut self.coarse] {
+        for map in [exact, coarse] {
             for _ in 0..read_u32(r)? {
                 let key = read_key(r)?;
                 let mut rec = Record::new();
@@ -968,7 +1114,12 @@ impl Stats {
         Ok(())
     }
 
-    fn read(r: &mut impl Read, decay: Decay) -> Result<Self> {
+    /// A table whose runs `read_run` reads.
+    fn read(
+        r: &mut impl Read,
+        decay: Decay,
+        read_run: fn(&mut dyn Read, &[Place]) -> Result<RunSample>,
+    ) -> Result<Self> {
         let mut stats = Self::new(decay);
         stats.read_places(r, |p, r| {
             for q in &mut p.curve {
@@ -985,16 +1136,7 @@ impl Stats {
         })?;
         stats.read_units(r, |rec, r, places| {
             for _ in 0..read_u32(r)? {
-                let place = read_place(r, places)?;
-                rec.runs_kept.push_back(RunSample {
-                    place,
-                    at: read_f64(r)?,
-                    load_c: read_u32(r)?,
-                    front_mi: read_f64(r)?,
-                    rest_mi: read_f64(r)?,
-                    rest_us: read_f64(r)?,
-                    tokens_us: read_f64(r)?,
-                });
+                rec.runs_kept.push_back(read_run(r, places)?);
             }
             for _ in 0..read_u32(r)? {
                 let place = read_place(r, places)?;
@@ -1006,14 +1148,24 @@ impl Stats {
         Ok(stats)
     }
 
-    // CR claude for claude: [risk/low] This pushes one RunSample per rdstats8 cell, a
+    // XCR claude for claude: [risk/low] This pushes one RunSample per rdstats8 cell, a
     // place and load bucket, so a unit that ran in more than RUNS_KEPT of them loads with
     // runs_kept over the cap. `push` trims only when len == cap, so such a queue never
     // shrinks back and grows by one per run until its samples age out at KEEP_S. Not hit
     // on this box (a probe loading a copy of its jobs.hdr found 16 at most), and no test
     // reads an rdstats8 table. Fix: trim in `push` with `while q.len() >= cap`; once
     // every box has saved an rdstats9 table, read_sums and SUMS_MAGIC can go. (stats-09)
-    /// A table of decayed sums: each sum's mean becomes one sample.
+    // 2026-11-01 claude: push now trims with while q.len() >= cap, and read_sums sorts
+    // each unit's runs_kept and sends by time, so the trim drops the oldest and
+    // Record::send's drop-first is right. Regression:
+    // a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_than_any_unit, the first
+    // test that reads an rdstats8 table. It writes 20 cells newest first; after one more
+    // run, runs_kept is 16, oldest first, the oldest 15 s old. On the old code it stays
+    // at 21; without the sort the oldest kept is 6 s old. Whether read_sums and
+    // SUMS_MAGIC can go is Eric's call once every box has saved an rdstats9 or rdstat10
+    // table.
+    /// A table of decayed sums: each sum's mean becomes one sample, kept
+    /// oldest first.
     fn read_sums(r: &mut impl Read, decay: Decay) -> Result<Self> {
         let mut stats = Self::new(decay);
         stats.read_places(r, |p, r| {
@@ -1044,7 +1196,7 @@ impl Stats {
                 }
                 let [runs, load_c, front_mi, rest_mi, rest_us, tokens_us, sent, copy_us, sent_kb] = sums;
                 if runs > 0. {
-                    rec.runs_kept.push_back(RunSample {
+                    rec.runs_kept.push_back(WorkSample {
                         place,
                         at,
                         load_c: (load_c / runs) as u32,
@@ -1052,12 +1204,15 @@ impl Stats {
                         rest_mi: rest_mi / runs,
                         rest_us: rest_us / runs,
                         tokens_us: tokens_us / runs,
-                    });
+                    }
+                    .measured(places));
                 }
                 if sent > 0. {
                     rec.sends.push_back(UnitSend { place, send: Send { at, copy_us: copy_us / sent, kb: sent_kb / sent } });
                 }
             }
+            rec.runs_kept.make_contiguous().sort_by(|a, b| a.at.total_cmp(&b.at));
+            rec.sends.make_contiguous().sort_by(|a, b| a.send.at.total_cmp(&b.send.at));
             Ok(())
         })?;
         Ok(stats)
@@ -1068,8 +1223,8 @@ impl Stats {
     fn read_old(r: &mut impl Read, decay: Decay) -> Result<Self> {
         let mut stats = Self::new(decay);
         let mut de = Deserializer::new();
-        let now = stats.now;
-        for map in [&mut stats.exact, &mut stats.coarse] {
+        let Self { places, exact, coarse, now, .. } = &mut stats;
+        for map in [exact, coarse] {
             for _ in 0..read_u32(r)? {
                 let key = read_key(r)?;
                 // cost, front, width, wall, mem, copy, sent
@@ -1084,7 +1239,7 @@ impl Stats {
                 let [cost, front, width, wall, mem, copy, sent] = old;
                 if let (Some(cost_mi), Some(width_c)) = (hist_median(&cost), hist_median(&width)) {
                     let front_mi = hist_median(&front).unwrap_or(0).min(cost_mi);
-                    rec.runs_kept.push_back(seed_run(front_mi, cost_mi - front_mi, width_c, now));
+                    rec.runs_kept.push_back(seed_run(places, front_mi, cost_mi - front_mi, width_c, *now));
                 }
                 (rec.mem_kb, rec.wall_ms, rec.copy_ms, rec.sent_kb) = (mem, wall, copy, sent);
                 map.insert(key, rec);
@@ -1130,7 +1285,7 @@ impl Stats {
                     w.write_all(&s.place.0.to_be_bytes())?;
                     w.write_all(&s.at.to_be_bytes())?;
                     w.write_all(&s.load_c.to_be_bytes())?;
-                    write_f64s(&mut w, &[s.front_mi, s.rest_mi, s.rest_us, s.tokens_us])?;
+                    write_f64s(&mut w, &[s.front_us, s.rest_us, s.tokens_us])?;
                 }
                 w.write_all(&(rec.sends.len() as u32).to_be_bytes())?;
                 for s in &rec.sends {
@@ -1152,9 +1307,11 @@ impl Stats {
     }
 }
 
-fn seed_run(front_mi: u64, rest_mi: u64, width_c: u64, now: f64) -> RunSample {
+/// A run at the seed place of `front_mi` and `rest_mi` of work, the rest
+/// `width_c` hundredths of a thread wide.
+fn seed_run(places: &[Place], front_mi: u64, rest_mi: u64, width_c: u64, now: f64) -> RunSample {
     let rest_us = 1e6;
-    RunSample {
+    let work = WorkSample {
         place: PlaceId(0),
         at: now,
         load_c: 0,
@@ -1162,7 +1319,34 @@ fn seed_run(front_mi: u64, rest_mi: u64, width_c: u64, now: f64) -> RunSample {
         rest_mi: rest_mi as f64,
         rest_us,
         tokens_us: rest_us * width_c as f64 / 100.,
-    }
+    };
+    work.measured(places)
+}
+
+/// A run as rdstat10 keeps it.
+fn read_run(r: &mut dyn Read, places: &[Place]) -> Result<RunSample> {
+    Ok(RunSample {
+        place: read_place(r, places)?,
+        at: read_f64(r)?,
+        load_c: read_u32(r)?,
+        front_us: read_f64(r)?,
+        rest_us: read_f64(r)?,
+        tokens_us: read_f64(r)?,
+    })
+}
+
+/// A run as rdstats9 kept it, its work at its place's calibration.
+fn read_work_run(r: &mut dyn Read, places: &[Place]) -> Result<RunSample> {
+    let work = WorkSample {
+        place: read_place(r, places)?,
+        at: read_f64(r)?,
+        load_c: read_u32(r)?,
+        front_mi: read_f64(r)?,
+        rest_mi: read_f64(r)?,
+        rest_us: read_f64(r)?,
+        tokens_us: read_f64(r)?,
+    };
+    Ok(work.measured(places))
 }
 
 fn read_u32(r: &mut (impl Read + ?Sized)) -> Result<u32> {
@@ -1183,9 +1367,9 @@ fn read_f64(r: &mut (impl Read + ?Sized)) -> Result<f64> {
     Ok(f64::from_be_bytes(b))
 }
 
-fn read_place(r: &mut (impl Read + ?Sized), places: u32) -> Result<PlaceId> {
+fn read_place(r: &mut (impl Read + ?Sized), places: &[Place]) -> Result<PlaceId> {
     let place = read_u32(r)?;
-    if place >= places {
+    if place as usize >= places.len() {
         bail!("a sample at unknown place {place}");
     }
     Ok(PlaceId(place))
@@ -1495,6 +1679,229 @@ mod test {
         assert!(ratio(&s) > 1.5, "the same calibration keeps it");
         assert_eq!(s.place("b/0", 2000, 2000), b);
         assert_eq!(s.factor(b, 0), 1.);
+    }
+
+    #[test]
+    fn a_recalibrated_place_reads_its_runs_at_its_new_rates_and_keeps_its_sends() {
+        let mut s = Stats::new(Decay::default());
+        let a = s.place("a/p/0", 1000, 1000);
+        for _ in 0..5 {
+            s.record(&unit("u:1", "u"), &run(a, 0, 1000));
+        }
+        let sent = Origin::Sent(Transfer { sent_kb: 1, copy_ms: 300, links: false });
+        s.record(&unit("t:1", "t"), &Run { origin: sent, ..run(a, 0, 100) });
+        let at_a = |s: &Stats| {
+            let (pred, basis) = s.predict_at(&ArcStr::from("u:1"), &ArcStr::from("u"), a);
+            (s.time_us(&pred, a, 0, 1.), basis)
+        };
+        assert_eq!(at_a(&s), (1_000_000, Basis::Place));
+        assert_eq!(s.place("a/p/0", 2000, 2000), a);
+        assert_eq!(at_a(&s), (1_000_000, Basis::Place), "the same runs on the same CPUs");
+        assert_eq!(predict(&s, &unit("u:1", "u")).rest_mi, 2000, "twice the work at twice the speed");
+        assert_eq!(s.copy_us(&unit("v:1", "v"), a, false, 1), 300_000, "its sends say nothing of its CPUs");
+    }
+
+    #[test]
+    fn a_busy_factor_below_the_calibration_pools_the_idle_anchor_into_it() {
+        let mut s = Stats::new(Decay::default());
+        let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/0", 1000, 1000));
+        // a ran the unit only at 2 tasks per CPU, in 0.4 of b's time idle.
+        // More load never makes a run faster, so a's idle bucket follows.
+        for _ in 0..200 {
+            s.record(&unit("u:1", "u"), &run(b, 0, 1000));
+            s.record(&unit("u:1", "u"), &run(a, 200, 400));
+        }
+        let (idle, busy) = (s.factor(a, 0), s.factor(a, 200));
+        assert!(near(idle, busy) && idle < 0.9, "{idle} {busy}");
+        let curve: Vec<f64> = (0..=1600).step_by(25).map(|l| s.factor(a, l)).collect();
+        assert!(curve.windows(2).all(|w| w[0] <= w[1] * 1.0001), "{curve:?}");
+    }
+
+    #[test]
+    fn a_units_runs_at_a_place_give_way_to_its_runs_on_the_box_then_its_size_as_they_age() {
+        let mut s = Stats::new(Decay::default());
+        let (a0, a1) = (s.place("a/p/0", 1000, 1000), s.place("a/p/1", 1000, 1000));
+        let c = s.place("c/p/0", 1000, 1000);
+        let (exact, coarse) = (ArcStr::from("u:1"), ArcStr::from("u"));
+        let basis = |s: &Stats, at| s.predict_at(&exact, &coarse, at).1;
+        // One run on a/p/0, which starved behind other work.
+        s.set_now(0.);
+        s.record(&unit("u:1", "u"), &run(a0, 0, 10_000));
+        assert_eq!(basis(&s, a0), Basis::Place);
+        // Two half-lives on it weighs a quarter of a fresh run.
+        s.set_now(2. * Decay::default().half_life_s);
+        for _ in 0..15 {
+            s.record(&unit("u:1", "u"), &run(c, 0, 1000));
+        }
+        assert_eq!(basis(&s, a0), Basis::Size);
+        for _ in 0..2 {
+            s.record(&unit("u:1", "u"), &run(a1, 0, 1000));
+        }
+        assert_eq!(basis(&s, a0), Basis::Box);
+    }
+
+    #[test]
+    fn halving_a_units_histograms_keeps_their_quantiles() {
+        let mut s = Stats::new(Decay::default());
+        let a = s.place("a/0", 1000, 1000);
+        let u = unit("u:1", "u");
+        let ran = |s: &mut Stats, mem_kb| s.record(&u, &Run { mem_kb, ..run(a, 0, 1000) });
+        let p90 = |s: &Stats| predict(s, &u).mem_kb;
+        // 229 runs peaked at 500 MB and 26 higher, each in its own bucket.
+        for _ in 0..229 {
+            ran(&mut s, 500_000);
+        }
+        for i in 0..26 {
+            ran(&mut s, 900_000 + i * 10_000);
+        }
+        assert!(p90(&s) >= 900_000, "{}", p90(&s));
+        // The 256th run halves them.
+        ran(&mut s, 500_000);
+        assert!(p90(&s) >= 900_000, "{}", p90(&s));
+        // Four halvings on, the high runs have faded.
+        for _ in 0..4 * HALVE_AT / 2 {
+            ran(&mut s, 500_000);
+        }
+        assert!(p90(&s) < 510_000, "{}", p90(&s));
+    }
+
+    #[test]
+    fn a_unit_whose_samples_all_went_stale_is_dropped() {
+        let mut s = Stats::new(Decay::default());
+        let a = s.place("a/0", 1000, 1000);
+        let sent = Origin::Sent(Transfer { sent_kb: 1, copy_ms: 300, links: false });
+        s.set_now(0.);
+        s.record(&unit("old:1", "old"), &Run { origin: sent, ..run(a, 0, 1000) });
+        s.set_now(KEEP_S);
+        s.record(&unit("new:1", "new"), &run(a, 0, 1000));
+        s.set_now(KEEP_S + 86_400.);
+        s.rebuild_global();
+        let keys = |m: &HashMap<ArcStr, Record>| m.keys().map(|k| k.to_string()).collect::<Vec<_>>();
+        assert_eq!((keys(&s.exact), keys(&s.coarse)), (vec!["new:1".to_string()], vec!["new".to_string()]));
+    }
+
+    #[test]
+    fn a_units_own_sends_give_way_to_the_places_as_they_age() {
+        let mut s = Stats::new(Decay::default());
+        let there = s.place("b/all", 1000, 1000);
+        let sent = |copy_ms| Run {
+            origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms, links: false }),
+            ..run(there, 0, 100)
+        };
+        // a:1 was sent twice on a slow network, then twenty other units on
+        // a fast one three copy half-lives later.
+        s.set_now(0.);
+        s.record(&unit("a:1", "a"), &sent(10_000));
+        s.record(&unit("a:1", "a"), &sent(10_000));
+        s.set_now(3. * Decay::default().copy_half_life_s);
+        for i in 0..20 {
+            s.record(&unit(&format!("u{i}:1"), "u"), &sent(100));
+        }
+        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 1), 100_000);
+        // Long after, when every weight from now is too small for an f64,
+        // the place's sends still stand.
+        s.set_now(50. * 86_400.);
+        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 1), 100_000);
+    }
+
+    #[test]
+    fn a_table_of_work_at_calibrated_speeds_loads_as_measured_runs() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-stats-work-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("jobs.hdr");
+        let mut w = BufWriter::new(File::create(&path)?);
+        w.write_all(WORK_MAGIC)?;
+        w.write_all(&2u32.to_be_bytes())?;
+        for (key, rate) in [(SEED, 1u64), ("a/0", 1000)] {
+            write_key(&mut w, key)?;
+            w.write_all(&rate.to_be_bytes())?;
+            w.write_all(&rate.to_be_bytes())?;
+            for _ in 0..BUCKETS.len() + 2 {
+                w.write_all(&0u32.to_be_bytes())?;
+            }
+        }
+        // a:1 ran on a/0 with a front end of 0.4 s, then 0.6 s holding 4
+        // tokens; s:1 is seed history three threads wide.
+        let now = now_s();
+        let mut ser = V2Serializer::new();
+        w.write_all(&2u32.to_be_bytes())?;
+        for (key, place, work) in [("a:1", 1u32, [400., 2400., 600_000., 2_400_000.]), ("s:1", 0, [100., 900., 1e6, 3e6])] {
+            write_key(&mut w, key)?;
+            w.write_all(&1u32.to_be_bytes())?;
+            w.write_all(&place.to_be_bytes())?;
+            w.write_all(&now.to_be_bytes())?;
+            w.write_all(&0u32.to_be_bytes())?;
+            write_f64s(&mut w, &work)?;
+            w.write_all(&0u32.to_be_bytes())?;
+            for h in Record::new().each() {
+                ser.serialize(h, &mut w).unwrap();
+            }
+            for n in [1u64, 0, 0] {
+                w.write_all(&n.to_be_bytes())?;
+            }
+        }
+        w.write_all(&0u32.to_be_bytes())?;
+        drop(w);
+        let s = Stats::load(&path, Decay::default())?;
+        let r = s.exact["a:1"].runs_kept[0];
+        assert_eq!((r.front_us, r.rest_us, r.tokens_us), (400_000., 600_000., 2_400_000.));
+        let p = |u| {
+            let p = predict(&s, &unit(u, u));
+            (p.front_mi, p.rest_mi, p.width_c)
+        };
+        assert_eq!(p("a:1"), (400, 2400, Some(400)));
+        assert_eq!(p("s:1"), (100, 900, Some(300)));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_than_any_unit() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-stats-sums-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("jobs.hdr");
+        let mut w = BufWriter::new(File::create(&path)?);
+        w.write_all(SUMS_MAGIC)?;
+        w.write_all(&2u32.to_be_bytes())?;
+        for (key, rate) in [(SEED, 1u64), ("a/0", 1000)] {
+            write_key(&mut w, key)?;
+            w.write_all(&rate.to_be_bytes())?;
+            w.write_all(&rate.to_be_bytes())?;
+            write_f64s(&mut w, &[0.; 3 * BUCKETS.len() + 2 * 6])?;
+        }
+        // a:1 ran in more cells than a unit keeps runs, written newest
+        // first: two runs of a second in each.
+        let now = now_s();
+        let cells = RUNS_KEPT + 4;
+        w.write_all(&1u32.to_be_bytes())?;
+        write_key(&mut w, "a:1")?;
+        w.write_all(&(cells as u32).to_be_bytes())?;
+        for age in 1..=cells {
+            w.write_all(&1u32.to_be_bytes())?;
+            w.write_all(&[0u8])?;
+            write_f64s(&mut w, &[now - age as f64, 2., 0., 0., 2000., 2e6, 2e6, 0., 0., 0.])?;
+        }
+        let mut ser = V2Serializer::new();
+        for h in Record::new().each() {
+            ser.serialize(h, &mut w).unwrap();
+        }
+        for n in [2 * cells as u64, 0, 0] {
+            w.write_all(&n.to_be_bytes())?;
+        }
+        w.write_all(&0u32.to_be_bytes())?;
+        drop(w);
+        let mut s = Stats::load(&path, Decay::default())?;
+        assert_eq!(s.exact["a:1"].runs_kept.len(), cells);
+        assert_eq!(predict(&s, &unit("a:1", "a")).rest_mi, 1000);
+        let a = s.place("a/0", 1000, 1000);
+        s.record(&unit("a:1", "a"), &run(a, 0, 1000));
+        let runs = &s.exact["a:1"].runs_kept;
+        assert_eq!(runs.len(), RUNS_KEPT);
+        let oldest = now - runs[0].at;
+        assert!((oldest - (RUNS_KEPT - 1) as f64).abs() < 1e-3, "{oldest}");
+        assert!(runs.iter().zip(runs.iter().skip(1)).all(|(a, b)| a.at <= b.at));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
