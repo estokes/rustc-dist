@@ -245,11 +245,11 @@ mod test {
         let give_up = Duration::from_millis(300);
         let start = Instant::now();
         let hangs_up = daemon(iter::repeat_with(|| (Duration::ZERO, Says::HangsUp)));
-        let e = follow(hangs_up, &Ask::Status, &mut BytesMut::new(), Patience { give_up: give_up, ..PATIENCE }, &mut Restarts::default()).unwrap_err();
+        let e = follow(hangs_up, &Ask::Status, &mut BytesMut::new(), Patience { give_up, ..PATIENCE }, &mut Restarts::default()).unwrap_err();
         assert!(start.elapsed() >= give_up && start.elapsed() < HELD, "gave up after {:?}: {e:#}", start.elapsed());
         let start = Instant::now();
         let restarting = daemon(iter::repeat_with(|| (Duration::ZERO, Says::Reply(Reply::Restarting))));
-        let e = follow(restarting, &Ask::Status, &mut BytesMut::new(), Patience { give_up: give_up, ..PATIENCE }, &mut Restarts::default()).unwrap_err();
+        let e = follow(restarting, &Ask::Status, &mut BytesMut::new(), Patience { give_up, ..PATIENCE }, &mut Restarts::default()).unwrap_err();
         assert!(start.elapsed() >= give_up, "{e:#}");
         assert_eq!(e.to_string(), "the rustc-dist daemon kept restarting");
     }
