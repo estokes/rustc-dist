@@ -620,6 +620,19 @@ pub struct Moved {
     /// The crate files the server holds after the job, by hash with their
     /// size in kB: its inputs, and the libraries it built.
     pub kept: Vec<(Hash, u64)>,
+    pub steps: Steps,
+}
+
+/// How long each step of a sent job took, in µs: offering it, sending its
+/// manifest, sending what rustc needs before it starts, and from asking
+/// for rustc to its exit arriving, which takes in setting up the job,
+/// rustc's run and its outputs.
+#[derive(Clone, Copy)]
+pub struct Steps {
+    pub offer_us: u64,
+    pub manifest_us: u64,
+    pub send_us: u64,
+    pub run_us: u64,
 }
 
 /// Send `m` and wait for the answer.
@@ -642,12 +655,19 @@ pub async fn run(
     mut sink: impl FnMut(Event) -> Result<()>,
 ) -> Result<Outcome> {
     let (out, mut inbox) = link.open()?;
+    let mut last = Instant::now();
+    let mut lap = || {
+        let (at, since) = (Instant::now(), last);
+        last = at;
+        at.duration_since(since).as_micros() as u64
+    };
     match ask(&out, &mut inbox, offer).await.context("offering the job")? {
         FromServer::Accepted { version } => sink(Event::Accepted { version })?,
         FromServer::Busy { version } => return Ok(Outcome::Busy { version }),
         FromServer::Failed(why) => bail!("{why}"),
         m => bail!("unexpected {m:?}"),
     }
+    let offer_us = lap();
     let manifest =
         ToServer::Manifest { files: staged.files.clone(), dirs: staged.dirs.clone(), late: staged.late.clone() };
     let (now, later) = match ask(&out, &mut inbox, manifest).await.context("sending the manifest")? {
@@ -655,10 +675,12 @@ pub async fn run(
         FromServer::Failed(why) => bail!("{why}"),
         m => bail!("unexpected {m:?}"),
     };
+    let manifest_us = lap();
     let sent = Sent::default();
     for hash in now {
         send_blob(&out, staged, hash, level, &sent).await.context("sending inputs")?;
     }
+    let send_us = lap();
     out.send(ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
     out.flush().await.context("starting rustc")?;
     // A rustc that fails before linking exits while late rlibs are still
@@ -682,7 +704,8 @@ pub async fn run(
     };
     let kept = staged.crates().chain(built).collect();
     let (bytes, wire_bytes) = (sent.raw.load(Ordering::Relaxed), sent.wire.load(Ordering::Relaxed));
-    let moved = Moved { bytes, wire_bytes, linker_waited_us, kept };
+    let steps = Steps { offer_us, manifest_us, send_us, run_us: lap() };
+    let moved = Moved { bytes, wire_bytes, linker_waited_us, kept, steps };
     Ok(Outcome::Exit { code, ran, measured, moved })
 }
 

@@ -427,16 +427,19 @@ async fn run_remote(
     let links = ctx.links.as_ref().context("not in a farm")?;
     let start = Instant::now();
     let staged = task::block_in_place(|| remote::stage(job, &r.crates, &ctx.hashes))?;
+    let stage_us = start.elapsed().as_micros() as u64;
     let offer = ToServer::Offer { unit: r.unit().clone(), key: r.key.clone(), target: r.target.clone(), class: r.class };
     let (etx, mut events) = mpsc::unbounded_channel();
     let level = ctx.compression_level;
     let jobs = r.jobs.clone();
     let running = async {
+        let linking = Instant::now();
         let link = links.get(&jobs).await?;
-        remote::run(&link, offer, job, &staged, &ctx.hashes, level, |ev| {
+        let link_us = linking.elapsed().as_micros() as u64;
+        let outcome = remote::run(&link, offer, job, &staged, &ctx.hashes, level, |ev| {
             etx.send(ev).map_err(|_| anyhow!("daemon connection gone"))
-        })
-        .await
+        });
+        Ok::<_, anyhow::Error>((link_us, outcome.await?))
     };
     tokio::pin!(running);
     // Diagnostics wait for the exit, so a failure here leaves nothing for
@@ -474,7 +477,8 @@ async fn run_remote(
     }
     drop(handle);
     match outcome {
-        Ok(Outcome::Exit { code: 0, ran, measured, moved: Moved { bytes, wire_bytes, linker_waited_us, kept } }) => {
+        Ok((link_us, Outcome::Exit { code: 0, ran, measured, moved })) => {
+            let Moved { bytes, wire_bytes, linker_waited_us, kept, steps } = moved;
             for (stderr, data) in held {
                 protocol::send_async(sock, buf, &Reply::Output { stderr, data }).await?;
             }
@@ -482,24 +486,32 @@ async fn run_remote(
             let copy_us = (start.elapsed().as_micros() as u64).saturating_sub(ran.wall_us) + linker_waited_us;
             let links = job.reads != Reads::Metadata;
             let transfer = Transfer { sent_kb: bytes / 1024, copy_ms: copy_us / 1000, links };
+            let ms = |us: u64| us / 1000;
             info!(
-                "{} on {}: compiled in {} ms, moving files took {} ms ({} kB sent as {} kB, linker waited {} ms)",
+                "{} on {}: compiled in {} ms, moving files took {} ms: staging {}, link {}, offer {}, manifest {}, \
+                 sending {} kB as {} kB {}, setup and outputs {} ms, linker waited {} ms",
                 r.unit().exact,
                 r.jobs,
-                ran.wall_us / 1000,
+                ms(ran.wall_us),
                 transfer.copy_ms,
+                ms(stage_us),
+                ms(link_us),
+                ms(steps.offer_us),
+                ms(steps.manifest_us),
                 transfer.sent_kb,
                 wire_bytes / 1024,
-                linker_waited_us / 1000
+                ms(steps.send_us),
+                ms(steps.run_us.saturating_sub(ran.wall_us)),
+                ms(linker_waited_us)
             );
             r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer, kept }));
             Ok(Remote::Done)
         }
-        Ok(Outcome::Busy { version }) => {
+        Ok((_, Outcome::Busy { version })) => {
             r.finish(RemoteOutcome::Busy { version });
             Ok(Remote::Busy)
         }
-        Ok(Outcome::Exit { code, .. }) => {
+        Ok((_, Outcome::Exit { code, .. })) => {
             debug!("{} exited {code} remotely, building it here", r.unit().exact);
             for (_, line) in held.iter().filter(|(stderr, _)| *stderr).take(5) {
                 debug!("remote stderr: {}", String::from_utf8_lossy(line).trim_end());

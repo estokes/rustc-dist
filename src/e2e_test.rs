@@ -511,6 +511,8 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     let hashes = Hashes::default();
     let (outcome, events) = send(&b, &lib, &lib_crates, &hashes, None).await?;
     let Outcome::Exit { code: 0, ran, measured, moved } = outcome else { bail!("remote rustc failed") };
+    let steps = moved.steps;
+    assert!(steps.run_us >= ran.wall_us && steps.send_us > 0 && steps.offer_us > 0, "{:?} {ran:?}", (steps.offer_us, steps.send_us, steps.run_us));
     let front = ran.front.context("app prints an .rmeta line")?;
     assert!(0 < front.wall_us && front.wall_us < ran.wall_us, "{ran:?}");
     // It held its one token at least from when rustc started to its exit,
