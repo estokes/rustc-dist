@@ -612,9 +612,9 @@ impl Layout {
     }
 
     /// A unit's prediction where it runs fastest here, on the fastest
-    /// class if it is light, else on every CPU, and the spot it takes.
-    fn fastest(&self, stats: &Stats, exact: &ArcStr, coarse: &ArcStr) -> (Prediction, Spot) {
-        let pinned = light(&stats.predict(exact, coarse));
+    /// class if it is `pinned` (light), else on every CPU, and the spot it
+    /// takes.
+    fn fastest(&self, stats: &Stats, exact: &ArcStr, coarse: &ArcStr, pinned: bool) -> (Prediction, Spot) {
         let at = if pinned { self.places.classes[self.by_speed()[0]] } else { self.places.all };
         let (pred, _) = stats.predict_at(exact, coarse, at);
         (pred, Spot::new(&pred, 1, at, pinned, self.cpus()))
@@ -622,7 +622,7 @@ impl Layout {
 
     /// A unit's predicted µs on this box idle, where it runs fastest.
     fn idle_us(&self, stats: &Stats, exact: &ArcStr, coarse: &ArcStr) -> u64 {
-        let (pred, spot) = self.fastest(stats, exact, coarse);
+        let (pred, spot) = self.fastest(stats, exact, coarse, light(&stats.predict(exact, coarse)));
         stats.time_us(&pred, spot.at, 0, spot.threads)
     }
 
@@ -2317,7 +2317,7 @@ impl Sched {
             .units()
             .map(|(key, info)| {
                 let [here, sent, served] = info.runs;
-                let (pred, spot) = layout.fastest(&self.stats, key, key);
+                let (pred, spot) = layout.fastest(&self.stats, key, key, light(&info.pred));
                 UnitStatus {
                     key: key.clone(),
                     here,
@@ -2485,7 +2485,7 @@ fn choose(cands: &[Cand], local: usize, slack_us: u64) -> usize {
     let finish = Cand::finish_us;
     let here = &cands[..local];
     let first = here.iter().map(finish).min().unwrap_or(0);
-    let deadline = first + slack_us;
+    let deadline = first.saturating_add(slack_us);
     let slowest = |free_only: bool| {
         here.iter()
             .enumerate()
