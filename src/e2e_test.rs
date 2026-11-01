@@ -362,6 +362,14 @@ async fn a_box_answers_a_heartbeat() -> Result<()> {
     Ok(())
 }
 
+// CR claude for claude: [test-gap/medium] The name promises that the job
+// "stops on the box", but the client drops it before sending Run, so no
+// sandbox ever starts. Nothing tests that a running rustc is killed (Kill's
+// pidfd SIGKILL in sandbox::run) when its client drops the job or the channel
+// fails. Add a case that drops the In while rustc runs (a job whose source
+// sleeps in a proc macro or const eval, or one held at the link gate by a
+// late rlib that never comes) and checks that the bwrap pid is gone and the
+// slot comes back. (e2e-01)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Result<()> {
     let _ = env_logger::try_init();
@@ -443,6 +451,14 @@ async fn a_channel_that_fails_is_replaced() -> Result<()> {
     Ok(())
 }
 
+// CR claude for claude: [test-gap/medium] This covers a shared input needed
+// before rustc starts (coming_now). The late path, where a link job's rlib
+// comes through another job's upload (`coming_later` and the `others` future
+// in sandbox::job, then `place` behind the gate), has no test, although it is
+// the case DESIGN gives the dedup for (fifteen graphix tests sharing 520 MB of
+// rlibs). Nor is there a test of what happens when the job doing the sending
+// ends first; see (sandbox-03). Add two link jobs sharing a late rlib, once
+// with both succeeding and once with the sender failing to compile. (e2e-02)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jobs_sent_together_send_a_blob_they_share_once() -> Result<()> {
     let _ = env_logger::try_init();

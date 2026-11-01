@@ -94,6 +94,14 @@ pub async fn run() -> Result<()> {
     let (load_tx, load) = watch::channel(Load::default());
     let sched = Sched::new(setup, profile, load_tx, tx.clone())?;
     let mut sched = tokio::spawn(sched.run(rx));
+    // CR claude for claude: [risk/low] The farm is joined before the accept loop starts, so no
+    // wrapper is answered until join returns, and join waits on the network: sandbox::listen awaits
+    // publisher.flushed(), which with the resolver unreachable (a laptop away from home, the
+    // resolver's box down) returns only once netidx's write client gives up on connecting, 15 s
+    // (HELLO_TO) or more. join also runs Store::open, which walks the whole blob store, on an async
+    // worker. Wrappers connect meanwhile and wait in client::open with no word of why. Fix: start
+    // the accept loop first and join in a spawned task that hands Ctx its Links when done (a
+    // OnceLock, say), with Store::open in spawn_blocking. (daemon-03)
     let (subscriber, publisher) = match &cfg.base {
         None => (None, None),
         Some(base) => match join(&cfg, base, load, tx.clone()).await {
@@ -213,6 +221,10 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "rustc-dist".into())
 }
 
+// CR claude for claude: [dead/low] Layout::lease names jobserver FIFOs `job-LAYOUT-JOB`, so this
+// matches nothing the daemon makes now: `class-` and `spread-` are older names. FIFOs of a killed
+// daemon stay in the runtime dir until a later one reuses that exact name. Match `job-`, or remove
+// every FIFO in the dir, which is private to the daemon. (daemon-04)
 /// FIFOs left by a daemon that died without cleaning up.
 fn remove_stale_fifos(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else { return };
@@ -252,6 +264,18 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
     let mut version = [0u8; 4];
     sock.read_exact(&mut version).await?;
     let version = u32::from_be_bytes(version);
+    // CR claude for eric: [risk/medium] Any client of another PROTOCOL makes the daemon exit, so
+    // that systemd starts the binary the client came from. That holds only when the client is the
+    // binary the unit's ExecStart names. An older or newer rustc-dist anywhere else (a checkout's
+    // target/debug/rustc-dist status, a lane testing a protocol bump, a second install) restarts
+    // the same daemon, retries for 30 s (client::exchange), and stops it again: a restart every
+    // second or two, each failing remote jobs in flight (wrapper-01) and long-queued wrappers
+    // (client-01), until systemd's default start limit (5 starts in 10 s; the unit from
+    // calibrate::install sets Restart=always, RestartSec=1 and no StartLimit*) marks the service
+    // failed and wrappers' systemctl start fails too. Options: exit only when the peer's
+    // /proc/PID/exe (peer_cred) is the ExecStart binary and its version is newer; otherwise close
+    // and let the client fail loudly, perhaps after a fixed-format line saying which protocol this
+    // daemon speaks. (daemon-02)
     if version != PROTOCOL {
         warn!("a client speaks protocol {version}, this daemon {PROTOCOL}; restarting");
         let _ = ctx.stop.try_send(());
@@ -485,6 +509,19 @@ async fn run_remote(
             }
         }
     };
+    // CR claude for claude: [bug/medium] Nothing here watches the wrapper while the job runs on the
+    // other box: admit polls the socket for EOF, this loop doesn't, and `handle` writes to it only
+    // on artifact lines. So a wrapper that dies (cargo interrupted) is noticed only at the job's
+    // next artifact line: for a binary or test, the end of its link, as its dep-info line comes
+    // early; for a library, the end of codegen after its rmeta. Until then the remote rustc runs
+    // on, holding the other box's token and this box's RemoteSlot, so a build started right after
+    // sees that box busy and may send the same unit again. A failed write then returns Err before
+    // r.finish, so a run that succeeded is recorded as RemoteOutcome::Failed and logged as a
+    // warning. DESIGN ("Wrapper protocol": a remote job is cancelled if its wrapper died) says
+    // otherwise. Fix: an arm here like admit's `sock.readable()` that returns on EOF without
+    // awaiting `running`; dropping it drops the exchange, whose Drop (remote::In) sends the server
+    // Stop. Staging under block_in_place can't notice either, for up to tens of seconds on a busy
+    // box. (daemon-01)
     let outcome = loop {
         tokio::select! {
             outcome = &mut running => break outcome,

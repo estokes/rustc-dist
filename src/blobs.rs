@@ -234,6 +234,15 @@ impl Hashes {
         Ok(Self { known: Mutex::new(known), dirty: AtomicBool::new(false) })
     }
 
+    // CR claude for claude: [perf/medium] This stats every file the table
+    // knows, writes the table, and fsyncs it, all on the caller's thread, and
+    // its caller is Sched::save on the scheduler's event loop, every
+    // SAVE_EVERY (60 s) whenever a hash was taken, which during a build is
+    // always. On washu-chan the table covers every input of every lane (tens
+    // of thousands of paths, many in swap-backed tmpfs), so placement stops
+    // for as long as that takes, and an fsync on a busy disk can take seconds.
+    // It also clones every PathBuf into the snapshot. Run it on a blocking
+    // thread: Hashes is already shared through triomphe::Arc. (blobs-01)
     /// Save the hashes of files still as they were hashed, if a hash was
     /// taken since the last save, and forget the rest, but those being
     /// hashed.
@@ -373,6 +382,9 @@ impl Store {
         self.dir.join(&name[..2]).join(name.as_str())
     }
 
+    // CR claude for claude: [doc-drift/low] The first doc line belongs to
+    // Store::has, which now has no doc, while claim's doc starts with a
+    // sentence about has. Move it down to has. (blobs-03)
     /// Whether the blob is present, marking it used.
     /// Where a job gets the blob `h`: see `Claim`.
     pub fn claim(&self, h: &Hash) -> Claim<'_> {
@@ -447,6 +459,13 @@ impl Store {
         }
     }
 
+    // CR claude for claude: [perf/low] When pinned blobs keep `used` above the
+    // cap (several large link jobs pinning hundreds of MB each, against a cap
+    // of a few GB), no pass gets back under 90%, so every following job lists
+    // and stats the whole store again (sandbox::job calls this on every job),
+    // and logs "evicted 0 MB" each time. Remember that the last pass was held
+    // back by pins and skip until a pin drops or `used` grows, and log only
+    // when something was freed. (blobs-02)
     /// Delete the least recently used blobs no job is reading until the
     /// store is under 90% of its cap.
     pub fn evict(&self) {

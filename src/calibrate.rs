@@ -275,6 +275,14 @@ mod test {
         assert_eq!(group(speeds(&[(0, 1000), (1, 1050)])).len(), 1);
     }
 
+    // CR claude for claude: [test-gap/low] In the usual debug `cargo test` this checks
+    // only ratio > 0.95, which a debug build always passes, so nothing notices
+    // RUN_INSTRUCTIONS going stale for the binary a box actually runs (a release build,
+    // here with `-C target-cpu=x86-64-v3` from ~/.cargo/config.toml). A box without
+    // counters then gets rates off by that ratio against boxes that count, which
+    // matters because calibrations are compared across the farm. Run the upper bound
+    // under `--release` somewhere routine, or say in RUN_INSTRUCTIONS's doc which
+    // build and flags 697 M was measured with. (calibrate-01)
     #[test]
     fn a_run_retires_about_the_fallback_count() {
         let Some(c) = perf::Counter::start() else { return };

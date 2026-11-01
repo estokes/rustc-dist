@@ -58,6 +58,14 @@ impl Counter {
         Some(Self(fds))
     }
 
+    // CR claude for claude: [risk/low] A failed or short read counts as 0, and the
+    // counter sets no read_format, so a count the kernel multiplexed (another perf user
+    // holding the PMU during calibration) comes back unscaled and low with nothing to
+    // say so. calibrate::worker then computes a low class rate from it, which feeds
+    // every Place's fast and rate, or a rate of 0, which classes::load rejects on the
+    // next start. Fix: set read_format to TOTAL_TIME_ENABLED | TOTAL_TIME_RUNNING, read
+    // the three u64s, and make a short read or running < enabled an error, so
+    // calibration falls back to RUN_INSTRUCTIONS or fails loudly. (perf-01)
     pub fn read(&self) -> u64 {
         self.0
             .iter()

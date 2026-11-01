@@ -27,6 +27,17 @@ pub fn request_running(ask: Ask, buf: &mut BytesMut) -> Result<Option<Reply>> {
 
 /// None if no daemon is running and `spawn` is false.
 fn exchange(ask: &Ask, spawn: bool, buf: &mut BytesMut) -> Result<Option<(UnixStream, Reply)>> {
+    // CR claude for claude: [bug/high] The 30 s deadline starts before the first attempt, and an
+    // attempt (open) lasts until the daemon answers, which for a compile means until it has a slot,
+    // or a remote job's first output. So a wrapper that queued for over 30 s and then gets
+    // Reply::Restarting, which Sched::run sends every queued job when the daemon drains, or EOF
+    // from a daemon that died, fails at once with "the rustc-dist daemon kept restarting" or
+    // "talking to the rustc-dist daemon" instead of reconnecting. Restarting the daemon during a
+    // big build (a deploy, systemctl restart, a client of another version: daemon::serve) then
+    // fails every cargo with a wrapper queued that long. Fix: start the 30 s at the first failure,
+    // and again after any attempt the daemon held for a while (longer than the 50 ms retry, say),
+    // so only a run of quick failures gives up. A test with a fake daemon that answers Restarting
+    // after the deadline would catch it. (client-01)
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let Some(mut sock) = connect(spawn)? else { return Ok(None) };

@@ -140,6 +140,16 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     }
     let zram_free = zram_kb.saturating_sub(zram_used);
     let disk_free = swap_free.saturating_sub(zram_free);
+    // CR claude for claude: [bug/medium] zswap's room is capped by the whole swap behind it
+    // (`swap_total - zram_kb`) where it should be capped by that swap's free slots: each page zswap
+    // holds keeps a slot on the swap device, so zswap can take at most `disk_free` more. Swap full
+    // of pages written back to disk (by zswap's shrinker, or once the pool filled) then counts as
+    // room. E.g. 16 GB of RAM, max_pool_percent 20, 3:1, and an 8 GB swap partition holding 7 GB
+    // written back plus 0.5 GB in zswap (SwapFree 0.5 GB): this gives min(9.6, 8) - 0.5 = 7.5 GB of
+    // room, 3.75 GB more capacity at the default share, where 0.5 GB is all there is. Fix: `((pool
+    // * ratio) as u64).saturating_sub(zswapped).min(disk_free)`. The zswap case in
+    // memory_counts_compressed_swap_at_the_ram_it_takes has a nearly empty disk, so it can't tell
+    // the two apart. (sys-01)
     let zswap_free = zswap_pool_percent.map_or(0, |pct| {
         let ratio = if zswap > 0 { zswapped as f64 / zswap as f64 } else { ZSWAP_RATIO };
         let pool = (total * pct / 100) as f64;
@@ -151,6 +161,17 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     })
 }
 
+// CR claude for eric: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
+// LLVM's text, shared by every rustc on the box, and the rlibs a linker maps. box_memory's use
+// leaves most of those out, as MemAvailable counts page cache as available. On washu-chan
+// (2026-11-01) samples of a small rustc read VmRSS 107 to 124 MB, RssFile 65 to 93 MB of it. So
+// every footprint and recorded peak carries some 90 MB that all jobs share (48 jobs: about 4 GB
+// that isn't there), which makes admission tighter than it need be; and Sched::finished subtracts
+// the whole footprint from mem.used_kb, file pages included, so after a big link the box looks
+// emptier than it is until the next sample, just when the next job is admitted. RssAnon + RssShmem
+// + VmSwap (all in /proc/PID/status since Linux 4.5) matches what box_memory counts. rustc's maxrss
+// (Ran::maxrss_kb) has the same bias and recorded peaks take the larger of the two, so changing
+// this alone leaves peaks high. (sys-02)
 /// RSS plus swap, in kB, of `pid` and its descendants.
 pub fn tree_footprint_kb(pid: u32) -> u64 {
     let mut path: LPooled<String> = LPooled::take();

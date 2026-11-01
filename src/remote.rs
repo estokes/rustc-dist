@@ -337,6 +337,15 @@ pub struct Staged {
 }
 
 impl Staged {
+    // CR claude for claude: [bug/low] This reports every late rlib's `.rmeta` as
+    // held by the server, but sandbox::job claims `r.meta` only for rlibs the
+    // store lacks (`rlibs.iter().filter(|r| !store.has(&r.hash))`). When the
+    // server already had the rlib, it never received the rmeta, yet
+    // sched::Held::used records it as held, so a later library job that reads
+    // that `.rmeta` (Reads::Metadata) is priced as sending nothing and then
+    // sends it. Fix: have the server say what it holds (e.g. in Need or Exit),
+    // or leave out the meta of rlibs that weren't asked for. It also stats
+    // every crate file on an async worker, after the exit. (remote-03)
     /// The crate files among its inputs, by hash with their size in kB.
     fn crates(&self) -> impl Iterator<Item = (Hash, u64)> + '_ {
         let late = self.late.iter().flat_map(|l| &l.rlibs).flat_map(|r| {
@@ -524,6 +533,14 @@ impl<'a> Collect<'a> {
                     if recursive && !skip {
                         stack.push(path);
                     }
+                // CR claude for claude: [bug/low] WALK_LIMIT counts a symlink at
+                // its own size: DirEntry::metadata doesn't follow links, but the
+                // check above and Hashes::name do, so a package with a symlink to
+                // a large file is sent whole while `walked` grows by a few bytes.
+                // Use the length from the followed fs::metadata already taken one
+                // line up. Symlinked directories are never walked (file_type says
+                // symlink, the followed metadata says not a file); a test should
+                // say whether that is intended. (remote-02)
                 } else if fs::metadata(e.path()).is_ok_and(|m| m.is_file()) {
                     self.walked += e.metadata().map(|m| m.len()).unwrap_or(0);
                     if self.walked > WALK_LIMIT {
@@ -746,6 +763,15 @@ pub async fn send_blob(out: &Out, staged: &Staged, hash: Hash, level: i32, sent:
     Ok(())
 }
 
+// CR claude for claude: [bug/medium] A partly written output is never
+// removed. remote::receive returns early on any error while a file is open
+// (the link failing mid-file, Packed::unpack or write_all failing, a Failed
+// or unexpected message), and Writing has no Drop, so `<stem>.rustc-dist-<pid>`
+// stays in the user's --out-dir. Cargo never cleans unknown files there, the
+// name changes with every daemon restart, and on the lanes target dirs are on
+// a RAM-backed tmpfs, so a link that drops during a 338 MB rlib leaves 338 MB
+// of RAM used until someone notices. Fix: a Drop on Writing that removes `tmp`
+// unless the rename happened (e.g. take the path out on success). (remote-01)
 /// An output arriving in chunks, written beside its destination.
 struct Writing {
     dest: PathBuf,

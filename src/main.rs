@@ -89,6 +89,15 @@ struct CalibrateArgs {
 
 fn main() {
     if let Err(e) = dispatch() {
+        // CR claude for claude: [risk/medium] A BrokenPipe anywhere makes rustc-dist exit 0 and
+        // print nothing. That suits `rustc-dist status | head`, but for the wrapper exit 0 tells
+        // cargo that rustc succeeded. anyhow's downcast_ref sees through context, so a wrapper
+        // whose write to the daemon socket fails with EPIPE once client::exchange stops retrying (a
+        // daemon that reads the version and closes, daemon::serve, races the Ask's write, which
+        // daemon-02 can keep going past 30 s) reports success with no crate compiled, and cargo
+        // fails later on a missing file far from the cause. Fix: swallow BrokenPipe only for the
+        // commands that print to stdout (Opt::Status, Opt::Calibrate), never for Opt::Wrapper.
+        // (main-01)
         if e.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe) {
             return;
         }

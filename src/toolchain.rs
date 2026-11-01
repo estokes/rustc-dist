@@ -57,6 +57,17 @@ fn parse_key(vv: &str) -> Result<ArcStr> {
     Ok(format_compact!("{} {}", field("commit-hash: ")?, field("host: ")?).as_str().into())
 }
 
+// CR claude for claude: [bug/high] The toolchains are read once, when the daemon joins the farm,
+// and a toolchain is found by key but run by path (Installed::rustc). After a `rustup update` while
+// the daemon runs, this box goes on advertising the old commit (farm::Member's toolchains) and runs
+// the new rustc for jobs that ask for the old one (sandbox::take finds `tc` by the old key). Leaf
+// crates, which load nothing but the sysroot, build cleanly there with the wrong compiler, and the
+// client's next compile that reads them fails with E0514 (compiled by an incompatible version of
+// rustc), locally, so nothing retries it; cargo's fingerprint names the client's rustc, so later
+// builds keep the bad files until `cargo clean`. The client re-keys when its rustc's mtime changes
+// (Keys::key); this side never does, and a toolchain installed later isn't served until a restart.
+// Fix: before running, check tc.rustc()'s key through a Keys cache and answer "no toolchain" on a
+// mismatch, and rescan and republish the toolchains when a sysroot's rustc changes. (toolchain-01)
 /// rustup's toolchains on this box.
 pub fn installed() -> Vec<Installed> {
     let home = env::var_os("RUSTUP_HOME")

@@ -194,6 +194,19 @@ impl Graph {
         }
         // Marks `id` as in progress, so a cycle in stale data ends here.
         self.ranks.insert(id.clone(), 0);
+        // CR claude for eric: [bug/medium] A rank adds each job's work, front plus rest,
+        // but Sched::dispatch turns rank differences into slack as time on one thread of
+        // the fastest class (`time_us(horizon - rank_mi, fastest_rate)`), so a wide job
+        // counts as if it ran on one thread. In `rustc-dist status` on washu-chan today,
+        // graphix_package_core (5aaddb61cfdea6bd) has 98.6 s of work, 2% of it front end,
+        // at width 9.6: about 12 s on that class with its threads (25 s measured wall
+        // on every CPU), yet it adds 98.6 s to every chain through it; graphix_types adds
+        // 243 s for about 120 s. A build whose horizon runs through such jobs gives its
+        // other jobs tens of seconds of slack they don't have, and they take slow
+        // classes. Fix: rank by predicted duration, the front end at the fast rate plus
+        // the rest over min(width, CPUs), as Stats::time_us computes at the fastest
+        // place; status's "Rank and work are seconds on one thread" changes with it.
+        // (graph-01)
         let own = match self.nodes.get(id) {
             Some(n) => stats.predict(&n.exact, &n.coarse).cost_mi(),
             None => 0,

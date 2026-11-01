@@ -273,6 +273,17 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
                     let _ = tx.send(Msg::Farm { name, state });
                 }
             }
+            // CR claude for claude: [bug/high] A resolver error ends the farm for good.
+            // check_changed and list return Err once netidx's read client gives up on the resolver
+            // (four tries with random waits of 1 to 12 s), and `?` ends run: this box's state
+            // columns are unpublished as `cells` drops, it stops watching the others, and it stays
+            // out until the daemon restarts, with one "left the farm" line in the log. The
+            // scheduler meanwhile keeps every other box's last state, since nothing sends Msg::Farm
+            // { state: None } on the way out, and goes on placing jobs by that frozen snapshot of
+            // versions, free tokens and frees in ms. A resolver restart, a wifi drop or a laptop
+            // suspend is enough. Fix: log the error and try again at the next tick, and whenever
+            // run returns send `state: None` for each watched box. No test covers a resolver that
+            // goes away and comes back. (farm-01)
             _ = list.tick() => {
                 if !m.subscriber.resolver().check_changed(&mut tracker).await? {
                     continue;

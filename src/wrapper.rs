@@ -61,6 +61,18 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
                 bail!("unexpected reply from the daemon")
             }
         }
+        // CR claude for eric: [bug/medium] Once the first reply is in, the wrapper can't follow a
+        // daemon restart. A remote job whose daemon exits while it streams (main's shutdown_timeout
+        // drops the connection tasks once daemon::run returns) ends here with "the daemon went away
+        // mid-job", and one that failed on another box after forwarding its rmeta line, then met a
+        // draining scheduler, gets Reply::Restarting, which this loop calls "unexpected reply from
+        // the daemon". Either way cargo sees a failed compile, so any daemon restart (a deploy,
+        // systemctl restart, a client of another version: daemon::serve) fails the builds that have
+        // jobs on other boxes. The wrapper knows whether it printed an rmeta line already
+        // (protocol::is_metadata_line on each Output), so it could ask again through
+        // client::request and OR that into the Slot's filter_metadata. Rerun or fail is a policy
+        // choice, hence for eric; see client-01 for the same failure before the first reply.
+        // (wrapper-01)
         reply = protocol::recv(&mut sock, &mut buf).context("the daemon went away mid-job")?;
     }
 }

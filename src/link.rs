@@ -99,6 +99,14 @@ impl Gate {
         self.asked.is_none() && !self.hung_up
     }
 
+    // CR claude for claude: [dead/low] `hung_up` is never set. Gate keeps
+    // `theirs` open for its whole life, so the server itself holds the
+    // sandbox's end and try_read never returns 0. So the doc's "or for every
+    // process holding the sandbox's end to exit", and `listening`'s "and one
+    // still could", never happen. sandbox::run only gets by because its loop
+    // also ends on the exit and EOFs. Either close `theirs` in the parent once
+    // the sandbox has started (then hang-up works and the doc holds), or remove
+    // `hung_up` and fix the docs. (link-01)
     /// Wait for a stand-in to start waiting, or for every process holding
     /// the sandbox's end to exit.
     pub async fn ask(&mut self) -> Result<()> {
