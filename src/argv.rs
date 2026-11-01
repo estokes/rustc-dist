@@ -107,7 +107,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
             paths.outputs.extend(
                 emit.split(',').filter_map(|e| e.split_once('=')).map(|(_, p)| ArcStr::from(p)),
             );
-            Some(Portable { paths, reads: types.reads(test, &cg, target) })
+            Some(Portable { paths, reads: types.reads(test, emit, &cg, target) })
         }
         _ => None,
     };
@@ -149,8 +149,14 @@ impl CrateTypes {
         }
     }
 
-    /// The default linker is found on `PATH` as `cc` for GNU targets.
-    fn reads(&self, test: bool, cg: &Codegen, target: Option<&str>) -> Reads {
+    /// A job that emits no object code, such as `cargo check`'s, reads only
+    /// metadata. With no `--emit`, rustc emits it. The default linker is
+    /// found on `PATH` as `cc` for GNU targets.
+    fn reads(&self, test: bool, emit: &str, cg: &Codegen, target: Option<&str>) -> Reads {
+        let emits_code = emit.is_empty() || emit.split(',').any(|e| e == "link" || e.starts_with("link="));
+        if !emits_code {
+            return Reads::Metadata;
+        }
         let links = self.links || test || !self.given;
         if self.reads_objects || links && cg.lto {
             return Reads::Rlibs;
@@ -351,6 +357,14 @@ mod test {
         assert_eq!(reads(&lib), Some(Reads::Metadata));
         assert_eq!(with(&["--crate-type=rlib"]), Some(Reads::Metadata));
         assert_eq!(with(&["--test"]), cc);
+        let check = |extra: &[&str]| {
+            let mut args = lib.to_vec();
+            args[5] = "--emit=dep-info,metadata";
+            args.extend_from_slice(extra);
+            reads(&args)
+        };
+        assert_eq!(check(&["--test"]), Some(Reads::Metadata), "cargo check --tests links nothing");
+        assert_eq!(check(&["--crate-type", "bin"]), Some(Reads::Metadata));
         assert_eq!(with(&["--crate-type", "proc-macro"]), cc);
         assert_eq!(with(&["--crate-type", "bin", "-C", "lto=off"]), cc);
         let bin = ["rustc", "--crate-name", "b", "src/main.rs", "--out-dir", "/t"];

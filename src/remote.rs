@@ -13,7 +13,7 @@ use poolshark::local::LPooled;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     pin::pin,
@@ -268,6 +268,10 @@ pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
             let mut source_dirs: LPooled<HashSet<PathBuf>> = LPooled::take();
             for dep in dep_info(&text) {
                 let path = at(&dep);
+                // The last compile read it; this one can't if it is gone.
+                if fs::metadata(&path).is_err_and(|e| e.kind() == ErrorKind::NotFound) {
+                    continue;
+                }
                 if let Some(dir) = path.parent()
                     && manifest.as_ref().is_some_and(|m| dir.starts_with(m))
                 {
@@ -475,6 +479,7 @@ async fn receive(
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::argv::{self, Invocation};
 
     #[test]
     fn absolute_resolves_dots() {
@@ -533,6 +538,37 @@ mod test {
         assert_eq!(names(&rlibs), ["libx.rlib", "liby.rlib", "libz.so"]);
         assert!(rlibs.rlibs.is_empty());
         assert_eq!(names(&stage(&Reads::Metadata)?), ["libx.rmeta", "liby.rlib", "libz.so"]);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_gone_since_the_last_compile_is_not_sent() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-gone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a/src"))?;
+        fs::create_dir_all(dir.join("target/deps"))?;
+        fs::write(dir.join("a/src/lib.rs"), "pub fn f() {}\n")?;
+        let deps = dir.join("target/deps");
+        fs::write(deps.join("a-x1.d"), format!("{0}/liba-x1.rmeta: a/src/lib.rs a/src/gone.rs\n", deps.display()))?;
+        let args = [
+            "rustc", "--crate-name", "a", "--crate-type", "lib", "--edition", "2021", "a/src/lib.rs",
+            "--emit=dep-info,metadata,link", "-C", "extra-filename=-x1", "--out-dir", deps.to_str().unwrap(),
+        ];
+        let Invocation::Compile(c) = argv::classify(&args, None) else { panic!("not a compile") };
+        let portable = c.portable.expect("portable");
+        let job = Job {
+            rustc: "rustc".into(),
+            args: args[1..].iter().map(|a| ArcStr::from(*a)).collect(),
+            env: vec![("CARGO_MANIFEST_DIR".into(), ArcStr::from(dir.join("a").to_str().unwrap()))],
+            cwd: ArcStr::from(dir.to_str().unwrap()),
+            target: None,
+            paths: portable.paths,
+            reads: portable.reads,
+        };
+        let staged = stage(&job, &[], &Hashes::default())?;
+        let names: Vec<&str> = staged.files.iter().filter_map(|f| f.path.rsplit_once('/')).map(|(_, n)| n).collect();
+        assert_eq!(names, ["lib.rs"]);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
