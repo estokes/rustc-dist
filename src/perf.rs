@@ -1,8 +1,9 @@
 //! Instructions retired, counted by the CPU.
 
+use anyhow::{Context, Result, bail};
+use poolshark::local::LPooled;
 use std::{
-    fs,
-    mem,
+    fs, io, mem,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
@@ -30,6 +31,17 @@ const PMU_SHIFT: u32 = 32;
 const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 8;
 const EXCLUDE_KERNEL: u64 = 1 << 5;
 const EXCLUDE_HV: u64 = 1 << 6;
+const FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
+const FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
+/// Counters that together ran this many ns less than they were enabled
+/// were shared with another perf user, and count low. A thread that moves
+/// between kinds of core finds them a fraction of a millisecond short with
+/// nothing else counting.
+const SHORT_NS: u64 = 1_000_000;
+
+/// What a counter's read gives: its count, then the ns it was enabled and
+/// the ns it was running.
+type Reading = [u64; 3];
 
 /// Counts the user-space instructions the calling thread retires on every
 /// kind of core.
@@ -46,6 +58,7 @@ impl Counter {
                     kind: PERF_TYPE_HARDWARE,
                     size: mem::size_of::<Attr>() as u32,
                     config: (pmu << PMU_SHIFT) | PERF_COUNT_HW_INSTRUCTIONS,
+                    read_format: FORMAT_TOTAL_TIME_ENABLED | FORMAT_TOTAL_TIME_RUNNING,
                     flags,
                     ..Attr::default()
                 };
@@ -58,7 +71,7 @@ impl Counter {
         Some(Self(fds))
     }
 
-    // CR claude for claude: [risk/low] A failed or short read counts as 0, and the
+    // XCR claude for claude: [risk/low] A failed or short read counts as 0, and the
     // counter sets no read_format, so a count the kernel multiplexed (another perf user
     // holding the PMU during calibration) comes back unscaled and low with nothing to
     // say so. calibrate::worker then computes a low class rate from it, which feeds
@@ -66,16 +79,55 @@ impl Counter {
     // next start. Fix: set read_format to TOTAL_TIME_ENABLED | TOTAL_TIME_RUNNING, read
     // the three u64s, and make a short read or running < enabled an error, so
     // calibration falls back to RUN_INSTRUCTIONS or fails loudly. (perf-01)
-    pub fn read(&self) -> u64 {
-        self.0
-            .iter()
-            .map(|fd| {
-                let mut n = 0u64;
-                let got = unsafe { libc::read(fd.as_raw_fd(), (&raw mut n).cast(), 8) };
-                if got == 8 { n } else { 0 }
-            })
-            .sum()
+    // 2026-11-01 claude: Counter sets read_format TOTAL_TIME_ENABLED |
+    // TOTAL_TIME_RUNNING and Counter::read returns Result<u64>. A failed or short read
+    // is an error. So is a sum of running time across the core types more than SHORT_NS
+    // (1 ms) under the largest enabled time. On this hybrid box (cpu_core and cpu_atom)
+    // both counters are enabled whenever the thread runs, but only the one for the core
+    // it is on runs. Pinned (calibration), the sum equals enabled exactly. Unpinned, it
+    // fell 8 to 11 us short over 6.5 s and up to about 0.1 ms on a first read, so a
+    // share of enabled time (first tried at 99%) fails at start. calibrate::worker
+    // propagates the error, so the calibration fails with the message, and
+    // Sched::calibrated logs it and uses classes::fallback unsaved. `rustc-dist
+    // calibrate --seconds 2` ran clean here. Regression:
+    // perf::test::counters_that_ran_less_than_the_thread_count_low on synthetic
+    // readings (pinned, moving and shared); counts_the_calling_thread_only reads real
+    // counters unpinned.
+    /// The instructions counted since `start`. An error if a counter can't
+    /// be read or the counters count low.
+    pub fn read(&self) -> Result<u64> {
+        let mut readings: LPooled<Vec<Reading>> = LPooled::take();
+        for fd in &self.0 {
+            let mut r: Reading = [0; 3];
+            let got = unsafe { libc::read(fd.as_raw_fd(), r.as_mut_ptr().cast(), mem::size_of::<Reading>()) };
+            if got < 0 {
+                return Err(io::Error::last_os_error()).context("reading an instruction counter");
+            }
+            if got as usize != mem::size_of::<Reading>() {
+                bail!("reading an instruction counter gave {got} bytes");
+            }
+            readings.push(r);
+        }
+        total(&readings)
     }
+}
+
+/// The count of every kind of core's counter. Each runs only while the
+/// thread is on its kind of core, so together they run whenever it does,
+/// and each is enabled whenever it does.
+fn total(readings: &[Reading]) -> Result<u64> {
+    let count = readings.iter().map(|r| r[0]).sum();
+    let enabled = readings.iter().map(|r| r[1]).max().unwrap_or(0);
+    let running: u64 = readings.iter().map(|r| r[2]).sum();
+    if enabled.saturating_sub(running) > SHORT_NS {
+        bail!(
+            "the instruction counters ran {} of the {} ms they were enabled: \
+             another perf user shares them, so they count low",
+            running / 1_000_000,
+            enabled / 1_000_000
+        );
+    }
+    Ok(count)
 }
 
 /// The PMU of each kind of core on a hybrid CPU, or the generic one.
@@ -107,11 +159,23 @@ mod test {
             return;
         };
         let spin = |n: u64| (0..n).fold(0u64, |a, i| black_box(a.wrapping_mul(31).wrapping_add(i)));
-        let base = c.read();
+        let base = c.read().unwrap();
         black_box(spin(50_000_000));
-        let spun = c.read();
+        let spun = c.read().unwrap();
         assert!(spun - base > 50_000_000, "{}", spun - base);
         black_box(thread::spawn(move || spin(50_000_000)).join().unwrap());
-        assert!(c.read() - spun < 10_000_000, "another thread's work counted");
+        assert!(c.read().unwrap() - spun < 10_000_000, "another thread's work counted");
+    }
+
+    #[test]
+    fn counters_that_ran_less_than_the_thread_count_low() {
+        // On one kind of core, the other kind's counter never runs.
+        assert_eq!(total(&[[5, 1000, 1000], [0, 999, 0]]).unwrap(), 5);
+        // Moving between kinds, the two run in turn.
+        let s = 1_000_000_000;
+        assert_eq!(total(&[[5, s, s - 10_000_000], [2, s + 8, 9_990_000]]).unwrap(), 7);
+        // Shared with another perf user, a counter runs part of the time.
+        assert!(total(&[[5, s, s / 2], [0, s, 0]]).is_err());
+        assert!(total(&[[5, 10_000_000, 5_000_000]]).is_err());
     }
 }

@@ -238,8 +238,12 @@ The classes come from those times. Sort the CPUs by time and start a new class
 wherever two neighbours differ by more than about 8%. Two core types that
 measure the same land in one class, which is right for scheduling. Each run
 also counts its instructions, and a class's rate is its members' mean
-instructions per CPU-µs. Without counters a run is taken to retire 697 M
-instructions, what a release build's run retires.
+instructions per CPU-µs. Counters that ran for less of the time than they
+were enabled were shared with another perf user and count low, so the
+calibration fails rather than use them. Without counters a run is taken to
+retire 633 M instructions, what a release build's run retired on washu-chan
+on 2026-11-01; the count can move with the compiler, the C library and the
+CPU.
 
 `rustc-dist calibrate` measures and prints without saving. Each profile's
 classes go in `~/.local/state/rustc-dist/profiles/NAME.toml`, and boxes publish
@@ -284,24 +288,26 @@ threads it can get, min(width, the place's CPUs for a heavy job), times the
 place's factor at the load there now plus the threads the job adds.
 
 The size and width a place's prediction uses come from the unit's own runs
-at that place when it has any, else from its runs at other places of that
-box (another class, the same profile), and only for a box it never ran on
-from all its runs. Each run counts at its place's factor for the load it
-saw, so the prediction is the time it took there scaled by the place's curve
-to the load now: the curve's shape matters, not its level. On 2026-11-01
-graphix_types (`836c9a8b3f8d481b`) had nine runs on ryouko of 55 s and two
-here of 108 and 146 s. Its size came mostly from ryouko, and washu-chan's
-factor for heavy jobs, learned from every unit, turned it into 54 s here:
-it stayed here and took 146 s. It also held 2.8 tokens on ryouko and 4
-here, which one width per unit hid in the factor.
+at that place while they weigh at least half a fresh run, else from its runs
+on that box (another class, the same profile) while those do, and otherwise
+from all its runs. So one old run, or one that starved, at a place stops
+speaking for the place as it ages. Each run counts at its place's factor for
+the load it saw, so the prediction is the time it took there scaled by the
+place's curve to the load now: the curve's shape matters, not its level. On
+2026-11-01 graphix_types (`836c9a8b3f8d481b`) had nine runs on ryouko of
+55 s and two here of 108 and 146 s. Its size came mostly from ryouko, and
+washu-chan's factor for heavy jobs, learned from every unit, turned it into
+54 s here: it stayed here and took 146 s. It also held 2.8 tokens on ryouko
+and 4 here, which one width per unit hid in the factor.
 
 Every estimate is a weighted median of recent samples, weights halving with
 age, so old samples fade but no one sample, however long, moves the middle.
 What a run teaches:
 
-- The unit: its last 16 runs, each its work at its place's calibrated speed
-  and its load. Its size is the weighted median of the size each implies at
-  its place's current factor, and its width the median of their widths.
+- The unit: its last 16 runs, each as measured (its front end's µs, and its
+  µs and token-µs after that) with its load. Its size is the weighted median
+  of the size each implies at its place's current calibrated speed and
+  factor, and its width the median of their widths.
 - Its place's factor at its load, if the unit also ran elsewhere or under
   another load: a comparison, its time over what its size from those other
   runs predicts at the place's calibrated speed. It weighs that prediction
@@ -318,12 +324,17 @@ as a sample of 3 s of runs that never ages, as much as a few typical jobs, so
 a few runs that agree outweigh it, and it outweighs runs grown old: a place
 with no recent comparisons goes back to its calibration. Idle is where the
 calibration ran, so with no runs there the idle bucket keeps the
-calibration's factor, with the curve's weight. More load never makes a run
-faster, so buckets whose factors fall as load grows are pooled into their
-mean, weighted by what each learned (pool adjacent violators). A bucket
-nothing has reached lies between the nearest buckets that have; one past the
-last that has follows the starting curve's slope. A place whose calibration
-changes starts over.
+calibration's factor, with the curve's weight, while every busier bucket
+learns at least that. More load never makes a run faster, so buckets whose
+factors fall as load grows are pooled into their mean, weighted by what each
+learned (pool adjacent violators). That includes the idle anchor: a busier
+bucket that learned a factor below the calibration pulls the idle bucket
+down with it most of the way, since the anchor weighs only the curve's 3 s.
+A bucket nothing has reached lies between the nearest buckets that have; one
+past the last that has follows the starting curve's slope. A place whose
+calibration changes starts its curve over. Its runs, kept as measured, then
+count at its new calibrated speed, and its sends, which say nothing about
+its CPUs, stay.
 
 On 2026-11-01 washu-chan ran builds at 2 to 14 runnable tasks per CPU and
 none idle. Its fastest class learned a factor of 0.42 at 2 tasks per CPU,
@@ -332,7 +343,9 @@ rustc slows there. Without pooling, predictions here swung threefold as the
 load moved between buckets. Without the idle anchor, the idle bucket copied
 the 0.21 learned at 2 tasks per CPU relative to the curve, and status, which
 shows speeds against this box's fastest class idle, put ryouko at 0.74 of it.
-Calibrated, ryouko's cores are 3.3 times as fast. Only ratios between factors are
+Calibrated, ryouko's cores are 3.3 times as fast. The anchor holds only while
+busier buckets learn at least the calibration, so that 0.42 still pools it
+most of the way down. Only ratios between factors are
 fixed by data, since every unit could be bigger and every place faster; the
 calibration's weight anchors the scale.
 
@@ -351,9 +364,10 @@ box already holds, such as crates it just built, is cheap to send there:
   the server trims its store. A file whose hash isn't known counts as
   missing everywhere.
 - The term is the weighted median of the unit's own last 8 sends to that
-  place, else of the last 64 sends there of jobs that link as it does or
-  doesn't (a job that links sends every rlib below it), else a guess of
-  200 ms, each adjusted for the kB the box lacks now against the kB that send
+  place while they weigh at least half a fresh send, else of the last 64
+  sends there of jobs that link as it does or doesn't (a job that links
+  sends every rlib below it), however old, else a guess of 200 ms, each
+  adjusted for the kB the box lacks now against the kB that send
   moved, at the place's µs per kB: the weighted median of the slopes between
   pairs of those 64 whose kB differ by at least 256 kB (Theil-Sen), with
   50 MB/s as one more slope. kB are counted before compression, so a place's
@@ -377,15 +391,20 @@ key is crate name plus the `-C metadata` hash, cargo's identity for a unit
 sources are edited. A unit with no history falls back to crate name plus
 opt-level plus emit kinds, then to the median size of all units. Each entry
 also holds hdrhistograms (2 significant figures) of wall time, peak memory,
-and sent runs' copy time and bytes, halved at 256 runs, and runs counted by
-where they ran and for whom. Admission uses the unit's p90 peak. Only
-successful compiles are recorded. A cell unrun for about 60 days, as long as
-the build graph keeps a node, is dropped. A table from before runs were timed
-loads as seed history: each unit's median instruction count, front end and
-width become one run at a place with factor 1. A table the daemon can't read,
-such as one a later version wrote, is moved aside to `jobs.hdr.unreadable`
-(or `.unreadable.2`, and so on, never over one already there), with an error
-in the log, and the daemon starts with an empty table.
+and sent runs' copy time and bytes, and runs counted by where they ran and
+for whom. At 256 runs each histogram halves the count at or above each value,
+rounding up, so every quantile stays where it was and old values still fade.
+Admission uses the unit's p90 peak. Only successful compiles are recorded. A
+sample older than about 60 days, as long as the build graph keeps a node, is
+dropped, and a unit left with none goes with it. The table (`rdstat10`)
+keeps runs as measured. One that kept them as work at their place's
+calibration (`rdstats9`, or `rdstats8`'s decayed sums) loads each run as the
+µs that work takes at its place's calibration, as wide. A table from before
+runs were timed loads as seed history: each unit's median instruction count,
+front end and width become one run at a place with factor 1. A table the
+daemon can't read, such as one a later version wrote, is moved aside to
+`jobs.hdr.unreadable` (or `.unreadable.2`, and so on, never over one already
+there), with an error in the log, and the daemon starts with an empty table.
 
 ## Build graph
 
