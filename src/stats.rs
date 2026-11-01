@@ -295,7 +295,7 @@ impl Place {
                 learned.push((i, prior(load_c) * r, weight));
             }
         }
-        // CR claude for eric: [doc-drift/medium] The idle anchor is pooled away whenever a
+        // CR claude for claude: [doc-drift/medium] The idle anchor is pooled away whenever a
         // busier bucket learned a factor below the calibration: the anchor weighs only
         // PRIOR_US, so pool adjacent violators averages it into that bucket's much
         // heavier mean. Probe (a temporary test, `cargo test --bin rustc-dist
@@ -311,6 +311,9 @@ impl Place {
         // from idle) or monotonicity (today's code; then the docs should say the anchor
         // holds only while busier buckets learn at least the calibration), and add a
         // test for the below-calibration case. (stats-05)
+        // 2026-11-01 claude: Eric ruled (2026-11-01): monotonicity wins (a): fix the docs
+        // to say the anchor holds only while busier buckets learn at least the
+        // calibration, and add a test for the case below it.
         non_decreasing(&mut learned);
         for (j, f) in self.factors.iter_mut().enumerate() {
             let (lo, a) = learned.iter().rev().find(|l| l.0 <= j).map_or((0, prior(0)), |l| (l.0, l.1));
@@ -408,18 +411,6 @@ struct Size {
     width: f64,
 }
 
-// CR claude for eric: [perf/medium] Each Record allocates four full hdrhistogram count
-// arrays, 3200 + 2560 + 2560 + 3200 u32s (Histogram::distinct_values), about 46 kB,
-// whether or not the unit was ever sent. Probe (a temporary test loading a copy of
-// this box's jobs.hdr, `cargo test --bin rustc-dist zz_probe`): its 548 exact and 354
-// coarse records hold 41 MB of counts, against a daemon RSS of 252 MB. At the 7,000
-// units DESIGN.md's Stage 6 plans for, exact records alone come to over 300 MB.
-// copy_ms and sent_kb repeat what `sends` already keeps per send. Options: keep mem_kb
-// and wall in RunSample (p90 of 16 runs is about the second largest) and read copy and
-// kB from `sends`, dropping the histograms and the halving (stats-02) together; or
-// keep histograms with a smaller range or 1 significant figure (16 sub-buckets per
-// half instead of 128, about 7x smaller). Either changes the table format and what
-// admission's p90 is taken over. (stats-03)
 struct Record {
     runs_kept: VecDeque<RunSample>,
     sends: VecDeque<UnitSend>,
@@ -627,7 +618,7 @@ impl Stats {
     pub fn place(&mut self, key: &str, fast: u64, rate: u64) -> PlaceId {
         if let Some(&id) = self.by_key.get(key) {
             let p = &mut self.places[id.0 as usize];
-            // CR claude for eric: [bug/medium] A recalibrated place reads its old runs at
+            // CR claude for claude: [bug/medium] A recalibrated place reads its old runs at
             // the new rate. RunSample keeps work (front_us * fast, tokens_us * rate) at the
             // calibration current when it ran, and Record::size divides that by the
             // place's factor now. This reset puts the factor back to the starting curve
@@ -644,6 +635,9 @@ impl Stats {
             // the place's current fast/rate in Record::size (or rescale the place's
             // samples by old over new rate here), and keep `sends` across a
             // recalibration. (stats-01)
+            // 2026-11-01 claude: Eric ruled (2026-11-01): store measured µs in each run and
+            // apply the place's current rates when sizing; keep sends across a
+            // recalibration (a).
             if (p.fast, p.rate) != (fast.max(1), rate.max(1)) {
                 *p = Place::new(p.key.clone(), fast, rate);
                 self.dirty = true;
@@ -686,7 +680,7 @@ impl Stats {
         let mut samples: LPooled<Vec<(f64, f64)>> = LPooled::take();
         let own = self.exact.get(&unit.exact).into_iter().flat_map(|r| &r.sends).filter(|s| s.place == place);
         samples.extend(own.map(|s| at(&s.send)));
-        // CR claude for eric: [bug/medium] The unit's own sends win whenever it has any,
+        // CR claude for claude: [bug/medium] The unit's own sends win whenever it has any,
         // however old: weights only count against each other inside one median, so two
         // sends from yesterday's network outvote 64 fresh sends of its kind, and the
         // copy half-life never hands a unit back to the place's sends. Probe (a
@@ -700,6 +694,9 @@ impl Stats {
         // sends. Fix: fall back by weight, not emptiness (take the place's sends when
         // the own sends weigh less than about one fresh send), or take one median over
         // both with the place's sends discounted. (stats-06)
+        // 2026-11-01 claude: Eric ruled (2026-11-01): fall back by weight, not emptiness
+        // (a): use the unit's own sends there only while they weigh at least half a
+        // fresh send, else the place's.
         if samples.is_empty() {
             samples.extend(p.sends[usize::from(links)].iter().map(at));
         }
@@ -739,7 +736,7 @@ impl Stats {
         let (places, now, half_life_s) = (&self.places, self.now, self.decay.half_life_s);
         let group = &places[place.0 as usize].group;
         if let Some(r) = self.exact.get(exact) {
-            // CR claude for eric: [risk/medium] One run at the place, of any age, decides
+            // CR claude for claude: [risk/medium] One run at the place, of any age, decides
             // the prediction there: Record::size needs only some weight, so a single run,
             // or one 15 days old at 2^-15 of a fresh run's weight, shadows fifteen fresh
             // runs on other boxes, against DESIGN.md's "no one sample, however long, moves
@@ -750,6 +747,9 @@ impl Stats {
             // require the place's runs to weigh at least a run or two fresh before
             // Basis::Place, or blend them with the Box and Size estimates in one median.
             // (stats-07)
+            // 2026-11-01 claude: Eric ruled (2026-11-01): fall back by weight, as
+            // (stats-06) (a): use the unit's runs at a place only while they weigh at
+            // least half a fresh run, else its runs on the box, else its size.
             if let Some(s) = r.size(places, now, half_life_s, |s| s.place == place) {
                 return (known(r, &s), Basis::Place);
             }

@@ -159,7 +159,7 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
                         data.unpack()?;
                         con.send_one(&FromBox { id, msg: FromServer::Heartbeat }).await?;
                     }
-                    // CR claude for eric: [risk/medium] Each job's inbox has no
+                    // CR claude for claude: [risk/medium] Each job's inbox has no
                     // bound, and this loop never waits on it, so nothing pushes
                     // back on the client. Its client sends late rlibs right after
                     // Run, but the job doesn't read them until its sandbox is
@@ -171,6 +171,9 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
                     // stall every job on the link behind one slow job. Starting
                     // the late `receive` into the store as soon as Run arrives
                     // avoids that trade-off. (sandbox-05)
+                    // 2026-11-01 claude: Eric ruled (2026-11-01): a, with
+                    // (sandbox-03): receive late uploads into the store as soon
+                    // as Run arrives.
                     ToServer::Offer { unit, key, target, class } => {
                         let (tx, inbox) = mpsc::unbounded_channel();
                         let reply = Reply { con: con.clone(), id };
@@ -292,7 +295,7 @@ async fn job(
         bail!("expected run");
     };
     check(&cwd)?;
-    // CR claude for eric: [bug/medium] A Coming waits on an upload that moves
+    // CR claude for claude: [bug/medium] A Coming waits on an upload that moves
     // only while the sending job is alive, and late rlibs are read from the
     // inbox only inside run's loop, i.e. while the sender's rustc runs. (1)
     // When the job whose client sends a shared late rlib exits first, a compile
@@ -311,6 +314,10 @@ async fn job(
     // after its rustc exits, while another job waits on them; and do not wait
     // here on a hash another job will receive only once its rustc runs.
     // (sandbox-03)
+    // 2026-11-01 claude: Eric ruled (2026-11-01): a: receive a job's late
+    // uploads into the store from Run on, to completion even after its rustc
+    // exits while another job waits on them; when a job needs now a blob that
+    // is another job's late rlib, ask its own client for it.
     for c in coming_now {
         c.arrived(store).await?;
     }
@@ -434,20 +441,6 @@ impl JobDir {
         self.0.join(&path[1..])
     }
 
-    // CR claude for eric: [risk/high] The job tree is hard links to store blobs,
-    // bound read-write into the sandbox, and only mode 0444 stands between the
-    // job and the store's inodes. The job runs as the user that owns them, so
-    // it can chmod and rewrite a blob in place. The blob keeps its hash name,
-    // Store::has keeps saying yes, and nothing checks the content again, so
-    // every later job from every client is given the altered file. One
-    // client's job can then change what other clients build against, which
-    // README's Security section doesn't cover. Store::adopt has the same
-    // shape: it links a job's output into the store while the job can still
-    // write it. A tool that writes outputs in place over an input path would
-    // corrupt the store without any intent. Options: copy or reflink instead
-    // of hard linking (costs time and space), ro-bind the inputs (one mount per
-    // directory of inputs), keep the store owned by another uid, or check
-    // hashes when placing (costs a read). Needs a decision. (sandbox-02)
     /// Rlibs still to come get stand-ins made from their metadata.
     fn build(
         &self,
@@ -681,21 +674,6 @@ async fn run(
 /// Send the file an artifact line names, before the line. A crate file
 /// stays in the store for jobs that read it later, and its last chunk
 /// tells the client its hash.
-// CR claude for eric: [bug/high] The server works on the job tree from the host
-// while the sandboxed job, which has that tree bound read-write, can put
-// symlinks in it, and every host-side operation on the tree follows them:
-// File::open here and fs::copy in Store::adopt follow a final symlink, and
-// hard_link, rename and create_dir_all (Store::adopt, blobs::replace for late
-// rlibs, JobDir::build) follow symlinked directory components. check only
-// vets the string. So a job, malicious or confused, can make the server read
-// files outside the tree and send them back or adopt them into the store, and
-// can redirect where blobs::replace writes, which reaches the server user's
-// files outside the sandbox. That is more than README's Security section
-// grants (code inside a sandbox with no home). Fix: resolve every path from
-// the job tree beneath `root` without following links (openat2 with
-// RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS, then fstat that the result is a
-// regular file and work from the fd), or place late rlibs in a directory the
-// sandbox cannot write. (sandbox-01)
 async fn send_artifact(reply: &Reply, store: &Store, root: &Path, line: &[u8], level: i32) -> Result<()> {
     let path = protocol::artifact(line)?;
     check(&path)?;

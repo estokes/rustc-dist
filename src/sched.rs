@@ -842,7 +842,7 @@ struct RemoteBox {
 }
 
 impl RemoteBox {
-    // CR claude for eric: [bug/medium] Once the published frees_in_ms has passed, this
+    // CR claude for claude: [bug/medium] Once the published frees_in_ms has passed, this
     // returns 0 and stays there until the box republishes, which a prediction changing
     // alone never causes (Sched::publish). Here an overdue job is expected to run half
     // again as long as it has (Running::left_us), so it can't strand jobs waiting for
@@ -856,6 +856,9 @@ impl RemoteBox {
     // prediction 30 s overdue, still waits: true". Options: past the prediction, the
     // client assumes at least half the overrun more; or the server republishes when its
     // predicted frees_in moves by more than some share. (sched-02)
+    // 2026-11-01 claude: Eric ruled (2026-11-01): the server republishes when its
+    // predicted frees-in moves by more than some share (b): easy, and the correct
+    // long-term fix.
     /// µs until a token of class `k`, which has none for jobs from here,
     /// is predicted to free: as its state says, or, if the tokens it shows
     /// free went to jobs from here it doesn't show yet, when the first of
@@ -1027,7 +1030,7 @@ impl Sched {
         load: watch::Sender<Load>,
         tx: mpsc::UnboundedSender<Msg>,
     ) -> Result<Self> {
-        // CR claude for eric: [risk/medium] A table or graph that exists but fails to load
+        // CR claude for claude: [risk/medium] A table or graph that exists but fails to load
         // (a binary rolled back to before a format change, a reader bug) is logged,
         // replaced by an empty one, and overwritten by the next Sched::save within a
         // minute. A rollback, which is routine here, then loses every learned size, factor
@@ -1035,6 +1038,8 @@ impl Sched {
         // Graph::load already treat a missing file as empty, so an Err here means a file
         // that holds something. Move the unreadable file aside (e.g. jobs.hdr.unreadable)
         // before starting empty, or refuse to start. (sched-04)
+        // 2026-11-01 claude: Eric ruled (2026-11-01): move the unreadable file aside with
+        // an error log and start empty (a).
         let mut stats = Stats::load(&setup.state_dir.join("jobs.hdr"), setup.decay).unwrap_or_else(|e| {
             warn!("starting with empty job stats: {e:#}");
             Stats::new(setup.decay)
@@ -1449,7 +1454,7 @@ impl Sched {
         }
     }
 
-    // CR claude for eric: [risk/medium] The new layout starts with every class's full
+    // CR claude for claude: [risk/medium] The new layout starts with every class's full
     // pool while the retired layouts' jobs still hold theirs on the same CPUs, and their
     // heavy jobs keep borrowing from the old pools (Event::Sample lends in every
     // layout). On a full box a switch admits a second full set of jobs at once: 16 CPUs
@@ -1461,6 +1466,8 @@ impl Sched {
     // start the new pool less what retired leases hold (by CPU overlap, or slowest
     // classes first), and hand retired tokens to the new pool as their jobs end.
     // (sched-03)
+    // 2026-11-01 claude: Eric ruled (2026-11-01): start the new pools less what retired
+    // leases hold, and hand retired tokens to the new pools as their jobs end (a).
     fn apply(&mut self, profile: Profile, classes: Vec<Class>) {
         let layout = Layout::new(&profile, classes, self.setup.tokens_per_cpu, &mut self.stats);
         let old = mem::replace(&mut self.layout, layout);
@@ -2052,7 +2059,7 @@ impl Sched {
             };
             ClassState { rate: c.rate, cpus: c.cpus.len() as u32, free, frees_in_ms }
         }));
-        // CR claude for eric: [risk/low] While switching, the state pairs the target
+        // CR claude for claude: [risk/low] While switching, the state pairs the target
         // profile's name with the current layout's classes and rates. Every client's
         // Sched::farm registers places under that name with those rates, and Stats::place
         // takes a changed rate for a recalibration and starts the place over. Harmless
@@ -2063,6 +2070,8 @@ impl Sched {
         // skip registering places while a box takes no offers. (sched-07)
         // A box switching shows the profile it is switching to: it takes no
         // offers meanwhile, and its status says how far along it is.
+        // 2026-11-01 claude: Eric ruled (2026-11-01): publish a name and classes that
+        // belong together: the current profile until the switch applies (a).
         let profile = match &self.switch {
             Switch::No => &self.profile,
             Switch::Draining(to)

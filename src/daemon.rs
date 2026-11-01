@@ -264,7 +264,7 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
     let mut version = [0u8; 4];
     sock.read_exact(&mut version).await?;
     let version = u32::from_be_bytes(version);
-    // CR claude for eric: [risk/medium] Any client of another PROTOCOL makes the daemon exit, so
+    // CR claude for claude: [risk/medium] Any client of another PROTOCOL makes the daemon exit, so
     // that systemd starts the binary the client came from. That holds only when the client is the
     // binary the unit's ExecStart names. An older or newer rustc-dist anywhere else (a checkout's
     // target/debug/rustc-dist status, a lane testing a protocol bump, a second install) restarts
@@ -276,6 +276,9 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
     // /proc/PID/exe (peer_cred) is the ExecStart binary and its version is newer; otherwise close
     // and let the client fail loudly, perhaps after a fixed-format line saying which protocol this
     // daemon speaks. (daemon-02)
+    // 2026-11-01 claude: Eric ruled (2026-11-01): never restart for a client of another PROTOCOL:
+    // the protocol is in the netidx path anyway, it should basically never happen, and if it does
+    // it is the client's fault. Refuse that client, saying which protocol each speaks.
     if version != PROTOCOL {
         warn!("a client speaks protocol {version}, this daemon {PROTOCOL}; restarting");
         let _ = ctx.stop.try_send(());

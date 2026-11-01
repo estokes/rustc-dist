@@ -161,7 +161,7 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     })
 }
 
-// CR claude for eric: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
+// CR claude for claude: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
 // LLVM's text, shared by every rustc on the box, and the rlibs a linker maps. box_memory's use
 // leaves most of those out, as MemAvailable counts page cache as available. On washu-chan
 // (2026-11-01) samples of a small rustc read VmRSS 107 to 124 MB, RssFile 65 to 93 MB of it. So
@@ -172,6 +172,8 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
 // + VmSwap (all in /proc/PID/status since Linux 4.5) matches what box_memory counts. rustc's maxrss
 // (Ran::maxrss_kb) has the same bias and recorded peaks take the larger of the two, so changing
 // this alone leaves peaks high. (sys-02)
+// 2026-11-01 claude: Eric ruled (2026-11-01): footprints from RssAnon + RssShmem + VmSwap; peaks
+// stay on maxrss (a).
 /// RSS plus swap, in kB, of `pid` and its descendants.
 pub fn tree_footprint_kb(pid: u32) -> u64 {
     let mut path: LPooled<String> = LPooled::take();

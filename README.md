@@ -247,6 +247,12 @@ netidx permissions on the base path, a bubblewrap sandbox with no network
 and no home directory, and checks on every path a client sends. Only run a
 farm within a netidx domain whose members you trust.
 
+The farm is trusted, not adversarial: clients already run the code servers
+compile for them. So the sandbox keeps honest jobs apart; it does not stop a
+hostile one. A job can plant symlinks in its own tree that the server then
+follows when it reads outputs, and it can rewrite the store blobs its inputs
+are hard links to, which later jobs from every client would use.
+
 ## How it works
 
 [DESIGN.md](DESIGN.md) covers the scheduler, calibration, the cost model,

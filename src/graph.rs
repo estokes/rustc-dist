@@ -194,7 +194,7 @@ impl Graph {
         }
         // Marks `id` as in progress, so a cycle in stale data ends here.
         self.ranks.insert(id.clone(), 0);
-        // CR claude for eric: [bug/medium] A rank adds each job's work, front plus rest,
+        // CR claude for claude: [bug/medium] A rank adds each job's work, front plus rest,
         // but Sched::dispatch turns rank differences into slack as time on one thread of
         // the fastest class (`time_us(horizon - rank_mi, fastest_rate)`), so a wide job
         // counts as if it ran on one thread. In `rustc-dist status` on washu-chan today,
@@ -207,6 +207,9 @@ impl Graph {
         // the rest over min(width, CPUs), as Stats::time_us computes at the fastest
         // place; status's "Rank and work are seconds on one thread" changes with it.
         // (graph-01)
+        // 2026-11-01 claude: Eric ruled (2026-11-01): rank by predicted duration on the
+        // fastest place, front end at the fast rate plus the rest over min(width, CPUs)
+        // (a).
         let own = match self.nodes.get(id) {
             Some(n) => stats.predict(&n.exact, &n.coarse).cost_mi(),
             None => 0,

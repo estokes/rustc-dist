@@ -61,7 +61,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
                 bail!("unexpected reply from the daemon")
             }
         }
-        // CR claude for eric: [bug/medium] Once the first reply is in, the wrapper can't follow a
+        // CR claude for claude: [bug/medium] Once the first reply is in, the wrapper can't follow a
         // daemon restart. A remote job whose daemon exits while it streams (main's shutdown_timeout
         // drops the connection tasks once daemon::run returns) ends here with "the daemon went away
         // mid-job", and one that failed on another box after forwarding its rmeta line, then met a
@@ -73,6 +73,8 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         // client::request and OR that into the Slot's filter_metadata. Rerun or fail is a policy
         // choice, hence for eric; see client-01 for the same failure before the first reply.
         // (wrapper-01)
+        // 2026-11-01 claude: Eric ruled (2026-11-01): rerun (a): reconnect and ask again, filtering
+        // the rmeta line if it was already printed.
         reply = protocol::recv(&mut sock, &mut buf).context("the daemon went away mid-job")?;
     }
 }
