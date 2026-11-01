@@ -189,43 +189,21 @@ fn read_into(path: &str, text: &mut String) -> bool {
     File::open(path).and_then(|mut f| f.read_to_string(text)).is_ok()
 }
 
-/// User plus system CPU time, in µs, of `pid` and its descendants so far,
-/// counting every thread.
-pub fn tree_cpu_us(pid: u32) -> u64 {
-    let mut path: LPooled<String> = LPooled::take();
-    let mut text: LPooled<String> = LPooled::take();
-    let mut ticks = 0;
-    descendants(pid, |p| {
-        path.clear();
-        let _ = write!(path, "/proc/{p}/stat");
-        if read_into(&path, &mut text) {
-            ticks += stat_ticks(&text);
-        }
-    });
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-    ticks * 1_000_000 / hz
-}
-
-/// utime plus stime from a `/proc/PID/stat`. The command name in
-/// parentheses may hold spaces, so fields count from the last `)`.
-fn stat_ticks(stat: &str) -> u64 {
-    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else { return 0 };
-    let mut fields = rest.split_whitespace().skip(11);
-    let mut next = || fields.next().and_then(|f| f.parse::<u64>().ok()).unwrap_or(0);
-    next() + next()
-}
-
-pub struct Usage {
-    pub cpu_us: u64,
-    pub maxrss_kb: u64,
-}
-
-/// Resource use of the children this process has waited for.
-pub fn children_usage() -> Usage {
+/// Peak RSS of the children this process has waited for.
+pub fn children_maxrss_kb() -> u64 {
     let mut ru: libc::rusage = unsafe { mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) };
-    let us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
-    Usage { cpu_us: us(ru.ru_utime) + us(ru.ru_stime), maxrss_kb: ru.ru_maxrss as u64 }
+    ru.ru_maxrss as u64
+}
+
+/// Tasks runnable on the box now, from `/proc/stat`.
+pub fn runnable() -> Result<u32> {
+    let stat = fs::read_to_string("/proc/stat").context("reading /proc/stat")?;
+    procs_running(&stat).context("no procs_running in /proc/stat")
+}
+
+fn procs_running(stat: &str) -> Option<u32> {
+    stat.lines().find_map(|l| l.strip_prefix("procs_running")?.trim().parse().ok())
 }
 
 #[cfg(test)]
@@ -289,10 +267,11 @@ mod test {
     }
 
     #[test]
-    fn stat_ticks_skip_the_command_name() {
-        let stat = "4242 (rustc (x) y) R 1 2 3 4 5 6 7 8 9 10 150 25 0 0 20 0 17";
-        assert_eq!(stat_ticks(stat), 175);
-        assert!(tree_cpu_us(std::process::id()) > 0);
+    fn runnable_tasks_come_from_proc_stat() -> Result<()> {
+        let stat = "cpu  1 2 3\nctxt 99\nprocs_running 7\nprocs_blocked 1\n";
+        assert_eq!(procs_running(stat), Some(7));
+        assert!(runnable()? >= 1, "this thread is running");
+        Ok(())
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::{
     protocol::{self, Ask, Job, PROTOCOL, Ran, Reads, Reply, Unit},
     remote::{self, Event, Moved, Outcome, ToServer},
     sandbox::{self, Server},
-    sched::{Admission, Msg, RemoteOutcome, RemoteSlot, Sched, Setup, Want},
+    sched::{Admission, Msg, RemoteOutcome, RemoteSlot, Sched, SentRun, Setup, Want},
     stats::Transfer,
     sys,
     toolchain::{self, Keys},
@@ -77,6 +77,7 @@ pub async fn run() -> Result<()> {
             let share = cfg.compressed_swap_share;
             Box::new(move || sys::box_memory(share))
         },
+        runnable: Box::new(sys::runnable),
         tokens_per_cpu: cfg.tokens_per_cpu,
         calibration_seconds: cfg.calibration_seconds,
     };
@@ -319,6 +320,9 @@ async fn compile(
             Admission::Restarting => {
                 return protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await;
             }
+            Admission::Refused(why) => {
+                return protocol::send_async(&mut sock, &mut buf, &Reply::Refused(why)).await;
+            }
             Admission::Slot(slot) => {
                 if let Some(pid) = sock.peer_cred().ok().and_then(|c| c.pid()) {
                     slot.started(pid as u32);
@@ -419,7 +423,7 @@ async fn run_remote(
     }
     drop(handle);
     match outcome {
-        Ok(Outcome::Exit { code: 0, ran, moved: Moved { bytes, linker_waited_us } }) => {
+        Ok(Outcome::Exit { code: 0, ran, measured, moved: Moved { bytes, linker_waited_us } }) => {
             for (stderr, data) in held {
                 protocol::send_async(sock, buf, &Reply::Output { stderr, data }).await?;
             }
@@ -435,7 +439,7 @@ async fn run_remote(
                 transfer.sent_kb,
                 linker_waited_us / 1000
             );
-            r.finish(RemoteOutcome::Done(ran, transfer));
+            r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer }));
             Ok(Remote::Done)
         }
         Ok(Outcome::Busy { version }) => {

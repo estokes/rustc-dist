@@ -1,6 +1,6 @@
 use crate::{
     blobs::{Hash, Hashes},
-    protocol::{self, Job, Ran, Reads, Unit},
+    protocol::{self, Job, Measured, Ran, Reads, Unit},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
@@ -76,9 +76,10 @@ pub enum FromServer {
     /// it names.
     Stderr(Bytes),
     Output { path: ArcStr, mode: u32, data: Bytes, last: bool },
-    /// `ran` is the server's measurement, whatever the code, and
-    /// `linker_waited_us` how long its linker waited for late rlibs.
-    Exit { code: i32, ran: Ran, linker_waited_us: u64 },
+    /// `ran` and `measured` are the server's measurements, whatever the
+    /// code, and `linker_waited_us` how long its linker waited for late
+    /// rlibs.
+    Exit { code: i32, ran: Ran, linker_waited_us: u64, measured: Measured },
     Failed(ArcStr),
 }
 
@@ -332,7 +333,15 @@ pub enum Event {
 
 pub enum Outcome {
     Busy { version: u64 },
-    Exit { code: i32, ran: Ran, moved: Moved },
+    Exit { code: i32, ran: Ran, measured: Measured, moved: Moved },
+}
+
+/// How rustc ended on the server.
+struct Exited {
+    code: i32,
+    ran: Ran,
+    linker_waited_us: u64,
+    measured: Measured,
 }
 
 /// What moving a job's files took that compiling didn't.
@@ -391,7 +400,7 @@ pub async fn run(
     });
     let mut receiving = pin!(receive(&con, &jobs, staged, hashes, &mut sink));
     let mut sending_done = false;
-    let (code, ran, linker_waited_us) = loop {
+    let Exited { code, ran, linker_waited_us, measured } = loop {
         tokio::select! {
             exit = &mut receiving => break exit.context("receiving outputs")?,
             r = &mut sending, if !sending_done => {
@@ -407,7 +416,8 @@ pub async fn run(
             }
         }
     };
-    Ok(Outcome::Exit { code, ran, moved: Moved { bytes: sent.load(Ordering::Relaxed), linker_waited_us } })
+    let moved = Moved { bytes: sent.load(Ordering::Relaxed), linker_waited_us };
+    Ok(Outcome::Exit { code, ran, measured, moved })
 }
 
 /// Send the blob `hash`, adding its size to `sent`.
@@ -444,15 +454,14 @@ async fn next(con: &Connection) -> Result<FromServer> {
     }
 }
 
-/// rustc's output until it exits: its code, the server's measurement and
-/// how long its linker waited.
+/// rustc's output until it exits.
 async fn receive(
     con: &Connection,
     jobs: &NPath,
     staged: &Staged,
     hashes: &Hashes,
     sink: &mut impl FnMut(Event) -> Result<()>,
-) -> Result<(i32, Ran, u64)> {
+) -> Result<Exited> {
     let mut writing: Option<Writing> = None;
     loop {
         match next(con).await? {
@@ -481,7 +490,9 @@ async fn receive(
                 sink(if artifact { Event::Artifact(line) } else { Event::Stderr(line) })?;
             }
             FromServer::Stdout(data) => sink(Event::Stdout(data))?,
-            FromServer::Exit { code, ran, linker_waited_us } => return Ok((code, ran, linker_waited_us)),
+            FromServer::Exit { code, ran, linker_waited_us, measured } => {
+                return Ok(Exited { code, ran, linker_waited_us, measured });
+            }
             FromServer::Failed(why) => bail!("{jobs}: {why}"),
             m => bail!("{jobs}: unexpected {m:?}"),
         }

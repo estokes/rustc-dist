@@ -1,6 +1,6 @@
 use crate::{
     argv::{self, Compile, Invocation},
-    client, config, perf,
+    client, config,
     protocol::{self, Ask, Front, Job, Ran, Reply},
     sys,
 };
@@ -56,7 +56,8 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             Reply::Output { stderr: true, data } => io::stderr().write_all(&data)?,
             Reply::Output { stderr: false, data } => io::stdout().write_all(&data)?,
             Reply::Exit(code) => process::exit(code),
-            Reply::Status(_) | Reply::Restarting | Reply::Done | Reply::Refused(_) => {
+            Reply::Refused(why) => bail!("the rustc-dist daemon can't run this compile: {why}"),
+            Reply::Status(_) | Reply::Restarting | Reply::Done => {
                 bail!("unexpected reply from the daemon")
             }
         }
@@ -121,7 +122,6 @@ fn compile(
             Ok(())
         });
     }
-    let counter = perf::Counter::start(true);
     let start = Instant::now();
     let mut child =
         cmd.spawn().with_context(|| format_compact!("running {}", Path::new(&args[0]).display()))?;
@@ -132,7 +132,7 @@ fn compile(
         let metadata = protocol::is_metadata_line(&line);
         if metadata && front.is_none() {
             let wall_us = start.elapsed().as_micros() as u64;
-            front = Some(Front { wall_us, cpu_us: sys::tree_cpu_us(child.id()) });
+            front = Some(Front { wall_us });
         }
         if !(metadata && filter_metadata) {
             out.write_all(&line)?;
@@ -142,9 +142,7 @@ fn compile(
     let status = child.wait()?;
     if status.success() {
         let wall_us = start.elapsed().as_micros() as u64;
-        let usage = sys::children_usage();
-        let instructions = counter.map(|c| c.read());
-        let ran = Ran { cpu_us: usage.cpu_us, wall_us, maxrss_kb: usage.maxrss_kb, instructions, front };
+        let ran = Ran { wall_us, maxrss_kb: sys::children_maxrss_kb(), front };
         // A daemon that restarted meanwhile just misses this sample.
         let _ = protocol::send(sock, buf, &ran);
     }
@@ -166,7 +164,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn a_compile_reports_its_instructions_and_front_end() -> Result<()> {
+    fn a_compile_reports_its_time_and_front_end() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("rustc-dist-wrapper-{}", process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir)?;
@@ -190,10 +188,7 @@ mod test {
         assert!(status.success());
         let ran: Ran = protocol::recv(&mut daemon, &mut buf)?;
         let front = ran.front.context("an .rmeta line")?;
-        assert!(front.wall_us < ran.wall_us && front.cpu_us > 0, "{ran:?}");
-        if perf::Counter::start(false).is_some() {
-            assert!(ran.instructions.is_some_and(|n| n > 100_000_000), "{ran:?}");
-        }
+        assert!(0 < front.wall_us && front.wall_us < ran.wall_us && ran.maxrss_kb > 0, "{ran:?}");
         let forwarded = |out: &[u8]| out.split(|b| *b == b'\n').any(protocol::is_metadata_line);
         assert!(forwarded(&out), "cargo gets the .rmeta line");
         // After a remote run already sent cargo one, it is dropped, but the

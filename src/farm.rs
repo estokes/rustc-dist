@@ -34,12 +34,12 @@ const LIST_EVERY: Duration = Duration::from_secs(1);
 /// The status columns a box's state is published in. A change updates the
 /// columns it touches in one batch, which subscribers get whole, so a box
 /// never sees half of another's state.
-pub const STATE: [&str; 8] =
-    ["protocol", "profile", "version", "toolchains", "cpus", "class GIPS", "free", "frees in ms"];
+pub const STATE: [&str; 9] =
+    ["protocol", "profile", "version", "toolchains", "load", "cpus", "class GIPS", "free", "frees in ms"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pack)]
 pub struct ClassState {
-    /// Instructions per CPU-µs.
+    /// Calibrated instructions per CPU-µs.
     pub rate: u64,
     pub cpus: u32,
     /// Jobserver tokens an offer to this class would find now: none while
@@ -60,17 +60,20 @@ pub struct BoxState {
     /// answer to an offer names the first version that reflects it.
     pub version: u64,
     pub toolchains: Vec<Toolchain>,
+    /// Runnable tasks per CPU, in hundredths.
+    pub load_c: u32,
     pub classes: Vec<ClassState>,
 }
 
 impl BoxState {
-    fn columns(&self) -> [Value; 8] {
+    fn columns(&self) -> [Value; 9] {
         let per_class = |f: fn(&ClassState) -> Value| Value::from(self.classes.iter().map(f).collect::<Vec<_>>());
         [
             self.protocol.into(),
             self.profile.clone().into(),
             self.version.into(),
             self.toolchains.iter().map(|t| (t.key.clone(), t.targets.clone())).collect::<Vec<_>>().into(),
+            (self.load_c as f64 / 100.).into(),
             per_class(|c| i64::from(c.cpus).into()),
             per_class(|c| (c.rate as f64 / 1000.).into()),
             per_class(|c| i64::from(c.free).into()),
@@ -79,13 +82,14 @@ impl BoxState {
     }
 
     fn from_columns(columns: &[Value]) -> Result<Self> {
-        let [protocol, profile, version, toolchains, cpus, rates, free, frees_in] = columns else {
+        let [protocol, profile, version, toolchains, load, cpus, rates, free, frees_in] = columns else {
             bail!("{} state columns", columns.len());
         };
         fn cast<T: FromValue>(v: &Value) -> Result<T> {
             v.clone().cast_to()
         }
         let toolchains: Vec<(ArcStr, Vec<ArcStr>)> = cast(toolchains)?;
+        let load: f64 = cast(load)?;
         let cpus: Vec<i64> = cast(cpus)?;
         let rates: Vec<f64> = cast(rates)?;
         let free: Vec<i64> = cast(free)?;
@@ -113,6 +117,7 @@ impl BoxState {
             profile: cast(profile)?,
             version: cast(version)?,
             toolchains: toolchains.into_iter().map(|(key, targets)| Toolchain { key, targets }).collect(),
+            load_c: (load * 100.).round().clamp(0., u32::MAX as f64) as u32,
             classes,
         })
     }
@@ -123,6 +128,8 @@ impl BoxState {
 pub struct Load {
     pub profile: ArcStr,
     pub version: u64,
+    /// Runnable tasks per CPU, in hundredths.
+    pub load_c: u32,
     pub classes: Vec<ClassState>,
 }
 
@@ -168,7 +175,7 @@ pub struct Member {
 /// Another box being watched: its state columns as they last arrived.
 struct Watched {
     _subs: Vec<Dval>,
-    columns: [Option<Value>; 8],
+    columns: [Option<Value>; STATE.len()],
 }
 
 impl Watched {
@@ -190,6 +197,7 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
         profile: load.profile.clone(),
         version: load.version,
         toolchains: m.toolchains.clone(),
+        load_c: load.load_c,
         classes: load.classes.clone(),
     };
     let row = status_path(&m.base, &m.name);
@@ -304,6 +312,7 @@ mod test {
             profile: "default".into(),
             version,
             toolchains: vec![Toolchain { key: "c h".into(), targets: vec!["h".into(), "wasm32".into()] }],
+            load_c: 37,
             classes: vec![
                 ClassState { rate: 6960, cpus: 30, free, frees_in_ms: None },
                 ClassState { rate: 3970, cpus: 2, free: 3, frees_in_ms: Some(0) },
@@ -326,7 +335,7 @@ mod test {
         let s = state(7, 0);
         assert_eq!(BoxState::from_columns(&s.columns()).unwrap(), s);
         let mut short = s.columns();
-        short[6] = Value::from(vec![1i64]);
+        short[7] = Value::from(vec![1i64]);
         assert!(BoxState::from_columns(&short).is_err());
     }
 
@@ -343,7 +352,7 @@ mod test {
         };
         let load = |version, free| {
             let s = state(version, free);
-            Load { profile: s.profile, version, classes: s.classes }
+            Load { profile: s.profile, version, load_c: s.load_c, classes: s.classes }
         };
         let (a_load, a_rx) = watch::channel(load(1, 0));
         let (a_tx, _a_msgs) = mpsc::unbounded_channel();

@@ -27,7 +27,7 @@ use bytes::BytesMut;
 use clap::{Args, Parser};
 use compact_str::{CompactString, format_compact};
 use classes::Profile;
-use protocol::{Ask, Reply, Switching, gib};
+use protocol::{Ask, Reply, Switching, gib, hundredths};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -150,13 +150,15 @@ fn status() -> Result<()> {
         )?,
         Switching::Calibrating(to) => writeln!(out, "profile {}, calibrating {to}", st.profile)?,
     }
-    writeln!(out, "\nclass  cpus  G instr/s  running  serving  lent  free")?;
+    writeln!(out, "load {:.2} runnable tasks per cpu", hundredths(st.load_c))?;
+    writeln!(out, "\nclass  cpus  G instr/s  factor  running  serving  lent  free")?;
     for (k, c) in st.classes.iter().enumerate() {
         writeln!(
             out,
-            "{k:5}  {:4}  {:9.2}  {:7}  {:7}  {:4}  {:4}",
+            "{k:5}  {:4}  {:9.2}  {:6.2}  {:7}  {:7}  {:4}  {:4}",
             c.cpus,
             c.rate_g(),
+            hundredths(c.factor_c),
             c.running,
             c.serving,
             c.lent,
@@ -165,8 +167,14 @@ fn status() -> Result<()> {
     }
     writeln!(
         out,
-        "on every cpu: {} running, {} serving; lent tokens are theirs",
-        st.spread.running, st.spread.serving
+        "on every cpu: factor {:.2}, {} running, {} serving; lent tokens are theirs",
+        hundredths(st.spread.factor_c),
+        st.spread.running,
+        st.spread.serving
+    )?;
+    writeln!(
+        out,
+        "G instr/s is calibrated; a job takes its calibrated time times the factor, learned at this load."
     )?;
     if st.finishing > 0 {
         writeln!(out, "{} jobs finishing under the previous profile", st.finishing)?;
@@ -183,12 +191,14 @@ fn status() -> Result<()> {
         let note = if b.compatible { "" } else { ", other version" };
         writeln!(
             out,
-            "box {}: profile {}, {} of {} cpus free, {:.0} G instr/s, {} from here{note}",
+            "box {}: profile {}, {} of {} cpus free, {:.0} G instr/s, load {:.2}, factor {:.2}, {} from here{note}",
             b.name,
             b.profile,
             b.free(),
             b.cpus(),
             b.capacity_g(),
+            hundredths(b.load_c),
+            hundredths(b.factor_c),
             b.sent
         )?;
     }
@@ -197,10 +207,11 @@ fn status() -> Result<()> {
     }
     writeln!(
         out,
-        "\n{} units run, by work waiting on them ({} in the build graph). Work is in G instructions; \
-         front is the single-threaded share, width the threads busy after it. Runs: here and sent \
-         for this box's builds, served for other boxes'. Copy is the time a sent run spent on its \
-         files rather than compiling, and MB what it sent (medians).",
+        "\n{} units run, by work waiting on them ({} in the build graph). Work is in G instructions \
+         of the calibration load, from how long the unit took where it ran; front is the \
+         single-threaded share, width the jobserver tokens held after it. Runs: here and sent for \
+         this box's builds, served for other boxes'. Copy is the time a sent run spent on its files \
+         rather than compiling, and MB what it sent (medians).",
         st.units.len(),
         st.graph_nodes
     )?;

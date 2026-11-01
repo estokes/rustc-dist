@@ -35,15 +35,18 @@ On one box:
 
 - **Core classes.** It calibrates the box's cores (performance, efficiency
   and low-power cores on hybrid CPUs) separately for each power profile, and
-  gives each class of cores its own jobserver. SMT siblings join their
-  core's class.
-- **The critical path goes first.** It learns each unit's cost in
-  instructions and records the build graph, so it knows how much work waits
-  on each job. The jobs most work waits on get the fast cores. Jobs with time
+  shares each class's jobserver tokens out to the jobs on it. SMT siblings
+  join their core's class.
+- **It learns from wall time.** Each unit's size comes from how long it took
+  where it ran, and each class and box learns how much slower than its
+  calibration it runs, at each load, from units that ran in more than one
+  place.
+- **The critical path goes first.** It records the build graph, so it knows
+  how much work waits on each job. The jobs most work waits on get the fast cores. Jobs with time
   to spare go to slow cores, but never wait for one while a faster core sits
   idle.
-- **Heavy jobs spread.** A job that keeps several codegen threads busy runs on
-  every core, borrowing jobserver tokens from the classes.
+- **Heavy jobs spread.** A job that holds several jobserver tokens runs on
+  every core, borrowing them from the classes.
 - **Memory.** Jobs are admitted by predicted peak memory, counting a share of
   compressed swap (zram or zswap).
 - **It learns.** Each class's speed is corrected by the jobs that actually run
@@ -81,7 +84,8 @@ Across boxes (a farm):
   names (`cc` by default, or for example `clang` with `mold`), and any system
   libraries your `-sys` crates link against.
 - Optional: hardware instruction counters (`perf_event_paranoid` of 2 or
-  lower). Without them, costs are estimated from CPU time.
+  lower), which calibration uses to compare cores. Without them, each
+  calibration run is taken to retire a fixed count.
 
 ## Install
 

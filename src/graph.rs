@@ -186,7 +186,8 @@ impl Graph {
     }
 
     /// The predicted cost of `id` plus the costliest chain of jobs that
-    /// depend on it: the work that waits on this job, in milli-cu.
+    /// depend on it: the work that waits on this job, in millions of
+    /// instructions.
     pub fn rank(&mut self, id: &ArcStr, stats: &Stats) -> u64 {
         if let Some(r) = self.ranks.get(id) {
             return *r;
@@ -194,7 +195,7 @@ impl Graph {
         // Marks `id` as in progress, so a cycle in stale data ends here.
         self.ranks.insert(id.clone(), 0);
         let own = match self.nodes.get(id) {
-            Some(n) => stats.predict(&n.exact, &n.coarse).cost_mi,
+            Some(n) => stats.predict(&n.exact, &n.coarse).cost_mi(),
             None => 0,
         };
         let mut dependents: LPooled<Vec<ArcStr>> = LPooled::take();
@@ -304,7 +305,6 @@ impl Graph {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::stats::{Origin, Sample};
 
     /// A unit in the target directory `/t`.
     fn unit(id: &str, deps: &[&str]) -> Unit {
@@ -331,9 +331,7 @@ mod test {
     fn stats(costs: &[(&str, u64)]) -> Stats {
         let mut s = Stats::new();
         for &(id, cost_mi) in costs {
-            let origin = Origin::Here;
-            let sample = Sample { cost_mi, front_mi: None, width_c: 100, wall_ms: 1, mem_kb: 1, origin };
-            s.record(&unit(id, &[]), sample);
+            s.seed(&unit(id, &[]), 0, cost_mi, 100, 1);
         }
         s
     }

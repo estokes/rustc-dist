@@ -28,19 +28,17 @@ const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
 /// Where a hybrid CPU's core type goes in a hardware event's config.
 const PMU_SHIFT: u32 = 32;
 const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 8;
-const INHERIT: u64 = 1 << 1;
 const EXCLUDE_KERNEL: u64 = 1 << 5;
 const EXCLUDE_HV: u64 = 1 << 6;
 
 /// Counts the user-space instructions the calling thread retires on every
-/// kind of core. With `inherit` it also counts the threads and processes
-/// the thread starts afterwards, which add theirs as they exit.
+/// kind of core.
 pub struct Counter(Vec<OwnedFd>);
 
 impl Counter {
     /// None if the kernel won't count instructions here.
-    pub fn start(inherit: bool) -> Option<Self> {
-        let flags = EXCLUDE_KERNEL | EXCLUDE_HV | if inherit { INHERIT } else { 0 };
+    pub fn start() -> Option<Self> {
+        let flags = EXCLUDE_KERNEL | EXCLUDE_HV;
         let fds = pmus()
             .into_iter()
             .map(|pmu| {
@@ -92,21 +90,20 @@ fn pmus() -> Vec<u64> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::{hint::black_box, process::Command, thread};
+    use std::{hint::black_box, thread};
 
     #[test]
-    fn counts_threads_and_children_it_starts() {
-        let Some(c) = Counter::start(true) else {
+    fn counts_the_calling_thread_only() {
+        let Some(c) = Counter::start() else {
             eprintln!("instruction counters are not available here");
             return;
         };
         let spin = |n: u64| (0..n).fold(0u64, |a, i| black_box(a.wrapping_mul(31).wrapping_add(i)));
         let base = c.read();
+        black_box(spin(50_000_000));
+        let spun = c.read();
+        assert!(spun - base > 50_000_000, "{}", spun - base);
         black_box(thread::spawn(move || spin(50_000_000)).join().unwrap());
-        let with_thread = c.read();
-        assert!(with_thread - base > 50_000_000, "{}", with_thread - base);
-        Command::new("rustc").arg("--version").output().unwrap();
-        let with_child = c.read();
-        assert!(with_child - with_thread > 1_000_000, "{}", with_child - with_thread);
+        assert!(c.read() - spun < 10_000_000, "another thread's work counted");
     }
 }

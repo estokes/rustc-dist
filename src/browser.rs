@@ -177,11 +177,12 @@ mod test {
         Status {
             profile: "default".into(),
             switching: Switching::No,
+            load_c: 75,
             classes: vec![
-                ClassStatus { rate: 5512, cpus: 4, running: 1, serving: 0, lent: 0, free: 5 },
-                ClassStatus { rate: 2000, cpus: 8, running: 0, serving: 2, lent: 1, free: 9 },
+                ClassStatus { rate: 5512, factor_c: 100, cpus: 4, running: 1, serving: 0, lent: 0, free: 5 },
+                ClassStatus { rate: 2000, factor_c: 130, cpus: 8, running: 0, serving: 2, lent: 1, free: 9 },
             ],
-            spread: SpreadStatus { running: 1, serving: 0 },
+            spread: SpreadStatus { running: 1, serving: 0, factor_c: 110 },
             finishing: 0,
             waiting: 7,
             mem_capacity_kb: 1 << 20,

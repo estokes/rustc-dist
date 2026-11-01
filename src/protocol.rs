@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 10;
+pub const PROTOCOL: u32 = 11;
 const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under
@@ -114,11 +114,8 @@ pub enum Reply {
 /// sends nothing, so its time is not recorded.
 #[derive(Debug, Clone, Copy, Pack)]
 pub struct Ran {
-    pub cpu_us: u64,
     pub wall_us: u64,
     pub maxrss_kb: u64,
-    /// User-space instructions retired, where the box can count them.
-    pub instructions: Option<u64>,
     /// When rustc printed its `.rmeta` line, if it did.
     pub front: Option<Front>,
 }
@@ -128,7 +125,15 @@ pub struct Ran {
 #[derive(Debug, Clone, Copy, Pack)]
 pub struct Front {
     pub wall_us: u64,
-    pub cpu_us: u64,
+}
+
+/// What the scheduler of the box a job ran on measured while it ran.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Pack)]
+pub struct Measured {
+    /// The jobserver tokens it held, times µs.
+    pub tokens_us: u64,
+    /// Runnable tasks per CPU on that box, in hundredths, on average.
+    pub load_c: u32,
 }
 
 fn contains(line: &[u8], pat: &[u8]) -> bool {
@@ -149,6 +154,8 @@ pub fn is_metadata_line(line: &[u8]) -> bool {
 pub struct Status {
     pub profile: ArcStr,
     pub switching: Switching,
+    /// Runnable tasks per CPU, in hundredths.
+    pub load_c: u32,
     /// Light jobs, pinned to one class each.
     pub classes: Vec<ClassStatus>,
     pub spread: SpreadStatus,
@@ -172,6 +179,11 @@ pub struct BoxStatus {
     pub name: ArcStr,
     pub profile: ArcStr,
     pub classes: Vec<ClassState>,
+    /// Runnable tasks per CPU there, in hundredths, as it last published.
+    pub load_c: u32,
+    /// What its calibrated time is multiplied by for a heavy job now, in
+    /// hundredths, as this box has learned from jobs it sent there.
+    pub factor_c: u32,
     /// Jobs this box has running there.
     pub sent: u32,
     /// It speaks this protocol version.
@@ -190,8 +202,11 @@ pub enum Switching {
 
 #[derive(Debug, Pack)]
 pub struct ClassStatus {
-    /// Instructions per CPU-µs.
+    /// Calibrated instructions per CPU-µs.
     pub rate: u64,
+    /// What its calibrated time is multiplied by for a light job now, in
+    /// hundredths.
+    pub factor_c: u32,
     pub cpus: u32,
     /// Jobs of this box's builds.
     pub running: u32,
@@ -208,6 +223,9 @@ pub struct ClassStatus {
 pub struct SpreadStatus {
     pub running: u32,
     pub serving: u32,
+    /// What the calibrated time of a heavy job here is multiplied by now,
+    /// in hundredths.
+    pub factor_c: u32,
 }
 
 #[derive(Debug, Pack)]
@@ -218,10 +236,10 @@ pub struct UnitStatus {
     pub sent: u64,
     /// Runs here for other boxes' builds.
     pub served: u64,
-    /// Millions of instructions.
+    /// Millions of the calibration load's instructions.
     pub cost_mi: u64,
     pub front_mi: Option<u64>,
-    /// Hundredths of the threads busy after the front end.
+    /// Hundredths of the jobserver tokens held after the front end.
     pub width_c: u64,
     pub wall_ms: u64,
     pub mem_kb: u64,
@@ -282,6 +300,11 @@ impl ClassStatus {
     pub fn rate_g(&self) -> f64 {
         g(self.rate)
     }
+}
+
+/// Hundredths as a number.
+pub fn hundredths(c: u32) -> f64 {
+    c as f64 / 100.
 }
 
 impl BoxStatus {

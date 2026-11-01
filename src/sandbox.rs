@@ -1,7 +1,6 @@
 use crate::{
     blobs::{self, Hash, Store, Upload},
     link::{self, Gate},
-    perf,
     protocol::{self, Front, Ran},
     remote::{CHUNK, FileEntry, FromServer, Late, Rlib, SYSTEM, ToServer},
     sched::{Answer, Msg, Slot},
@@ -360,8 +359,7 @@ enum Ev {
     Stderr(Bytes),
     Stdout(Bytes),
     Eof,
-    /// With the instructions it retired, where they can be counted.
-    Exit(ExitStatus, libc::rusage, Option<u64>),
+    Exit(ExitStatus, libc::rusage),
 }
 
 /// Kills the sandbox if the job is abandoned. A pidfd can't hit a reused
@@ -402,11 +400,10 @@ async fn run(
     let start = Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (spawned_tx, spawned) = oneshot::channel();
-    // A thread of its own starts the sandbox and waits for it, so the
-    // instruction counter it opens counts nothing else.
+    // A thread of its own starts the sandbox and waits for it, for its
+    // resource use.
     let xtx = tx.clone();
     thread::spawn(move || {
-        let counter = perf::Counter::start(true);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -422,7 +419,7 @@ async fn run(
         let mut status = 0;
         let mut ru: libc::rusage = unsafe { mem::zeroed() };
         if unsafe { libc::wait4(pid, &mut status, 0, &mut ru) } == pid {
-            let _ = xtx.send(Ev::Exit(ExitStatus::from_raw(status), ru, counter.map(|c| c.read())));
+            let _ = xtx.send(Ev::Exit(ExitStatus::from_raw(status), ru));
         }
     });
     let (pid, (stdout, stderr)) = spawned.await?.context("starting bwrap")?;
@@ -461,7 +458,7 @@ async fn run(
                     if protocol::is_artifact_line(&line) {
                         if front.is_none() && protocol::is_metadata_line(&line) {
                             let wall_us = start.elapsed().as_micros() as u64;
-                            front = Some(Front { wall_us, cpu_us: sys::tree_cpu_us(pid as u32) });
+                            front = Some(Front { wall_us });
                         }
                         send_artifact(con, store, root, &line).await?;
                     }
@@ -469,7 +466,7 @@ async fn run(
                 }
                 Ev::Stdout(data) => con.send_one(&FromServer::Stdout(data)).await?,
                 Ev::Eof => eofs += 1,
-                Ev::Exit(status, ru, instructions) => exit = Some((status, ru, instructions)),
+                Ev::Exit(status, ru) => exit = Some((status, ru)),
             },
             arrived = &mut arrive, if arriving => {
                 arrived.context("guarded")??;
@@ -483,19 +480,12 @@ async fn run(
         }
     }
     kill.0 = None;
-    let (status, ru, instructions) = exit.expect("loop ends with an exit");
-    let us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
-    let ran = Ran {
-        cpu_us: us(ru.ru_utime) + us(ru.ru_stime),
-        wall_us: start.elapsed().as_micros() as u64,
-        maxrss_kb: ru.ru_maxrss as u64,
-        instructions,
-        front,
-    };
+    let (status, ru) = exit.expect("loop ends with an exit");
+    let ran = Ran { wall_us: start.elapsed().as_micros() as u64, maxrss_kb: ru.ru_maxrss as u64, front };
     let code = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     debug!("sandbox exited {code}");
     let linker_waited_us = gate.map_or(0, |g| g.waited_us());
-    con.send_one(&FromServer::Exit { code, ran, linker_waited_us }).await?;
+    con.send_one(&FromServer::Exit { code, ran, linker_waited_us, measured: slot.measured() }).await?;
     Ok((code == 0).then_some(ran))
 }
 

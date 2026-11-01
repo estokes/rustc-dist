@@ -6,7 +6,6 @@ use crate::{
     blobs::{Hashes, Store},
     classes::{self, Class, Profile},
     farm::Load,
-    perf,
     protocol::{Job, Reads, Unit},
     remote::{self, CHUNK, Event, FromServer, Moved, Outcome, ToServer},
     sandbox::{self, Server},
@@ -54,6 +53,7 @@ async fn server(dir: &Path) -> Result<ServerBox> {
         fifo_dir: dir.to_path_buf(),
         allowed,
         memory: Box::new(|| sys::box_memory(0.5)),
+        runnable: Box::new(sys::runnable),
         tokens_per_cpu: 1.5,
         calibration_seconds: 4,
     };
@@ -355,15 +355,13 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     let lib_crates: Vec<ArcStr> = unit.deps.iter().filter_map(|d| d.file.clone()).collect();
     let hashes = Hashes::default();
     let (outcome, events) = send(&b, &lib, &lib_crates, &hashes, None).await?;
-    let Outcome::Exit { code: 0, ran, .. } = outcome else { bail!("remote rustc failed") };
-    // rustc's own time; bwrap alone uses about 10 ms.
-    assert!(ran.cpu_us > 200_000, "remote cpu {} us", ran.cpu_us);
+    let Outcome::Exit { code: 0, ran, measured, .. } = outcome else { bail!("remote rustc failed") };
     let front = ran.front.context("app prints an .rmeta line")?;
-    assert!(front.wall_us < ran.wall_us && front.cpu_us <= ran.cpu_us + 10_000, "{ran:?}");
-    if perf::Counter::start(false).is_some() {
-        // A few hundred ms of rustc retire billions of instructions.
-        assert!(ran.instructions.is_some_and(|n| n > 500_000_000), "{ran:?}");
-    }
+    assert!(0 < front.wall_us && front.wall_us < ran.wall_us, "{ran:?}");
+    // It held its one token at least from when rustc started to its exit,
+    // and the server counted no time before.
+    let tokens = measured.tokens_us as f64 / ran.wall_us as f64;
+    assert!((0.8..16.).contains(&tokens), "{measured:?} over {ran:?}");
     let lines = artifacts(&events);
     assert_eq!(lines.len(), 3, "dep-info, metadata and link: {lines:?}");
     let deps = dir.join("ws/target/deps");

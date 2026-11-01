@@ -42,9 +42,9 @@ Wrapper to daemon: `Job { argv, env, cwd, cargo_cwd }`, where `cargo_cwd` is
 Daemon to wrapper, either:
 
 - `Run { cpus, jobserver, filter_metadata }`: the wrapper sets its CPU
-  affinity, points `CARGO_MAKEFLAGS` at the box jobserver, forks and execs
-  rustc, collects `wait4` rusage, sends `Ran { exit, cpu, wall, maxrss }`, and
-  exits with rustc's code; or
+  affinity, points `CARGO_MAKEFLAGS` at the job's jobserver, forks and execs
+  rustc, sends `Ran { wall, maxrss, front }` (`front` when rustc printed its
+  `.rmeta` line), and exits with rustc's code; or
 - a remote result: `Artifact`/`Stderr`/`Stdout` lines, then `Exit(code)`. If
   the remote job fails, the daemon sends `Run` instead and the job reruns
   locally.
@@ -73,31 +73,37 @@ below) and overridable in config. On this laptop sysfs suggests three:
 | E     | 8    | 3.7 GHz     |
 | LP-E  | 4    | 3.3 GHz     |
 
-A job is light if it has been measured to keep fewer than 1.5 threads busy
-after its front end; every other job, including one never measured, is
-heavy. A light job runs pinned to one class's CPU set (the whole set, not one
+A job is light if it has been measured to hold fewer than 1.5 jobserver
+tokens on average after its front end; every other job, including one never
+measured, is heavy. A light job runs pinned to one class's CPU set (the whole set, not one
 CPU). A heavy job runs on every CPU of the box.
 
 ### Jobserver
 
-Each class has a FIFO jobserver (`--jobserver-auth=fifo:PATH`) holding 1.5
-tokens per CPU (`tokens_per_cpu`). Mild overcommit keeps CPUs busy while jobs
-wait on I/O; around 4x would be lost to context switching. Admitting a light
-job takes a token from its class, its codegen threads take more from the same
-FIFO, and the token returns when the job exits.
+Each class has 1.5 tokens per CPU (`tokens_per_cpu`), a count the daemon
+keeps. Mild overcommit keeps CPUs busy while jobs wait on I/O; around 4x would
+be lost to context switching.
 
-A heavy job gets a FIFO of its own, which the daemon lends tokens into from
-the class FIFOs, fastest class first. Admitting it takes one token, which it
-holds without reading, and lends one spare. Rustc reads a token when it wants
-another thread, which the daemon can't see, so the spare is how a job asks.
-Every 100 ms the daemon checks each heavy job's FIFO: if the spare is gone it
-lends twice what the job holds, up to its codegen units; spares left unused for
-a whole tick go back, all but one. When the job ends, every token it borrowed
-goes back to the class it came from, so a killed rustc can't leak them. Light
-and heavy jobs together never hold more than the classes' tokens.
+Every job gets a FIFO jobserver of its own (`--jobserver-auth=fifo:PATH`),
+which the daemon lends tokens into: from its class for a light job, from every
+class, fastest first, for a heavy one. Admitting a job takes one token, which
+it holds without reading. Rustc reads a token when it wants another thread,
+which the daemon can't see, so a spare in its jobserver is how it asks. The
+spare is lent on credit: no class's token backs it until rustc takes it, so a
+job that never asks, as most light jobs don't, ties up only the token it
+holds. Every 100 ms the daemon checks each job's FIFO. A spare taken is
+backed by a class token, or, if every class is out, owed until one frees or the
+job gives a token back. A job that took every token offered is lent twice what
+it holds, up to its codegen units. Spares left unused for a whole tick go
+back, all but one, which stays on credit. A job with no spare is offered one
+on credit when its classes have a free token. When the job ends, every token
+it borrowed goes back to the class it came from, so a killed rustc can't leak
+them. Jobs never hold more than the classes' tokens, but for spares taken
+before a class had a token to back them.
 
-A class whose last light job ends is refilled, to recover tokens a killed
-rustc leaked, but only with the tokens heavy jobs don't hold.
+The daemon counts the tokens each job holds, the one it started with
+included, at every tick, from when its rustc starts. That is how wide a job
+is (see Cost).
 
 Cargo's own jobserver is never handed to rustc. Cargo's `jobs` setting only
 caps how many wrappers wait. Set it at or above the farm's slot count.
@@ -180,8 +186,8 @@ class at its rate. Two threads sharing a core run slower than one alone, and
 the more cache a load wants the slower: on aieka (i9-10980XE) the load ran at
 2.29 G instructions/s per core with one thread each and 0.56 per thread with
 two, a box's total halved. That loss depends on the load, so calibration
-leaves it, like rustc's IPC differing from the load's, to the rates classes
-learn from real jobs. The whole box is under load, so the numbers are
+leaves it, like rustc's IPC differing from the load's, to the factors places
+learn from real jobs (see Cost). The whole box is under load, so the numbers are
 sustained speed with shared caches and memory bandwidth under contention,
 not single-core turbo.
 The load repeats for about a minute so laptops drop out of their short boost
@@ -202,58 +208,82 @@ instructions, what a release build's run retires.
 classes go in `~/.local/state/rustc-dist/profiles/NAME.toml`, and boxes publish
 each class's rate, CPUs and free tokens.
 
-The calibrated rate is only a starting point. Every job that runs pinned to a
-class adds its instructions and CPU time to the class's rate, which weighs the
-calibration as 10 CPU-seconds of jobs and halves the weight of older jobs every
-60 CPU-seconds. Class speeds so come to reflect rustc rather than chunkmap,
-which replaces the acceptance check once planned here (comparing chunkmap's
-class ratios against a real compile's). What each class has learned is saved
-per profile in `~/.local/state/rustc-dist/rates/NAME.toml`, with the job stats
-every minute and on shutdown, and when the profile changes, so a restarted
-daemon carries on from it. Each entry names its class's CPUs and calibrated
-rate; a new calibration, or a class edited by hand, starts from calibration
-again.
+The calibrated rate is only a starting point: each class's place in the cost
+table learns a factor on its calibrated time from the jobs that run there (see
+Cost). That replaces the acceptance check once planned here (comparing
+chunkmap's class ratios against a real compile's).
 
 ## Cost
 
 Agentic work compiles the same units over and over: `graphix_types` hundreds
-of times a day. Each unit's past runs predict its next one.
+of times a day. Each unit's past runs predict its next one. See Stage 5 below
+for why the table works in wall time.
 
-The unit of cost is an instruction: the user-space instructions retired by
-rustc and every thread and process under it, counted by the CPU (both core
-types on a hybrid CPU). The same job retires about the same count whichever
-box, class, profile or load ran it, so every run of a unit counts toward one
-record. A box that can't count instructions estimates them from CPU time at
-its class's rate. A predicted time is cost over rate.
+A place is a class of a box, where light jobs run, or all of a box's CPUs,
+where heavy jobs run: this box's (`here/PROFILE/K`, `here/PROFILE/all`) or
+another's (`NAME/PROFILE/...`). Each has its calibrated rates: its class's,
+or for all CPUs the fastest class's, where a front end runs, and the mean per
+CPU. A place's factor scales calibrated time to time there. It is a curve over
+load: one value per bucket at 0, ¼, ½, ¾, 1, 1½, 2, 3, 4, 6 and 8 runnable
+tasks per CPU, interpolated between them and growing with load past the last.
 
-The job table is per daemon, persisted under `$XDG_STATE_HOME`. Its key is
-crate name plus the `-C metadata` hash, cargo's identity for a unit (package,
-version, features, profile, target). The hash doesn't change when sources are
-edited. Each entry holds:
+A box's load is its runnable tasks per CPU (`procs_running` in `/proc/stat`),
+sampled every 250 ms, so test binaries and other work the daemon doesn't run
+count. A run's load is the mean of the samples while it ran. Boxes publish
+their load.
 
-- hdrhistograms (2 significant figures) of cost in millions of instructions,
-  of the front end's instructions, of width, of wall time and of peak memory;
-- runs counted by where they ran and for whom.
+A unit's size is the work it takes, in millions of the calibration load's
+instructions: its front end, the compile up to rustc's `.rmeta` line, which
+runs on one thread, and the rest, in thread-work. A run that took `t` at a
+place under load `l` says its front end was its front-end time times the
+place's fast rate, and the rest its token-µs after the front end times the
+place's rate per CPU, both over the place's factor at `l`. Width is the
+tokens it held on average after its front end. Predicted time at a place is
+its front end at the fast rate plus the rest at the rate per CPU over the
+threads it can get, min(width, the place's CPUs for a heavy job), times the
+place's factor at the load there now plus the threads the job adds.
 
-The front end is the compile up to rustc's `.rmeta` line, which runs on one
-thread. Its instructions are the job's instructions times its share of CPU
-time, read from `/proc` when the line appears, since a thread's instruction
-count only reaches the job's total when the thread exits. Width is the CPU
-time after the front end over the wall time after it: how many threads codegen
-kept busy. A job with no `.rmeta` line (a binary) records its width over the
-whole run.
+What a run teaches:
 
-Only successful compiles are recorded. Once a unit has 256 runs its counts are
-halved, so the prediction follows the crate as it grows.
+- The unit: its record holds decayed sums per place and load bucket, so its
+  size uses each place's current factor.
+- Its place's factor at its load, if the unit also ran elsewhere or under
+  another load: its time against what its size from those other runs
+  predicts at the place's calibrated speed, weighing `n/(n+1)` for `n` other
+  runs. A unit seen at one place and load only says nothing about that place
+  against the others. Long runs weigh the most, since the factor is total time
+  over total calibrated time.
 
-The predicted cost is the unit's median, which an occasional run on a
-throttled box doesn't move. Admission uses the unit's p90 maxrss. A unit with
-no history falls back to crate name plus opt-level plus emit kinds, then to the
-median of all jobs.
+Weights halve every day of wall-clock time. Each bucket starts from the
+calibrated speed, flat up to one task per CPU and then slower in proportion as
+CPUs time-share, at the level the place has learned over all its buckets, so a
+bucket nothing has reached follows the ones that have. That start counts as
+30 s of runs in each bucket and never decays: a place with no recent
+comparisons drifts back to its calibration. A place whose calibration changes
+starts over. Only ratios between factors are fixed by data, since every unit
+could be bigger and every place faster; the calibration's weight anchors the
+scale.
 
-A global hdrhistogram, the sum of every unit's cost histogram, gives the
-median cost used for a unit with no history. It is rebuilt from the units
-whenever the table is saved (every minute), so halving keeps it recent too.
+A sent run's time is everything the client waits for, from offering the job to
+its last output. Its part other than compiling (staging and sending inputs,
+the linker waiting for late rlibs, receiving outputs) is its own term,
+predicted from the unit's recent sends to that place, else every unit's, else
+200 ms, and added in full. The server reports the token-µs and load it
+measured, counted from when rustc started, so time waiting for inputs isn't
+counted as the job's.
+
+The table is per daemon, persisted under `$XDG_STATE_HOME` (`jobs.hdr`). Its
+key is crate name plus the `-C metadata` hash, cargo's identity for a unit
+(package, version, features, profile, target). The hash doesn't change when
+sources are edited. A unit with no history falls back to crate name plus
+opt-level plus emit kinds, then to the median size of all units. Each entry
+also holds hdrhistograms (2 significant figures) of wall time, peak memory,
+and sent runs' copy time and bytes, halved at 256 runs, and runs counted by
+where they ran and for whom. Admission uses the unit's p90 peak. Only
+successful compiles are recorded. A cell unrun for about 60 days, as long as
+the build graph keeps a node, is dropped. A table from before runs were timed
+loads as seed history: each unit's median instruction count, front end and
+width become one run at a place with factor 1.
 
 ## Build graph
 
@@ -312,7 +342,7 @@ jobs with time to spare on slow cores.
    can finish without delaying the build.
 4. For each class the daemon predicts when the job would finish there: when a
    slot frees (now, or the earliest predicted end of a job running in that
-   class) plus the job's cost over the class's rate. The job takes the
+   class) plus its predicted time there (see Cost). The job takes the
    slowest class on which it finishes within its slack of the earliest
    finish, choosing among classes with a free slot if any of them will do.
    It never waits for a slow class while a faster one sits idle: a short job
@@ -332,13 +362,14 @@ jobs with time to spare on slow cores.
 
 A job that may go remote considers other boxes if it has no history (neither
 the unit nor its crate has run before), if it is predicted to take at least
-1 s on the fastest local class, or if it would wait here: no local class has a
-free slot left, or its predicted memory doesn't fit. A job with history chooses among local classes
-as above, and goes to another box instead if it would finish there sooner,
-counting 200 ms for the trip. A job with no history has nothing to predict
+1 s on one thread of the fastest local class, or if it would wait here: no
+local class has a free slot left, or its predicted memory doesn't fit. A job
+with history chooses among local classes as above, and goes to another box
+instead if it would finish there sooner, counting the time its sends there
+spend moving files (see Cost). A job with no history has nothing to predict
 with, so it takes free capacity: the fastest local class with a token, else the
 fastest other box with one free, else it waits for the local class expected to
-free first. Light jobs with history stay home.
+free first.
 
 A job is local-only if:
 
@@ -377,22 +408,23 @@ netidx namespace:
   holds up no other.
 - `BASE/units/NAME/UNIT/COLUMN`: the units the box has run (see below).
 
-A box's state is eight columns of its status row, each its own value:
-`protocol`, `profile`, `version` (a counter), `toolchains`, and per class (as
-arrays) `cpus`, `class GIPS` (G instructions/s), `free` tokens, and `frees in
-ms`, until its next token is predicted to free. A change updates the columns it touches in
+A box's state is nine columns of its status row, each its own value:
+`protocol`, `profile`, `version` (a counter), `toolchains`, `load` (runnable
+tasks per CPU), and per class (as arrays) `cpus`, `class GIPS` (calibrated G
+instructions/s), `free` tokens, and `frees in ms`, until its next token is
+predicted to free. A change updates the columns it touches in
 one batch, which subscribers get whole and in order, so no box sees half a
-state, and unchanged columns aren't sent. Free tokens
-are counted in the class's jobserver FIFO with `FIONREAD`, which doesn't take
-them, so they leave out the tokens rustc's codegen threads hold. The
-prediction is the soonest predicted end of a job holding one of the class's
-tokens, this box's or another's: 0 with a token free, unknown while the box
-takes no offers. It changing alone doesn't republish; it goes out with the
-next change, and clients count it down from when the state arrived. A box
-publishes no free tokens while it switches profile or its own jobs wait. The
-scheduler counts after every event, and every 100 ms while jobs run, since
-codegen threads take and return tokens without telling it. A changed load is
-republished at most every 100 ms. The daemon lists `BASE/status` for other
+state, and unchanged columns aren't sent. Free tokens are the class's tokens
+no job holds, so they leave out the tokens lent to rustc's codegen threads.
+The prediction is the soonest predicted end of a job holding one of the
+class's tokens, this box's or another's: 0 with a token free, unknown while
+the box takes no offers. It changing alone doesn't republish; it goes out with
+the next change, and clients count it down from when the state arrived. The
+load changing republishes only once it has moved a quarter of a task per CPU.
+A box publishes no free tokens while it switches profile or its own jobs wait.
+The scheduler publishes after every event, which includes the 100 ms ticks
+that lend tokens while jobs run. A changed state is republished at most every
+100 ms. The daemon lists `BASE/status` for other
 boxes and subscribes to each one's state columns.
 
 Toolchains are rustup's (`~/.rustup/toolchains/*`). A compiler is matched by
@@ -404,8 +436,8 @@ A server admits a remote job only into a free token of the class asked for,
 or for a heavy job the fastest class with one, and only when none of its own
 jobs is waiting, so local work comes first. It
 answers busy otherwise. An admitted job holds a normal slot: it shares the
-class's jobserver and CPUs with local jobs, and its cost goes into the
-server's history too.
+class's tokens and CPUs with local jobs, and its runs go into the server's
+history too.
 
 Each answer, accepted or busy, names the version of the server's state that
 first reflects it, and the server publishes that version right after. A
@@ -564,7 +596,7 @@ Config is real TOML (`toml` + serde), parsed into two separate structs.
   boxes reach this one, in netidx's syntax, since netidx's default is often
   loopback only), `cache_dir`, `cache_gb` and `remote_links` (on by default).
   Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit
-  those to override them. Their learned rates live in `rates/` beside it. The netidx config is netidx's own (`NETIDX_CFG` or
+  those to override them. The netidx config is netidx's own (`NETIDX_CFG` or
   its default paths).
 - Project, `rustc-dist.toml` at or above cargo's cwd (`/proc/$PPID/cwd`, which
   is where cargo looks for its own config): `local = [...]`. Starting from
@@ -673,10 +705,9 @@ libraries and linker, kept so by the sysadmin.
   finishes there soonest (built 2026-10-31). It is offered once the box shows
   a free token; until then no other job from here takes that box's tokens,
   since none show free.
-- Still to do: count each job's predicted transfer time rather than a flat
-  200 ms (see Stage 5).
+- Each job's predicted transfer time replaced the flat 200 ms in Stage 5.
 
-### Stage 5: predict wall time (planned 2026-11-01)
+### Stage 5: predict wall time (built 2026-11-01)
 
 The scheduler predicts when a job would finish at each place it could run, but
 every number it predicts from comes from CPU time: a class's rate is
@@ -702,66 +733,40 @@ CPU time isn't time.
 So measure what is predicted: how long each job took where it ran, as the
 client saw it.
 
-A place is a class of a box, where a light job runs, or all of a box's CPUs,
-where a heavy job runs; this box's or another's. A unit's size is how long it
-takes at a reference speed (this box's fastest class, idle): its front end in
-seconds, and the rest in thread-seconds. A place's factor, a curve over the
-load there, scales size to time. A light job's predicted time at a class is
-its size times the class's factor at the load there. A heavy job's is its front
-end times the box's fastest class's factor, plus the rest times the heavy
-place's factor over the threads it can get, min(its width, the box's CPUs).
+Cost, Jobserver and the farm's state above describe what was built. The
+plan's main points, and where the build went past it:
 
-Load is measured, not counted, since test binaries and fuzzers bypass the
-daemon: at 06:59 the laptop ran five rustc jobs at load 246. A box's load is
-its runnable tasks per CPU (`procs_running` in `/proc/stat`), sampled with
-memory every 250 ms. A run's load is the mean of the samples while it ran. A
-prediction uses the load now plus the threads the job would add. Other boxes
-publish their load, and a server reports the load each job it ran saw.
-
-A factor holds one value per load bucket, interpolated between buckets. Its
-starting curve comes from calibration: the calibrated ratio, flat up to one
-task per CPU, then growing with load past it, as CPUs time-share. That start is
-worth `P` of runs in each bucket and never decays, so a bucket nothing has
-reached yet keeps its shape.
-
-Each run of unit `u` at place `p` and load `l` that took `t` teaches both:
-
-- `u`'s size: the weighted mean of `t` over `p`'s factor at `l`, across `u`'s
-  runs.
-- `p`'s factor at `l`: the weighted total time of runs there over their total
-  size. A unit seen at one place and load only says nothing about it against
-  the others, so a run moves the factor only as far as `u`'s size draws on
-  runs elsewhere or at other loads. ryouko idle and ryouko busy compare on the
-  same units, as ryouko and the laptop do. Long jobs weigh the most, as they
-  take most of the time.
-
-Since the factors no longer average over load, old runs can count for a long
-time: weights halve every `H` of wall-clock time, which only has to follow
-slow changes (a toolchain, a kernel, a box's cooling).
-
-A sent run's time is everything the client waits for, from offering the job to
-its last output: staging and sending inputs, the linker waiting for late rlibs,
-rustc on the server, receiving outputs. The part that isn't compiling (what
-`copy_ms` measures now) counts in full but as its own term, predicted per unit
-and box from that unit's recent sends there. It depends on what the box has
-cached and on the network, not on the box's CPUs, so it stays out of the box's
-factor. This replaces the flat 200 ms. `build_script_build:980e7c5bc3a8806d`
-took 10.2 s on ryouko with nothing to send, and 38.3 s when it sent 345 MB,
-28.2 s of that the linker waiting for rlibs.
-
-Width becomes the tokens a job held after its front end, on average: rustc
-takes a token for each codegen thread, and a spinning linker takes none. Every
-job gets a jobserver FIFO of its own, as heavy jobs have now, lent from its
-class for a light job, so a light job's width is measured too. A server reports
-the token-seconds of each job it runs.
-
-What goes: instructions as the unit of cost (ranks, predictions and `status`
-work in reference seconds), job instruction counters, and class rates learned
-from CPU time (`rates/NAME.toml`). Calibration still counts instructions to
-compare CPUs, and boxes still publish calibrated rates, as starting factors.
-
-Guesses: `H` 1 day, `P` 30 s of runs, load buckets at 0, ¼, ½, ¾, 1, 1½, 2,
-3, 4, 6 and 8 tasks per CPU.
+- Each place has a factor, a curve over the load there, that scales its
+  calibrated time to time there, learned only from units that also ran
+  elsewhere or under other load. Load is measured from the box, since test
+  binaries and fuzzers bypass the daemon: at 06:59 the laptop ran five rustc
+  jobs at load 246. Because the curves model load, old runs keep counting for
+  a day rather than minutes.
+- Size is in the calibration load's instructions rather than seconds at a
+  reference speed, which comes to the same thing at one instruction per µs and
+  keeps ranks and `status` in the units they had.
+- A sent run's transfer counts in full, as its own term per unit and place, so
+  a fast box behind a slow link or a cold cache isn't taken for a slow box.
+  `build_script_build:980e7c5bc3a8806d` took 10.2 s on ryouko with nothing to
+  send, and 38.3 s when it sent 345 MB, 28.2 s of that the linker waiting for
+  rlibs.
+- Width is the tokens a job held after its front end: rustc takes a token for
+  each codegen thread, and a spinning linker takes none. That needs every job
+  to have a jobserver of its own. Lent like a heavy job's, every light job
+  would also hold a spare it never reads, halving light jobs' share of the
+  tokens; so spares are lent on credit, and the heavy jobs' unread spare went
+  too.
+- A server's slot exists while the job's inputs are still arriving, so its
+  meter counts from when rustc starts.
+- A bucket starts from the calibrated curve at the level the place has learned
+  over all its buckets, so a load nothing has run at doesn't read faster than
+  the loads around it.
+- The table from before loads as seed history, so the first builds after the
+  change still know every unit's size.
+- What went: instructions counted per job, CPU time, and class rates learned
+  from it (`rates/NAME.toml`, which a new daemon ignores). Calibration still
+  counts instructions to compare CPUs, and boxes publish calibrated rates as
+  starting factors.
 
 Open: a unit's recent sends mix runs that sent 345 MB with runs that sent
 nothing. The client could instead track what it has sent each box and predict
@@ -927,19 +932,21 @@ Every number below is a guess. None has been tested on an idle box.
 | neighbouring CPUs split into classes above | 8% | `src/calibrate.rs:19` |
 | calibration length | 60 s | `src/config.rs:22` |
 | calibration keys per run (about 0.25 s on a P-core) | 2^15 | `src/calibrate.rs:20` |
-| halve a unit's history at | 256 runs | `src/stats.rs:18` |
-| cost of a job with no history at all | 1 G instructions | `src/stats.rs` `UNKNOWN_COST_MI` |
-| a class's calibration counts as | 10 CPU-s of jobs | `src/sched.rs` `RATE_PRIOR_US` |
-| older jobs count half toward a class's rate after | 60 CPU-s | `src/sched.rs` `RATE_HALF_LIFE_US` |
+| halve a unit's histograms at | 256 runs | `src/stats.rs` `HALVE_AT` |
+| size of a job with no history at all | 1 G instructions | `src/stats.rs` `UNKNOWN_COST_MI` |
+| a place's calibration counts as, in each load bucket | 30 s of runs | `src/stats.rs` `PRIOR_US` |
+| runs count half after | 1 day | `src/stats.rs` `HALF_LIFE_S` |
+| load buckets, runnable tasks per CPU | 0, ¼, ½, ¾, 1, 1½, 2, 3, 4, 6, 8 | `src/stats.rs` `BUCKETS` |
+| republish load alone once it moves | ¼ task per CPU | `src/sched.rs` `LOAD_STEP_C` |
 | share of compressed swap predicted peaks may use beyond RAM | 50% | `src/config.rs` `compressed_swap_share` |
 | zswap compression ratio before it has stored anything | 3:1 | `src/sys.rs` `ZSWAP_RATIO` |
 | sample memory and job footprints every | 250 ms | `src/sched.rs` `MEASURE` |
 | keep graph nodes unseen for | 60 days | `src/graph.rs` `KEEP_DAYS` |
 | only send jobs predicted to take at least | 1 s | `src/sched.rs` `REMOTE_MIN_US` |
-| predicted cost of going remote | 200 ms | `src/sched.rs` `REMOTE_OVERHEAD_US` |
-| count free tokens and lend to heavy jobs every | 100 ms | `src/sched.rs` `SAMPLE` |
+| time moving files, before anything was sent to a place | 200 ms | `src/sched.rs` `REMOTE_OVERHEAD_US` |
+| count and lend each job's tokens every | 100 ms | `src/sched.rs` `SAMPLE` |
 | jobserver tokens per CPU | 1.5 | `src/config.rs` `tokens_per_cpu` |
-| a job is light below this many threads busy | 1.5 | `src/sched.rs` `LIGHT_WIDTH_C` |
+| a job is light below this many tokens held | 1.5 | `src/sched.rs` `LIGHT_WIDTH_C` |
 | a heavy job's spare is taken: lend it | twice what it holds | `src/sched.rs` `Layout::lend` |
 | keep a unit local after remote-fail, local-pass | 2 times | `src/sched.rs` `PIN_AFTER` |
 | cache size | 20 GB | `src/config.rs` `cache_gb` |

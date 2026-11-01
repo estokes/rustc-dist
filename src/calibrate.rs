@@ -113,7 +113,7 @@ struct Speed {
 fn worker(cpu: u32, t0: Instant, warm: Duration, stop: &AtomicBool) -> Result<Speed> {
     sys::pin(&[cpu])?;
     let keys = keys();
-    let counter = perf::Counter::start(false);
+    let counter = perf::Counter::start();
     let count = || counter.as_ref().map_or(0, |c| c.read());
     let mut warming = Vec::new();
     let mut measured = Vec::new();
@@ -289,7 +289,7 @@ mod test {
 
     #[test]
     fn a_run_retires_about_the_fallback_count() {
-        let Some(c) = perf::Counter::start(false) else { return };
+        let Some(c) = perf::Counter::start() else { return };
         let keys = keys();
         let before = c.read();
         black_box(run_once(&keys, None));
