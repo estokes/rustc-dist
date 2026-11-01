@@ -186,6 +186,7 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
 // sys::test::status_counts_anonymous_shared_and_swapped_but_not_file_pages has a RssFile line and
 // fails if VmRSS (or RssFile) is counted. DESIGN's Memory section updated. sched.rs's
 // RunningJob::foot_kb doc still says 'RSS plus swap' (not my file).
+// 2026-11-01 claude: Correction to the note above: the stale doc is sched::Running::foot_kb.
 /// The memory `pid` and its descendants hold in RAM or swap, in kB: see
 /// [`status_kb`].
 pub fn tree_footprint_kb(pid: u32) -> u64 {
