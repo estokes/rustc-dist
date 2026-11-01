@@ -595,10 +595,12 @@ run on, so no client pairs one profile's name with another's rates.
 The scheduler publishes after every event, which includes the 100 ms ticks
 that lend tokens while jobs run. A changed state is republished at most every
 100 ms. The daemon lists `BASE/vN/status` for other
-boxes and subscribes to each one's state columns. A resolver error is logged
-and the listing tried again at the next tick. Netidx retries the resolver
-for up to tens of seconds first, and meanwhile the box neither publishes its
-state nor reads the others'. Whenever the farm task ends, the scheduler is
+boxes and subscribes to each one's state columns, looking every second. A
+resolver error is logged and the listing tried again at the next look.
+Netidx retries the resolver for up to tens of seconds first; the listing
+waits beside the farm task's other work, so meanwhile the box goes on
+publishing its state and reading the others', and the looks it missed are
+not made back to back. Whenever the farm task ends, the scheduler is
 told every other box is gone, so it never places jobs by a state that no
 longer changes.
 
