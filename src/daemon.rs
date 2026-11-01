@@ -531,50 +531,6 @@ async fn run_remote(
             }
         }
     };
-    // XCR claude for claude: [bug/medium] Nothing here watches the wrapper while the job runs on the
-    // other box: admit polls the socket for EOF, this loop doesn't, and `handle` writes to it only
-    // on artifact lines. So a wrapper that dies (cargo interrupted) is noticed only at the job's
-    // next artifact line: for a binary or test, the end of its link, as its dep-info line comes
-    // early; for a library, the end of codegen after its rmeta. Until then the remote rustc runs
-    // on, holding the other box's token and this box's RemoteSlot, so a build started right after
-    // sees that box busy and may send the same unit again. A failed write then returns Err before
-    // r.finish, so a run that succeeded is recorded as RemoteOutcome::Failed and logged as a
-    // warning. DESIGN ("Wrapper protocol": a remote job is cancelled if its wrapper died) says
-    // otherwise. Fix: an arm here like admit's `sock.readable()` that returns on EOF without
-    // awaiting `running`; dropping it drops the exchange, whose Drop (remote::In) sends the server
-    // Stop. Staging under block_in_place can't notice either, for up to tens of seconds on a busy
-    // box. (daemon-01)
-    // 2026-11-01 claude: admit and run_remote now wait through unless_hung_up, which returns None
-    // on the wrapper's EOF: staging runs in spawn_blocking under it, and the relay of a remote
-    // run's events is wrapped in it (the socket split so events can still be written). Returning
-    // Remote::Gone drops running and so the exchange, whose Drop sends Stop; the RemoteSlot drops
-    // as Failed, which records nothing. A failed write to the wrapper also ends the relay as Gone,
-    // and a run that succeeded is finished as Done before its held output and Exit are written.
-    // Test: daemon::test::waiting_ends_when_the_wrapper_hangs_up pins unless_hung_up; nothing
-    // drives run_remote itself, as a RemoteSlot can only be made by the scheduler with a farm
-    // behind it, so dropping the helper from run_remote would go unnoticed by the tests.
-    // 2026-11-01 claude: The code holds, but no test fails without it: with run_remote's two
-    // unless_hung_up calls (staging and relay) turned back into plain awaits in a scratch copy,
-    // every daemon and e2e test passed. waiting_ends_when_the_wrapper_hangs_up pins only the helper.
-    // The e2e harness can drive run_remote: e2e_test::server gives an in-process netidx with Links
-    // and a publisher (enough for Ctx::farm), and endless() a job that runs until stopped. With a
-    // #[cfg(test)] constructor for sched::RemoteSlot (its fields are private), a test can call
-    // run_remote, drop the wrapper's end, and check that it returns Remote::Gone at once and that
-    // serving(&b) drops to 0.
-    // 2026-11-01 claude:
-    // daemon::test::a_remote_job_ends_when_its_wrapper_hangs_up_while_it_is_staged_or_runs drives
-    // run_remote against e2e_test::server (in-process netidx, Ctx::farm from its publisher and a
-    // Links on its subscriber) with sched::RemoteSlot::for_test (a #[cfg(test)] constructor).
-    // Staging: the job's last dep-info is a FIFO, so remote::stage blocks reading it; the wrapper
-    // has hung up, and run_remote must return Remote::Gone within 5 s. Relay: e2e_test::endless runs
-    // in the sandbox until the wrapper end is dropped; run_remote must return Gone within 5 s,
-    // serving(&b) drop to 0 and the sandbox die. It fails with the staging unless_hung_up turned
-    // into a plain await, and with the relay's (each checked). Writing it found a gap: a wrapper
-    // that hangs up with output unread (here the early dep-info artifact line, as when cargo kills a
-    // wrapper) gives the daemon ECONNRESET, not EOF, so unless_hung_up returned Err, compile logged
-    // 'sending it failed just now' and queued the job again here. unless_hung_up now treats
-    // ConnectionReset as a hang-up; waiting_ends_when_the_wrapper_hangs_up gained that case and
-    // fails without it (checked), as does the run_remote test.
     let (from_wrapper, mut to_wrapper) = sock.split();
     let relay = async {
         loop {

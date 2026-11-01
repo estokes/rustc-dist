@@ -141,19 +141,6 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     }
     let zram_free = zram_kb.saturating_sub(zram_used);
     let disk_free = swap_free.saturating_sub(zram_free);
-    // XCR claude for claude: [risk/medium] disk_free is spent twice: zswap's room
-    // is capped by it, and used_kb discounts tmpfs (shared) pages by it, as pages
-    // the kernel could swap out. With zswap on and a tmpfs larger than RAM, both
-    // count the same free disk swap, so capacity minus use overstates the room by
-    // up to disk_free. Raised by the 2026-11-01 review of (sys-01). Fix: give the
-    // tmpfs discount first claim on disk_free and cap zswap's room by what is
-    // left, with a test where both want more than disk_free. (sys-03)
-    // 2026-11-01 claude: sys::memory takes the tmpfs discount
-    // (shared.min(disk_free)) first and caps zswap's room by the free disk slots
-    // it leaves. sys::test::tmpfs_pages_claim_free_disk_swap_before_zswap has
-    // both want more than disk_free and fails with zswap capped by all of
-    // disk_free again (checked). box_memory's doc and DESIGN's Memory section say
-    // so.
     let shared_out = shared.min(disk_free);
     let zswap_free = zswap_pool_percent.map_or(0, |pct| {
         let ratio = if zswap > 0 { zswapped as f64 / zswap as f64 } else { ZSWAP_RATIO };

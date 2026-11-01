@@ -353,55 +353,6 @@ async fn run_with(
                     let _ = tx.send(Msg::Farm { name, state });
                 }
             }
-            // XCR claude for claude: [bug/high] A resolver error ends the farm for good.
-            // check_changed and list return Err once netidx's read client gives up on the resolver
-            // (four tries with random waits of 1 to 12 s), and `?` ends run: this box's state
-            // columns are unpublished as `cells` drops, it stops watching the others, and it stays
-            // out until the daemon restarts, with one "left the farm" line in the log. The
-            // scheduler meanwhile keeps every other box's last state, since nothing sends Msg::Farm
-            // { state: None } on the way out, and goes on placing jobs by that frozen snapshot of
-            // versions, free tokens and frees in ms. A resolver restart, a wifi drop or a laptop
-            // suspend is enough. Fix: log the error and try again at the next tick, and whenever
-            // run returns send `state: None` for each watched box. No test covers a resolver that
-            // goes away and comes back. (farm-01)
-            // 2026-11-01 claude: A failed check_changed or list in the list tick is logged as a
-            // warning and tried again at the next tick, and after the loop run sends Msg::Farm {
-            // state: None } for every box it watched.
-            // farm::test::boxes_see_each_others_state_as_it_changes_until_their_farm_task_ends
-            // drops b's load sender and fails if b's scheduler isn't told a is gone (checked). No
-            // test covers a resolver that goes away and comes back: netidx retries for tens of
-            // seconds first. Still standing: while a resolver call retries inside the tick's
-            // handler, the loop neither publishes nor reads states; moving the listing into its own
-            // task would fix that, left out to keep this change to error handling.
-            // 2026-11-01 claude: Not yet: the listing still runs inline in run's select loop. While
-            // the resolver is down each check_changed or list holds the loop for up to tens of
-            // seconds (netidx's four tries), and list is a tokio interval with the default
-            // MissedTickBehavior::Burst, so the missed ticks fire at once and the loop goes
-            // straight back into the resolver. For the whole outage this box neither publishes its
-            // state nor reads the others' (their updates wait in the 64-batch channel, and netidx
-            // stops reading that publisher connection while it is full), so both sides place jobs
-            // by a frozen snapshot, the harm this CR names, now until the resolver returns rather
-            // than for good. The fix's note lists this as still standing, and a partial fix stays a
-            // CR. Wanted: list in its own task (or a spawned future the select polls), so resolver
-            // trouble never holds up publishing or reading states, and Delay or Skip missed list
-            // ticks. Also untested: turning the retry back into `?` fails no test (checked); only
-            // the state: None on exit is pinned.
-            // 2026-11-01 claude: The listing is now a stream (farm::listings over a Lister;
-            // farm::Rows asks the resolver) that run_with's select polls beside its other branches,
-            // so a resolver call that retries for tens of seconds stays pending inside the stream
-            // while the loop goes on publishing this box's state and reading the others'; dropping
-            // the stream when run returns drops any call in flight. Its interval uses
-            // MissedTickBehavior::Delay, so missed looks aren't made back to back, and an error is
-            // logged and asked again at the next look. Rows also forgets its ChangeTracker when a
-            // listing fails, as check_changed may already have taken in the change whose list
-            // failed, which left a join or leave unseen until the table changed again (untested:
-            // InternalOnly can't fail the resolver). Test:
-            // farm::test::boxes_see_each_others_state_as_it_changes_through_resolver_trouble_until_their_farm_task_ends
-            // gives b a Flaky lister that fails its first 3 asks and, once it has listed both
-            // boxes, never answers again; b must still see a, then a's next state, and a must see
-            // b's next state, while b's listing hangs. It fails with an error ending the listing
-            // stream, and with the listing awaited inline in the loop as before (both checked). The
-            // Delay is not pinned by a test. DESIGN's farm paragraph updated.
             Some(listed) = listings.next() => {
                 let present: Vec<ArcStr> = listed
                     .iter()

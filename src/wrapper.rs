@@ -109,52 +109,6 @@ fn answer(
                 Reply::Restarting => break anyhow!("the rustc-dist daemon sent the job back as it restarted"),
                 Reply::Status(_) | Reply::Done => bail!("unexpected reply from the daemon"),
             }
-            // XCR claude for claude: [bug/medium] Once the first reply is in, the wrapper can't follow a
-            // daemon restart. A remote job whose daemon exits while it streams (main's shutdown_timeout
-            // drops the connection tasks once daemon::run returns) ends here with "the daemon went away
-            // mid-job", and one that failed on another box after forwarding its rmeta line, then met a
-            // draining scheduler, gets Reply::Restarting, which this loop calls "unexpected reply from
-            // the daemon". Either way cargo sees a failed compile, so any daemon restart (a deploy,
-            // systemctl restart, a client of another version: daemon::serve) fails the builds that have
-            // jobs on other boxes. The wrapper knows whether it printed an rmeta line already
-            // (protocol::is_metadata_line on each Output), so it could ask again through
-            // client::request and OR that into the Slot's filter_metadata. Rerun or fail is a policy
-            // choice, hence for eric; see client-01 for the same failure before the first reply.
-            // (wrapper-01)
-            // 2026-11-01 claude: Eric ruled (2026-11-01): rerun (a): reconnect and ask again, filtering
-            // the rmeta line if it was already printed.
-            // 2026-11-01 claude: Per Eric's ruling (a): wrapper::answer asks again through
-            // client::request when the daemon sends Restarting after the first reply or the socket
-            // fails with an io::Error mid-job; a decode error still fails. It notes when it printed an
-            // rmeta line and then drops a later one, from a remote rerun's Output or, through
-            // filter_metadata, from a run here.
-            // wrapper::test::a_daemon_gone_mid_job_is_asked_again_and_cargo_gets_one_rmeta_line fails
-            // without the reconnect or without the filtering (checked both).
-            // 2026-11-01 claude: Not yet: wrapper::answer asks again with no bound. A daemon that loses
-            // the connection after its first reply every time (a panic in its connection task on this
-            // job, a crash loop) makes the wrapper ask again forever, at full speed and with no word to
-            // cargo: client::follow's give-up never sees these losses, as open got a reply, and the
-            // inner break skips RETRY. Before the fix cargo failed loudly. Probe (scratch copy): a
-            // request that returns one Output and hangs up, given to answer, was asked 1001 times in
-            // 0.01 s, until the probe's request bailed. Wanted: a pause before asking again, and a
-            // bound, e.g. give up after a few reruns that followed a reply (each one redoes the job),
-            // saying so on stderr. A test with daemons() that always lose the job after its first reply
-            // would pin it.
-            // 2026-11-01 claude: client::Restarts counts the daemon restarts one ask follows, at most
-            // client::RESTARTS (5), then fails with 'gave up after following 5 restarts of the
-            // rustc-dist daemon: <how the last showed>', which main prints on stderr as cargo's compile
-            // fails. wrapper::answer owns one and counts each job lost after its first reply
-            // (Restarting or an io error), pausing RERUN (250 ms) before asking again; it hands the
-            // same Restarts to its request (client::request_after), whose follow counts each ask the
-            // daemon held 1 s or more before failing it, so a daemon crash-looping on long cycles no
-            // longer resets the give-up clock forever. Tests:
-            // wrapper::test::a_daemon_that_always_loses_the_job_after_its_first_reply_is_followed_only_so_far
-            // (daemons that always hang up after one rmeta line: RESTARTS + 1 asks, at least RESTARTS
-            // pauses, one rmeta line to cargo, and restarts counted inside request share the limit)
-            // fails without the count in answer and without the pause (both checked);
-            // client::test::a_daemon_that_dies_each_time_it_holds_the_ask_counts_toward_the_restarts_it_follows
-            // fails without the count in follow (checked). DESIGN's Wrapper protocol and guesses table
-            // updated. No message changes.
             reply = match protocol::recv(&mut sock, buf) {
                 Ok(reply) => reply,
                 Err(e) if e.downcast_ref::<io::Error>().is_some() => break e.context("the rustc-dist daemon went away mid-job"),

@@ -90,52 +90,6 @@ fn parse_key(vv: &str) -> Result<ArcStr> {
     Ok(format_compact!("{} {}", field("commit-hash: ")?, field("host: ")?).as_str().into())
 }
 
-// XCR claude for claude: [bug/high] The toolchains are read once, when the daemon joins the farm,
-// and a toolchain is found by key but run by path (Installed::rustc). After a `rustup update` while
-// the daemon runs, this box goes on advertising the old commit (farm::Member's toolchains) and runs
-// the new rustc for jobs that ask for the old one (sandbox::take finds `tc` by the old key). Leaf
-// crates, which load nothing but the sysroot, build cleanly there with the wrong compiler, and the
-// client's next compile that reads them fails with E0514 (compiled by an incompatible version of
-// rustc), locally, so nothing retries it; cargo's fingerprint names the client's rustc, so later
-// builds keep the bad files until `cargo clean`. The client re-keys when its rustc's mtime changes
-// (Keys::key); this side never does, and a toolchain installed later isn't served until a restart.
-// Fix: before running, check tc.rustc()'s key through a Keys cache and answer "no toolchain" on a
-// mismatch, and rescan and republish the toolchains when a sysroot's rustc changes. (toolchain-01)
-// 2026-11-01 claude: toolchain::installed now returns Toolchains, which stamps each sysroot's rustc
-// (mtime, inode, size) and lib/rustlib before asking the key. Server holds it in a Mutex and
-// refreshes it before every offer (cheap stats; a full read only when something changed, warning
-// when a sysroot's key changed), so an old key gets no toolchain; take also fails a job whose rustc
-// changed while it ran (Installed::unchanged). That replaces the Keys cache the CR suggests, with
-// the same effect and also catching a toolchain added or removed. Republishing: farm::run follows
-// toolchain::watch, a task that looks every 10 s (its first look a full read, as the daemon's list
-// may predate a change) and republishes on a change (a few lines in farm.rs; daemon.rs untouched,
-// as Toolchains iterates like the old Vec). Tests:
-// toolchain::test::toolchains_are_read_again_when_rustup_changes_them and
-// toolchain::test::the_toolchains_to_publish_follow_rustup (both fail if Toolchains::current always
-// says yes).
-// 2026-11-01 claude: Toolchains, refresh and watch hold, and both named tests fail when
-// Toolchains::current always says yes (checked). Two gaps remain. (1) The stamp is checked when the
-// job is offered and again after it runs, but not just before the sandbox starts. In between come
-// the manifest, uploading inputs (a minute or more over wifi), waiting for other jobs' uploads, and
-// building the tree. A rustup update in that window makes the new rustc run for the old key. Its
-// artifacts, including the .rmeta line cargo starts dependents on, reach the client before the
-// check after the run fails the job, so a dependent built locally can still hit E0514. Fix: check
-// tc.unchanged() in sandbox::job just before run(), and keep the check after the run. (2) No test
-// covers the server side. With toolchains.refresh() removed from Server::toolchain and the check
-// after the run turned off, all 170 tests still pass (checked). A test that runs a Server on a fake
-// rustup home and swaps its rustc between two offers would cover it; Toolchains::read is private,
-// so it needs a pub(crate) constructor.
-// 2026-11-01 claude: sandbox::job checks tc.unchanged() just before run() starts the sandbox, after
-// the inputs are in and the tree is built, and fails the job 'before the job ran' so no output
-// reaches the client; take keeps the check after the run. Toolchains::read is pub(crate), and
-// toolchain::test's fake rustup home now keeps each rustc as a hard link in its sysroot (so the
-// sandbox can run it), printing '<commit> ran', c1 waiting until its sysroot's rustc is no longer
-// c1. e2e_test::a_toolchain_rustup_changes_is_refused_at_the_offer_before_the_run_and_after_it runs
-// a Server on it: rustc swapped between two offers (the second must get 'no toolchain'), between
-// offer and Run (nothing may print, and the job fails), and while c1 runs (the job fails rather
-// than exit 0). It fails with the refresh in Server::toolchain removed, with the check before run
-// removed, and with the check after the run removed (each checked). DESIGN's toolchain paragraph
-// says so.
 /// rustup's toolchains on this box, as they were when read.
 pub struct Toolchains {
     home: PathBuf,
