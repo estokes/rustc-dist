@@ -44,24 +44,6 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     let mut args = args[1..].iter().filter_map(|a| a.as_ref().to_str());
     while let Some(arg) = args.next() {
         match arg {
-            // XCR claude for claude: [bug/low] Two flags are read as if they came once, or only in
-            // probes. `--print` anywhere makes a probe, but `cargo rustc --crate-type staticlib --
-            // --print native-static-libs` (the documented way to get a staticlib's link line) is a
-            // real compile, which then runs with no slot, outside the scheduler and memory
-            // admission (the probe in argv-01 printed `probe` for it). And rustc unions repeated
-            // `--emit` flags while `emit` keeps the last, so `cargo rustc -- --emit=llvm-ir` on a
-            // binary keys the unit `llvm-ir` and gives Reads::Metadata though it still links (the
-            // probe printed `reads=Some(Metadata)`); the remote run then fails for want of rlibs
-            // and reruns here, and a `kind=path` in the earlier `--emit` is missing from
-            // paths.outputs. Fix: make `--print` a probe only when no source file is given, and
-            // gather every `--emit` value. (argv-02)
-            // 2026-11-01 claude: A --print (either spelling, its value consumed) makes a probe
-            // only when no .rs source is given; a compile that prints stays here, since --print
-            // KIND=PATH writes a file no box sends back. Every --emit is gathered, comma joined,
-            // into the unit key, the outputs and reads. Tests:
-            // argv::test::a_print_with_a_source_file_compiles (classified a probe before) and
-            // argv::test::every_emit_counts (keyed llvm-ir and read Metadata before), plus a
-            // --print row in what_portable_jobs_read. README's What stays local lists --print.
             "-" | "-vV" | "-V" | "--version" => return Invocation::Probe,
             "--print" => {
                 print = true;
@@ -128,15 +110,6 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     if let Some(dir) = out_dir.and_then(|d| Path::new(d).parent()) {
         deps.extend(build_group(dir).map(|id| Dep { id, file: None }));
     }
-    // XCR claude for claude: [doc-drift/low] README's "What stays local" list misses reasons a job
-    // stays here: an `@argfile` argument (`argfile` here), a compile with no `--out-dir`, an
-    // argument, compiler path or cwd that isn't UTF-8 (wrapper::job), a project `rustc-dist.toml`
-    // that fails to parse (wrapper::job prints the error and keeps the job), and a package
-    // directory past remote's WALK_LIMIT of 256 MB, which DESIGN mentions. List them, or say the
-    // list gives the common ones. (argv-03)
-    // 2026-11-01 claude: README's What stays local now lists an @file, --print, no --out-dir, a
-    // non-UTF-8 argument, compiler path or cwd, a project rustc-dist.toml that doesn't parse, and
-    // a package directory past 256 MB. Doc only, no test.
     let portable =
         driver == "rustc" && !argfile && !print && !cg.incremental && !cg.native_cpu && !cg.split_debuginfo;
     let portable = match out_dir_arg {
@@ -234,25 +207,6 @@ struct Codegen<'a> {
 }
 
 impl<'a> Codegen<'a> {
-    // XCR claude for claude: [bug/medium] rustc reads a `-C` option's name with `_` and `-` alike,
-    // and takes `--codegen V` and `--codegen=V` as `-C V`, but parse matches only the dashed names
-    // and classify passes only `-C V` and `-CV` here. So `-C target_cpu=native`, `--codegen
-    // target-cpu=native` or `-C split_debuginfo=packed` (from RUSTFLAGS, say) leaves the job
-    // portable, and another box builds it for its own CPU: code the client's CPU may not run
-    // (SIGILL), with no error anywhere. The same goes for `incremental`. Probe: a temporary test
-    // classifying a bin with each of `-C target_cpu=native`, `--codegen target-cpu=native`,
-    // `--codegen=target-cpu=native` and `-C split_debuginfo=packed` printed `portable=true
-    // reads=Some(RlibsToLink { linker: "cc" })` for all four (`cargo test --bin rustc-dist
-    // probe_tmp_review`, removed since); `rustc --print cfg -C target_cpu=native` lists 38 target
-    // features, 3 without it. Fix: in classify read `--codegen V` and `--codegen=V` like `-C V`,
-    // and here compare the option name with `_` read as `-`. A row per spelling in
-    // what_portable_jobs_read's `local` list would pin it. (argv-01)
-    // 2026-11-01 claude: classify reads --codegen V and --codegen=V like -C V, and Codegen::parse
-    // splits NAME=VALUE and reads _ in the name as - before matching. New rows in
-    // what_portable_jobs_read's local list (-C target_cpu=native, --codegen target-cpu=native,
-    // --codegen=target-cpu=native, -C split_debuginfo=packed, --codegen incremental=...) and two
-    // in compile_keys (--codegen codegen_units=4, --codegen=extra_filename=-77) fail without
-    // either half (checked).
     /// One `-C` option, `NAME` or `NAME=VALUE`. rustc reads `_` in a name
     /// as `-`.
     fn parse(&mut self, arg: &'a str) {

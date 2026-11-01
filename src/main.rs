@@ -91,20 +91,6 @@ fn main() {
     let opt = Opt::parse();
     let prints = opt.prints();
     if let Err(e) = dispatch(opt) {
-        // XCR claude for claude: [risk/medium] A BrokenPipe anywhere makes rustc-dist exit 0 and
-        // print nothing. That suits `rustc-dist status | head`, but for the wrapper exit 0 tells
-        // cargo that rustc succeeded. anyhow's downcast_ref sees through context, so a wrapper
-        // whose write to the daemon socket fails with EPIPE once client::exchange stops retrying (a
-        // daemon that reads the version and closes, daemon::serve, races the Ask's write, which
-        // daemon-02 can keep going past 30 s) reports success with no crate compiled, and cargo
-        // fails later on a missing file far from the cause. Fix: swallow BrokenPipe only for the
-        // commands that print to stdout (Opt::Status, Opt::Calibrate), never for Opt::Wrapper.
-        // (main-01)
-        // 2026-11-01 claude: main parses the command first and swallows a BrokenPipe only for one
-        // that prints to stdout (Opt::Status, Opt::Calibrate), through quiet(prints, e); a
-        // wrapper's broken pipe is printed and exits 1.
-        // test::only_a_command_that_prints_ends_quietly_on_a_broken_pipe fails if quiet ignores
-        // prints (checked).
         if quiet(prints, &e) {
             return;
         }

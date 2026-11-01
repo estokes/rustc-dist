@@ -108,20 +108,6 @@ pub async fn run() -> Result<()> {
     let (load_tx, load) = watch::channel(Load::default());
     let sched = Sched::new(setup, profile, load_tx, tx.clone())?;
     let mut sched = tokio::spawn(sched.run(rx));
-    // XCR claude for claude: [risk/low] The farm is joined before the accept loop starts, so no
-    // wrapper is answered until join returns, and join waits on the network: sandbox::listen awaits
-    // publisher.flushed(), which with the resolver unreachable (a laptop away from home, the
-    // resolver's box down) returns only once netidx's write client gives up on connecting, 15 s
-    // (HELLO_TO) or more. join also runs Store::open, which walks the whole blob store, on an async
-    // worker. Wrappers connect meanwhile and wait in client::open with no word of why. Fix: start
-    // the accept loop first and join in a spawned task that hands Ctx its Links when done (a
-    // OnceLock, say), with Store::open in spawn_blocking. (daemon-03)
-    // 2026-11-01 claude: run starts the accept loop without waiting for the farm: join runs in a
-    // spawned task that sets Ctx::farm (a OnceLock<Farm> holding the Links and the Publisher) when
-    // done, and starts the heartbeat sender itself; Store::open runs in spawn_blocking. Until then
-    // compile sees no farm and keeps jobs here. At shutdown a join still under way is aborted, and
-    // a joined farm's publisher is shut down as before. No test: run reads the user's config and
-    // binds the user's socket.
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let ctx = Arc::new(Ctx {
         tx: tx.clone(),
@@ -246,14 +232,6 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "rustc-dist".into())
 }
 
-// XCR claude for claude: [dead/low] Layout::lease names jobserver FIFOs `job-LAYOUT-JOB`, so this
-// matches nothing the daemon makes now: `class-` and `spread-` are older names. FIFOs of a killed
-// daemon stay in the runtime dir until a later one reuses that exact name. Match `job-`, or remove
-// every FIFO in the dir, which is private to the daemon. (daemon-04)
-// 2026-11-01 claude: remove_stale_fifos now removes every FIFO in the runtime dir (the
-// lock-holding daemon owns them all) rather than matching old name prefixes.
-// daemon::test::a_dead_daemons_fifos_go_and_nothing_else makes a job-N-M FIFO and a plain file and
-// fails if the FIFO stays or the file goes.
 /// Jobserver FIFOs left by a daemon that died without cleaning up. The
 /// daemon that holds the lock owns every FIFO in its runtime dir.
 fn remove_stale_fifos(dir: &Path) {
@@ -292,33 +270,6 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
     let mut version = [0u8; 4];
     sock.read_exact(&mut version).await?;
     let version = u32::from_be_bytes(version);
-    // XCR claude for claude: [risk/medium] Any client of another PROTOCOL makes the daemon exit, so
-    // that systemd starts the binary the client came from. That holds only when the client is the
-    // binary the unit's ExecStart names. An older or newer rustc-dist anywhere else (a checkout's
-    // target/debug/rustc-dist status, a lane testing a protocol bump, a second install) restarts
-    // the same daemon, retries for 30 s (client::exchange), and stops it again: a restart every
-    // second or two, each failing remote jobs in flight (wrapper-01) and long-queued wrappers
-    // (client-01), until systemd's default start limit (5 starts in 10 s; the unit from
-    // calibrate::install sets Restart=always, RestartSec=1 and no StartLimit*) marks the service
-    // failed and wrappers' systemctl start fails too. Options: exit only when the peer's
-    // /proc/PID/exe (peer_cred) is the ExecStart binary and its version is newer; otherwise close
-    // and let the client fail loudly, perhaps after a fixed-format line saying which protocol this
-    // daemon speaks. (daemon-02)
-    // 2026-11-01 claude: Eric ruled (2026-11-01): never restart for a client of another PROTOCOL:
-    // the protocol is in the netidx path anyway, it should basically never happen, and if it does
-    // it is the client's fault. Refuse that client, saying which protocol each speaks.
-    // 2026-11-01 claude: Per Eric's ruling the daemon never stops for a client of another
-    // PROTOCOL. serve answers it with protocol::refusal() (0xFFFFFFFF, longer than any message,
-    // then its own PROTOCOL), takes what the client sends until it hangs up (5 s at most) so the
-    // client's write can't fail first, and goes on. The client's protocol::recv_reply turns that
-    // into OtherProtocol, which client::follow returns at once, saying which protocol each speaks.
-    // client::shutdown, for rustc-dist install, now sends protocol::STOP (0xFFFFFFFF) in place of
-    // PROTOCOL, which any daemon stops on, an older one too as it exits on any other version;
-    // Ask::Shutdown is gone. Tests:
-    // daemon::test::a_client_of_another_protocol_is_refused_and_the_daemon_stays (fails if serve
-    // stops, checked) and client::test::a_daemon_of_another_protocol_fails_the_ask_at_once (fails
-    // if the refusal is retried, checked). DESIGN's Wrapper protocol and Farm sections and
-    // README's Install say so.
     match version {
         PROTOCOL => (),
         STOP => {
@@ -578,7 +529,7 @@ async fn run_remote(
             }
         }
     };
-    // XCR claude for claude: [bug/medium] Nothing here watches the wrapper while the job runs on the
+    // CR claude for claude: [bug/medium] Nothing here watches the wrapper while the job runs on the
     // other box: admit polls the socket for EOF, this loop doesn't, and `handle` writes to it only
     // on artifact lines. So a wrapper that dies (cargo interrupted) is noticed only at the job's
     // next artifact line: for a binary or test, the end of its link, as its dep-info line comes
@@ -600,6 +551,14 @@ async fn run_remote(
     // Test: daemon::test::waiting_ends_when_the_wrapper_hangs_up pins unless_hung_up; nothing
     // drives run_remote itself, as a RemoteSlot can only be made by the scheduler with a farm
     // behind it, so dropping the helper from run_remote would go unnoticed by the tests.
+    // 2026-11-01 claude: The code holds, but no test fails without it: with run_remote's two
+    // unless_hung_up calls (staging and relay) turned back into plain awaits in a scratch copy,
+    // every daemon and e2e test passed. waiting_ends_when_the_wrapper_hangs_up pins only the helper.
+    // The e2e harness can drive run_remote: e2e_test::server gives an in-process netidx with Links
+    // and a publisher (enough for Ctx::farm), and endless() a job that runs until stopped. With a
+    // #[cfg(test)] constructor for sched::RemoteSlot (its fields are private), a test can call
+    // run_remote, drop the wrapper's end, and check that it returns Remote::Gone at once and that
+    // serving(&b) drops to 0.
     let (from_wrapper, mut to_wrapper) = sock.split();
     let relay = async {
         loop {

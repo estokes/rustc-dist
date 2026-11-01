@@ -117,18 +117,6 @@ pub struct JobPaths {
 
 #[derive(Debug, Pack)]
 #[allow(clippy::large_enum_variant)]
-// XCR claude for claude: [doc-drift/low] DESIGN's "Wrapper protocol" describes messages that are
-// gone. The wrapper sends Ask::Compile (a Unit, cargo's pid, and an optional Job of rustc, args,
-// env, cwd, target, paths and reads), not `Job { argv, env, cwd, cargo_cwd }`; cargo's cwd isn't
-// sent, as the wrapper reads the project config itself. It reports Finished, which also lists the
-// crate files written, not `Ran { wall, maxrss, front }`, and remote output comes as Reply::Output,
-// not `Artifact`/`Stderr`/`Stdout` lines. DESIGN's "Process model" also says RUSTC_DIST=off is the
-// only bypass, but wrapper::run runs rustc directly as root too, as README says. (protocol-01)
-// 2026-11-01 claude: DESIGN's Wrapper protocol now describes Ask::Compile with its Unit and
-// optional Job, Ask::Probe, Slot with filter_metadata, Finished with the crate files, Output and
-// Exit, the follow-through-restarts rules (client-01, wrapper-01) and the refusal of another
-// PROTOCOL (daemon-02); Process model says running as root bypasses the daemon too. Doc only, no
-// test.
 pub enum Ask {
     /// `rustc -vV`, `--print`, stdin input. Runs at once without a slot.
     Probe,

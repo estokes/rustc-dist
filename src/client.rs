@@ -42,23 +42,6 @@ fn follow(
     buf: &mut BytesMut,
     give_up: Duration,
 ) -> Result<Option<(UnixStream, Reply)>> {
-    // XCR claude for claude: [bug/high] The 30 s deadline starts before the first attempt, and an
-    // attempt (open) lasts until the daemon answers, which for a compile means until it has a slot,
-    // or a remote job's first output. So a wrapper that queued for over 30 s and then gets
-    // Reply::Restarting, which Sched::run sends every queued job when the daemon drains, or EOF
-    // from a daemon that died, fails at once with "the rustc-dist daemon kept restarting" or
-    // "talking to the rustc-dist daemon" instead of reconnecting. Restarting the daemon during a
-    // big build (a deploy, systemctl restart, a client of another version: daemon::serve) then
-    // fails every cargo with a wrapper queued that long. Fix: start the 30 s at the first failure,
-    // and again after any attempt the daemon held for a while (longer than the 50 ms retry, say),
-    // so only a run of quick failures gives up. A test with a fake daemon that answers Restarting
-    // after the deadline would catch it. (client-01)
-    // 2026-11-01 claude: client::follow (was exchange) gives up only once failures have gone on for
-    // GIVE_UP (30 s) counting from the first after the last ask the daemon held for HELD (1 s) or
-    // more, so a long-queued wrapper follows a restart. Tests with a fake daemon:
-    // client::test::an_ask_queued_past_the_give_up_time_follows_a_restart (held 1.2 s, then
-    // Restarting, with give_up 300 ms; fails with a deadline from the start, checked) and
-    // client::test::a_run_of_quick_failures_gives_up.
     let mut failing_since = None;
     loop {
         let Some(mut sock) = connect()? else { return Ok(None) };

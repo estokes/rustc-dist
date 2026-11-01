@@ -172,31 +172,6 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
                         data.unpack()?;
                         con.send_one(&FromBox { id, msg: FromServer::Heartbeat }).await?;
                     }
-                    // XCR claude for claude: [risk/medium] Each job's inbox has no
-                    // bound, and this loop never waits on it, so nothing pushes
-                    // back on the client. Its client sends late rlibs right after
-                    // Run, but the job doesn't read them until its sandbox is
-                    // running: while it waits for another job's upload (the
-                    // coming_now loop in sandbox::job, which can take a minute
-                    // when a 520 MB rlib crosses wifi), builds its tree and
-                    // evicts, every late chunk queues here in memory, on a box
-                    // whose cache may also be in RAM. A bounded channel would
-                    // stall every job on the link behind one slow job. Starting
-                    // the late `receive` into the store as soon as Run arrives
-                    // avoids that trade-off. (sandbox-05)
-                    // 2026-11-01 claude: Eric ruled (2026-11-01): a, with
-                    // (sandbox-03): receive late uploads into the store as soon
-                    // as Run arrives.
-                    // 2026-11-01 claude: Fixed with (sandbox-03): from Run on,
-                    // receive_late drains the inbox into the store as chunks
-                    // come, while the job waits for other uploads, evicts and
-                    // builds its tree, so late chunks no longer pile up in
-                    // memory; the inbox stays unbounded but is drained as fast as
-                    // the store writes. Test:
-                    // e2e_test::late_rlibs_are_stored_as_they_come_while_the_job_waits_for_another_jobs_upload
-                    // (the late rlib must reach the store while the job still
-                    // waits for another job's stalled upload; fails if the
-                    // receiver starts only after that wait).
                     ToServer::Offer { unit, key, target, class } => {
                         let (tx, inbox) = mpsc::unbounded_channel();
                         let reply = Reply { con: con.clone(), id };
@@ -340,66 +315,9 @@ async fn job(server: &Arc<Server>, reply: &Reply, mut inbox: Inbox, tc: &Install
         receiving.spawn(receive_late(server.clone(), inbox, Uploads::new(send_later), stored_tx, exit));
     }
     let work = async {
-        // XCR claude for claude: [bug/medium] A Coming waits on an upload that moves
-        // only while the sending job is alive, and late rlibs are read from the
-        // inbox only inside run's loop, i.e. while the sender's rustc runs. (1)
-        // When the job whose client sends a shared late rlib exits first, a compile
-        // error for example, run returns, its `send_later` drops the Sending, and
-        // every job waiting on that rlib fails with "never arrived", although its
-        // own client could have sent it. Each then reruns locally and the daemon
-        // sends Msg::Mismatch, so a compile error in one test can get the other
-        // tests that share its rlibs kept local until restart. (2) If X needs now a
-        // hash that is Y's late rlib, and Y needs now a hash that is X's late rlib,
-        // both wait here before starting rustc, neither reads its late chunks, and
-        // both hang, holding their slots, with no timeout on either side. That
-        // needs two lanes whose rlibs differ in having an .rmeta beside them (see
-        // remote::crate_files), so it is rare. Fix options: when a Coming fails,
-        // ask this job's own client for the blob (another Need, which changes the
-        // protocol); or keep reading a job's late uploads until they finish, even
-        // after its rustc exits, while another job waits on them; and do not wait
-        // here on a hash another job will receive only once its rustc runs.
-        // (sandbox-03)
-        // 2026-11-01 claude: Eric ruled (2026-11-01): a: receive a job's late
-        // uploads into the store from Run on, to completion even after its rustc
-        // exits while another job waits on them; when a job needs now a blob that
-        // is another job's late rlib, ask its own client for it.
-        // 2026-11-01 claude: Per the ruling, with no message added: after Run a
-        // task of its own (sandbox::receive_late, holding the inbox) receives the
-        // job's late rlibs into the store whatever the job does, and tells the job
-        // of each through a channel; the job's rustc exiting (or the job failing
-        // after Run) makes it give up only uploads nobody waits for
-        // (Sending::release, checked under the arriving lock), and the job sends
-        // Exit/Failed only once the awaited ones are in, which keeps the client
-        // sending until then. The ask-its-own-client half needs no mid-job message:
-        // Store::claim now records whether an upload is late (When), and a job that
-        // needs now a blob that is another job's late rlib gets Claim::SendToo, so
-        // that blob goes in its first Need.now. Both halves also end the deadlock
-        // in (2). Tests:
-        // e2e_test::a_late_rlib_comes_through_another_jobs_upload_even_when_that_job_fails_first
-        // (fails if release ignores waiters),
-        // e2e_test::a_job_that_needs_another_jobs_late_rlib_before_rustc_starts_has_its_own_client_send_it
-        // (fails without SendToo),
-        // blobs::test::a_blob_needed_now_is_sent_again_rather_than_waited_for_as_another_jobs_late_rlib.
         for c in coming_now {
             c.arrived(store).await?;
         }
-        // XCR claude for claude: [perf/medium] sandbox::job does blocking filesystem
-        // work on a tokio worker: Store::claim calls Store::has, an open plus
-        // futimens, once per input file (thousands for a graphix test);
-        // sandbox::receive writes each 1 MB chunk and decompresses it inline;
-        // Store::evict below reads and stats every blob in the store;
-        // JobDir::build makes a hard link per input; JobDir's Drop runs
-        // remove_dir_all on the whole tree. Each blocks a worker for tens of ms or
-        // more on a large job, and with many jobs at once they block the serve
-        // loops and other jobs' sends. Move them to spawn_blocking or
-        // block_in_place, as daemon::run_remote does for remote::stage.
-        // (sandbox-04)
-        // 2026-11-01 claude: Claims, chunk writes and stores (Uploads::take), evict
-        // and JobDir::build run under block_in_place; JobDir's Drop removes the
-        // tree on spawn_blocking (inline only outside a runtime), and the toolchain
-        // check in take is under block_in_place too. No test: which thread runs the
-        // work isn't observable here; the e2e tests cover that the moved work still
-        // happens.
         task::block_in_place(|| store.evict());
         let n = server.next_job.fetch_add(1, Ordering::Relaxed);
         let root = JobDir(server.jobs_dir.join(format_compact!("{n}").as_str()));
@@ -765,23 +683,6 @@ async fn run(
             let _ = xtx.send(Ev::Exit(ExitStatus::from_raw(status), ru, Instant::now()));
         }
     });
-    // XCR claude for claude: [risk/low] There are two ways a dropped job's
-    // sandbox can keep running with no one killing it, and neither is logged.
-    // pidfd_open failing leaves Kill(None). And Kill is armed only once
-    // `spawned` resolves, so a job aborted (Stop, channel closed) between
-    // cmd.spawn on the thread and that await leaves bwrap running with its
-    // slot already given back. Fail the job when pidfd_open fails, and open the
-    // pidfd on the spawning thread so the Kill exists before the task can be
-    // dropped. (sandbox-06)
-    // 2026-11-01 claude: The thread that spawns bwrap opens the pidfd at once
-    // and sends Kill(OwnedFd) with the pid and pipes; if the job is gone the
-    // send fails and the Kill drops there, killing the sandbox. A pidfd_open
-    // failure kills and reaps the child and fails the job. Kill is no longer an
-    // Option or disarmed: once reaped, its SIGKILL does nothing. The thread
-    // also closes the gate's sandbox end after spawning (link-01). No test for
-    // the race itself;
-    // e2e_test::a_running_sandbox_is_killed_when_its_client_drops_the_job_or_the_channel_fails
-    // fails if Kill doesn't kill.
     let (pid, _kill, (stdout, stderr)) = spawned.await.context("the sandbox's thread died")??;
     slot.started(pid as u32);
     let stderr = stderr.context("stderr")?;

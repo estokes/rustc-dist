@@ -191,36 +191,6 @@ impl Graph {
         }
         // Marks `id` as in progress, so a cycle in stale data ends here.
         self.ranks.insert(id.clone(), 0);
-        // XCR claude for claude: [bug/medium] A rank adds each job's work, front plus rest,
-        // but Sched::dispatch turns rank differences into slack as time on one thread of
-        // the fastest class (`time_us(horizon - rank_mi, fastest_rate)`), so a wide job
-        // counts as if it ran on one thread. In `rustc-dist status` on washu-chan today,
-        // graphix_package_core (5aaddb61cfdea6bd) has 98.6 s of work, 2% of it front end,
-        // at width 9.6: about 12 s on that class with its threads (25 s measured wall
-        // on every CPU), yet it adds 98.6 s to every chain through it; graphix_types adds
-        // 243 s for about 120 s. A build whose horizon runs through such jobs gives its
-        // other jobs tens of seconds of slack they don't have, and they take slow
-        // classes. Fix: rank by predicted duration, the front end at the fast rate plus
-        // the rest over min(width, CPUs), as Stats::time_us computes at the fastest
-        // place; status's "Rank and work are seconds on one thread" changes with it.
-        // (graph-01)
-        // 2026-11-01 claude: Eric ruled (2026-11-01): rank by predicted duration on the
-        // fastest place, front end at the fast rate plus the rest over min(width, CPUs)
-        // (a).
-        // 2026-11-01 claude: Per the ruling: Graph::rank and Graph::ranked take each job's
-        // predicted µs as a closure, and Sched passes Layout::idle_us: the unit's
-        // prediction where it runs fastest here (Layout::fastest: the fastest class if
-        // light, else every CPU, via Stats::predict_at), timed by Stats::time_us at load 0
-        // with Spot's threads, so front end at the fast rate and the rest over min(width,
-        // CPUs). Ranks are µs now: Waiting and Running carry a Build { pid, rank_us,
-        // own_us } (None for another box's job, which has no rank), Running::rank_left_us
-        // counts down own_us, status shows rank_ms = rank/1000, and Sched::apply
-        // invalidates ranks. No Stats helper was needed. main.rs's status text and
-        // protocol.rs's rank_ms doc changed with it (text only, no message change);
-        // DESIGN.md (Build graph, Scheduling, status) updated. Tests:
-        // a_rank_counts_a_wide_job_at_the_threads_it_gets (gate 1 ms before wide's 8 ms of
-        // work on 4 cpus ranks 3 ms; 9000 with work summed); graph.rs tests now pass times
-        // directly.
         let own = match self.nodes.get(id) {
             Some(n) => own_us(&n.exact, &n.coarse),
             None => 0,

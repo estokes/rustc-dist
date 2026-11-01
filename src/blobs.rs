@@ -237,7 +237,7 @@ impl Hashes {
         Ok(Self { known: Mutex::new(known), dirty: AtomicBool::new(false), saving: Mutex::new(()) })
     }
 
-    // XCR claude for claude: [perf/medium] This stats every file the table
+    // CR claude for claude: [perf/medium] This stats every file the table
     // knows, writes the table, and fsyncs it, all on the caller's thread, and
     // its caller is Sched::save on the scheduler's event loop, every
     // SAVE_EVERY (60 s) whenever a hash was taken, which during a build is
@@ -253,6 +253,20 @@ impl Hashes {
     // shutdown_timeout; if it is cut short the old table stays (tmp plus
     // rename). No test: what changed is which thread runs it, which no test
     // here observes.
+    // 2026-11-01 claude: Taking Hashes::save off the scheduler's loop holds,
+    // but the save at shutdown is no longer sure to finish. Sched::run's last
+    // self.save() now spawns the hashes save and returns at once. daemon::run's
+    // sched.await then returns, main's rt.shutdown_timeout(1 s) stops waiting
+    // for the save, and the process exits partway through writing. Before the
+    // fix, Sched::run saved inline and daemon::run waited for it. So every
+    // restart (each rustc-dist install) can lose up to a minute of hashes, and
+    // DESIGN's Inputs says reading those files again after a restart ran at
+    // about 110 MB/s from swap. Fix: have Sched::run wait for the hashes save
+    // after its loop (for example, Sched::save returns the JoinHandle and run
+    // awaits it at shutdown), and leave the save every minute as it is. No test
+    // is needed for which thread runs it, but the shutdown path could be
+    // covered by a scheduler test that drains and then checks that the hashes
+    // file exists.
     /// Save the hashes of files still as they were hashed, if a hash was
     /// taken since the last save, and forget the rest, but those being
     /// hashed. It stats every file it knows and syncs the table, so it
@@ -443,11 +457,6 @@ impl Store {
         self.dir.join(&name[..2]).join(name.as_str())
     }
 
-    // XCR claude for claude: [doc-drift/low] The first doc line belongs to
-    // Store::has, which now has no doc, while claim's doc starts with a
-    // sentence about has. Move it down to has. (blobs-03)
-    // 2026-11-01 claude: Moved the line to Store::has; claim's doc is now just
-    // its own sentence. Doc only, no test.
     /// Where a job that reads the blob `h` `when` gets it: see `Claim`.
     pub fn claim(&self, h: &Hash, when: When) -> Claim {
         if self.has(h) {
@@ -526,20 +535,6 @@ impl Store {
         }
     }
 
-    // XCR claude for claude: [perf/low] When pinned blobs keep `used` above the
-    // cap (several large link jobs pinning hundreds of MB each, against a cap
-    // of a few GB), no pass gets back under 90%, so every following job lists
-    // and stats the whole store again (sandbox::job calls this on every job),
-    // and logs "evicted 0 MB" each time. Remember that the last pass was held
-    // back by pins and skip until a pin drops or `used` grows, and log only
-    // when something was freed. (blobs-02)
-    // 2026-11-01 claude: Store::stuck holds `used` after a pass that pins kept
-    // above 90% of the cap; evict skips while used is no higher, and Pins::drop
-    // clears it when a pin count reaches zero. It logs only when it freed
-    // something, plus one line when pins first hold the store over its cap.
-    // Test: blobs::test::an_eviction_pins_held_back_waits_for_a_pin_to_drop (an
-    // uncounted stray blob survives the skipped pass and goes once a pin drops;
-    // fails without the skip).
     /// Delete the least recently used blobs no job is reading until the
     /// store is under 90% of its cap.
     pub fn evict(&self) {

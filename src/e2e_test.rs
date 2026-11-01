@@ -470,22 +470,6 @@ async fn a_box_answers_a_heartbeat() -> Result<()> {
     Ok(())
 }
 
-// XCR claude for claude: [test-gap/medium] The name promises that the job
-// "stops on the box", but the client drops it before sending Run, so no
-// sandbox ever starts. Nothing tests that a running rustc is killed (Kill's
-// pidfd SIGKILL in sandbox::run) when its client drops the job or the channel
-// fails. Add a case that drops the In while rustc runs (a job whose source
-// sleeps in a proc macro or const eval, or one held at the link gate by a
-// late rlib that never comes) and checks that the bwrap pid is gone and the
-// slot comes back. (e2e-01)
-// 2026-11-01 claude: Added
-// e2e_test::a_running_sandbox_is_killed_when_its_client_drops_the_job_or_the_channel_fails:
-// a library whose static spins in const eval forever; once its bwrap and rustc
-// show in /proc (found by the workspace path in their command lines), the
-// client drops the job, and then in a second round fails the channel; each time
-// every such process must go within 10 s and the box must stop serving. Fails
-// if Kill sends no signal. This test keeps its name and its case (dropped
-// before Run).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Result<()> {
     let _ = env_logger::try_init();
@@ -602,24 +586,6 @@ async fn a_channel_that_fails_is_replaced() -> Result<()> {
     Ok(())
 }
 
-// XCR claude for claude: [test-gap/medium] This covers a shared input needed
-// before rustc starts (coming_now). The late path, where a link job's rlib
-// comes through another job's upload (`coming_later` and the `others` future
-// in sandbox::job, then `place` behind the gate), has no test, although it is
-// the case DESIGN gives the dedup for (fifteen graphix tests sharing 520 MB of
-// rlibs). Nor is there a test of what happens when the job doing the sending
-// ends first; see (sandbox-03). Add two link jobs sharing a late rlib, once
-// with both succeeding and once with the sender failing to compile. (e2e-02)
-// 2026-11-01 claude: Added
-// e2e_test::a_late_rlib_comes_through_another_jobs_upload_even_when_that_job_fails_first:
-// two link jobs on one late rlib, driven step by step (e2e_test::Manual); the
-// second must get no Need for it and link (exit 0, so not against the stand-in)
-// once the first's client sends it, first with both compiling, then with the
-// first failing to compile before it sends. Also
-// e2e_test::a_job_that_needs_another_jobs_late_rlib_before_rustc_starts_has_its_own_client_send_it
-// and
-// e2e_test::late_rlibs_are_stored_as_they_come_while_the_job_waits_for_another_jobs_upload
-// for the rest of (sandbox-03) and (sandbox-05).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jobs_sent_together_send_a_blob_they_share_once() -> Result<()> {
     let _ = env_logger::try_init();

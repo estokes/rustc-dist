@@ -316,33 +316,6 @@ impl Place {
                 learned.push((i, prior(load_c) * r, weight));
             }
         }
-        // XCR claude for claude: [doc-drift/medium] The idle anchor is pooled away whenever a
-        // busier bucket learned a factor below the calibration: the anchor weighs only
-        // PRIOR_US, so pool adjacent violators averages it into that bucket's much
-        // heavier mean. Probe (a temporary test, `cargo test --bin rustc-dist
-        // zz_probe`): b ran u idle in 1 s and a ran it at 2 tasks per CPU in 0.4 s, 200
-        // times each; factor(a, 0) = 0.80 = factor(a, 200), not the calibration's 1.0.
-        // washu-chan's fastest class learned 0.42 at 2 tasks per CPU (DESIGN.md's Cost
-        // section), the case the anchor was added for, so its idle bucket follows that
-        // 0.42 most of the way. This function's doc ("with no runs there it keeps the
-        // calibration's factor") and DESIGN.md say otherwise, and
-        // a_place_that_only_ran_busy_keeps_its_calibration_idle covers only a busy
-        // factor above the calibration (2.0), where nothing pools. Decide which wins:
-        // the anchor (leave bucket 0 out of the pooling and accept a curve that falls
-        // from idle) or monotonicity (today's code; then the docs should say the anchor
-        // holds only while busier buckets learn at least the calibration), and add a
-        // test for the below-calibration case. (stats-05)
-        // 2026-11-01 claude: Eric ruled (2026-11-01): monotonicity wins (a): fix the docs
-        // to say the anchor holds only while busier buckets learn at least the
-        // calibration, and add a test for the case below it.
-        // 2026-11-01 claude: Per the ruling, the code is unchanged. Place::refresh's doc and
-        // DESIGN.md's Cost section (the curve paragraph and the washu-chan 0.42 example) now
-        // say that the idle anchor holds only while every busier bucket learns at least the
-        // calibration, and that one which learns less pools the anchor most of the way down.
-        // Pin: a_busy_factor_below_the_calibration_pools_the_idle_anchor_into_it (a runs at
-        // 2 tasks per CPU in 0.4 of b's idle time; factor(a, 0) == factor(a, 200) < 0.9,
-        // curve monotone). It passes on the old code by design, and fails if bucket 0 is
-        // left out of the pooling.
         non_decreasing(&mut learned);
         for (j, f) in self.factors.iter_mut().enumerate() {
             let (lo, a) = learned.iter().rev().find(|l| l.0 <= j).map_or((0, prior(0)), |l| (l.0, l.1));
@@ -528,26 +501,6 @@ impl Record {
             self.sent_kb.saturating_record(t.sent_kb.max(1));
         }
         self.runs[origin.index()] += 1;
-        // XCR claude for claude: [bug/medium] Halving with `count / 2` drops every value
-        // recorded once, and those are mostly the tail, so admission's p90 peak loses
-        // its high runs at each halving. Probe (a temporary test, `cargo test --bin
-        // rustc-dist zz_probe`): 255 runs of one unit, 229 at 500_000 kB and 26 from
-        // 900_000 kB up, one per bucket; p90 was 901_119 kB, the 256th run (500_000 kB)
-        // triggered the halving, and p90 became 501_759 kB. The job is then admitted at
-        // about half its recorded p90 peak, the overcommit DESIGN.md's Memory section
-        // guards against. wall_ms, copy_ms and sent_kb lose their tails the same way
-        // (status medians). Fix: round up, `(count + 1) / 2`, which keeps every value
-        // (an old singleton then never fades, which errs high for a peak), or replace
-        // the histograms with the kept samples (stats-03). (stats-02)
-        // 2026-11-01 claude: Halving is now the free fn halved, which halves the count
-        // at or above each value, rounding up, rather than each value's own count.
-        // Every quantile stays where it was to within one run, the total halves, and
-        // the highest value stays. That is better than rounding each count up, which
-        // keeps every singleton forever (26 singletons out of 154 hold p90 in the tail
-        // for good). Regression: halving_a_units_histograms_keeps_their_quantiles,
-        // which is the probe plus a fade check. With count / 2, p90 drops to about
-        // 501_759 at the 256th run; with per-value div_ceil it stays at 962_559 four
-        // halvings later.
         if self.mem_kb.len() >= HALVE_AT {
             for h in self.all() {
                 *h = halved(h);
@@ -692,21 +645,6 @@ impl Stats {
     /// they last did.
     pub fn set_now(&mut self, now: f64) {
         self.now = now;
-        // XCR claude for claude: [perf/low] Sched::run calls this before every event (each
-        // message, the 100 ms token sample, the 250 ms measure), and each call reruns
-        // every place's eleven bucket medians: on this box 14 places, each bucket up to
-        // 32 comparisons with a powf and a sort, hundreds of times a second during a
-        // build. Weights halve per day, so nothing moves between calls. Refresh only
-        // once `now` has moved a minute or so past the last refresh; Place::learn
-        // already refreshes the place it teaches. (stats-08)
-        // 2026-11-01 claude: Stats keeps `refreshed`. set_now refreshes every place only once now is
-        // REFRESH_HALF_LIVES (1/1440, a minute at the default day) of half_life_s from
-        // it, in either direction, and rebuild_global resets it. It is a share of the
-        // half-life, not a fixed minute, because half_life_s is configurable down to 60
-        // s. Place::learn still refreshes the place it teaches. No test measures the
-        // saving. old_runs_stop_counting_as_they_age and
-        // a_units_runs_at_a_place_give_way_... fail if a jump of a day or more stops
-        // refreshing.
         if (now - self.refreshed).abs() >= REFRESH_HALF_LIVES * self.decay.half_life_s {
             self.refreshed = now;
             for p in &mut self.places {
@@ -722,7 +660,7 @@ impl Stats {
     pub fn place(&mut self, key: &str, fast: u64, rate: u64) -> PlaceId {
         if let Some(&id) = self.by_key.get(key) {
             let p = &mut self.places[id.0 as usize];
-            // XCR claude for claude: [bug/medium] A recalibrated place reads its old runs at
+            // CR claude for claude: [bug/medium] A recalibrated place reads its old runs at
             // the new rate. RunSample keeps work (front_us * fast, tokens_us * rate) at the
             // calibration current when it ran, and Record::size divides that by the
             // place's factor now. This reset puts the factor back to the starting curve
@@ -756,6 +694,18 @@ impl Stats {
             // if the sends are dropped), and
             // a_table_of_work_at_calibrated_speeds_loads_as_measured_runs for the rdstats9
             // conversion, seed width included.
+            // 2026-11-01 claude: The fix holds, and the live table converts exactly: a copy
+            // of washu-chan's rdstats9 jobs.hdr (1619 units, 13599 runs, 14 places) loaded
+            // through the old code and the new gives identical per-run work and width (to 9
+            // digits) and identical predict, predict_at basis and time_us for every unit at
+            // every place, and a resave as rdstat10 reloads identically. One gap in the
+            // regression test: a_table_of_work_at_calibrated_speeds_loads_as_measured_runs
+            // writes a/0 with fast == rate (1000), so it cannot tell a front end converted
+            // at fast from one converted at rate. Changing WorkSample::measured's front_us
+            // to divide by p.rate instead of p.fast leaves all 25 stats tests passing. The
+            // live all places have fast != rate (here/low/all: 1814 vs 1498), so that
+            // regression would mis-size every converted front end there. Give a/0 a fast
+            // unlike its rate in that test, with the expected µs to match.
             if (p.fast, p.rate) != (fast.max(1), rate.max(1)) {
                 p.recalibrate(fast, rate);
                 self.dirty = true;
@@ -798,31 +748,6 @@ impl Stats {
         let mut samples: LPooled<Vec<(f64, f64)>> = LPooled::take();
         let own = self.exact.get(&unit.exact).into_iter().flat_map(|r| &r.sends).filter(|s| s.place == place);
         samples.extend(own.map(|s| at(&s.send, self.now)));
-        // XCR claude for claude: [bug/medium] The unit's own sends win whenever it has any,
-        // however old: weights only count against each other inside one median, so two
-        // sends from yesterday's network outvote 64 fresh sends of its kind, and the
-        // copy half-life never hands a unit back to the place's sends. Probe (a
-        // temporary test, `cargo test --bin rustc-dist zz_probe`): a:1 sent twice at
-        // 10 s, then 20 other units at 0.1 s three hours later (copy half-life 1 h);
-        // copy_us(a:1) = 10_000_000 µs, an unsent unit's 100_000. A laptop that changed
-        // networks prices every unit it sent by the old network until that unit is sent
-        // again, and a unit priced high isn't sent, so it stays. Past about 45 days,
-        // where 0.5^(t / 1 h) underflows, the own sends weigh exactly 0, `median` gives
-        // None, and this falls through to the 200 ms guess rather than to the place's
-        // sends. Fix: fall back by weight, not emptiness (take the place's sends when
-        // the own sends weigh less than about one fresh send), or take one median over
-        // both with the place's sends discounted. (stats-06)
-        // 2026-11-01 claude: Eric ruled (2026-11-01): fall back by weight, not emptiness
-        // (a): use the unit's own sends there only while they weigh at least half a
-        // fresh send, else the place's.
-        // 2026-11-01 claude: copy_us uses the unit's own sends only while their weights
-        // sum to at least OWN_WEIGHT (0.5, half a fresh send), and otherwise the place's
-        // sends of that kind. Those are weighed from the newest of them rather than from
-        // now. A median doesn't move when every weight scales, so that is the same answer,
-        // and it never underflows to the guess while the place has sends. Regression:
-        // a_units_own_sends_give_way_to_the_places_as_they_age, which is the probe
-        // (10_000_000 on the old code, 100_000 now). At 50 days it still gives 100_000;
-        // with weights from now it gives 200_020, the guess.
         if samples.iter().map(|(_, w)| w).sum::<f64>() < OWN_WEIGHT {
             let sends = &p.sends[usize::from(links)];
             // A median doesn't move when every weight scales, so weighing
@@ -869,27 +794,6 @@ impl Stats {
         let (places, now, half_life_s) = (&self.places, self.now, self.decay.half_life_s);
         let group = &places[place.0 as usize].group;
         if let Some(r) = self.exact.get(exact) {
-            // XCR claude for claude: [risk/medium] One run at the place, of any age, decides
-            // the prediction there: Record::size needs only some weight, so a single run,
-            // or one 15 days old at 2^-15 of a fresh run's weight, shadows fifteen fresh
-            // runs on other boxes, against DESIGN.md's "no one sample, however long, moves
-            // the middle". A run that swapped or starved (the load curve doesn't see
-            // swapping) makes the place look slow for the unit; the unit then runs
-            // elsewhere, and the sample stays until 16 newer runs push it out of
-            // runs_kept, days for a unit built daily. Same shape as (stats-06). Options:
-            // require the place's runs to weigh at least a run or two fresh before
-            // Basis::Place, or blend them with the Box and Size estimates in one median.
-            // (stats-07)
-            // 2026-11-01 claude: Eric ruled (2026-11-01): fall back by weight, as
-            // (stats-06) (a): use the unit's runs at a place only while they weigh at
-            // least half a fresh run, else its runs on the box, else its size.
-            // 2026-11-01 claude: predict_at takes Basis::Place only while the unit's runs
-            // there weigh at least OWN_WEIGHT (0.5, half a fresh run), then Basis::Box
-            // under the same rule, then Basis::Size from all its runs. Docs on predict_at
-            // and DESIGN.md's Cost section say so. Regression:
-            // a_units_runs_at_a_place_give_way_to_its_runs_on_the_box_then_its_size_as_they_age.
-            // One starved run on a/p/0 two half-lives old plus 15 fresh runs on c gives
-            // Size (Place on the old code), and two fresh runs on a/p/1 give Box.
             let enough = |s: &Size| s.runs >= OWN_WEIGHT;
             if let Some(s) = r.size(places, now, half_life_s, |s| s.place == place).filter(enough) {
                 return (known(r, &s), Basis::Place);
@@ -1002,20 +906,6 @@ impl Stats {
     pub fn rebuild_global(&mut self) {
         let now = self.now;
         let fresh = |at: f64| now - at <= KEEP_S;
-        // XCR claude for claude: [bug/low] Stale samples go but their Record never does: a
-        // unit unrun for KEEP_S keeps its key, histograms (about 46 kB in memory, see
-        // stats-03) and run counts in `exact` and `coarse`, and is saved and loaded
-        // forever. Stats::units hides it and Stats::predict skips to the coarse key, so
-        // only memory and the file grow, with every unit ever built (every metadata
-        // hash a dependency bump, feature set or profile makes). DESIGN.md's Cost
-        // section says a cell unrun for about 60 days is dropped. Fix: after the
-        // retain, remove records whose runs_kept and sends are both empty. (stats-04)
-        // 2026-11-01 claude: rebuild_global now retains each map's records only while
-        // runs_kept or sends still holds a fresh sample, so a unit unrun for KEEP_S goes
-        // with its histograms and counts. That includes rdstats4 records loaded without a
-        // seed run, which predict never used. DESIGN.md's Cost section now says a unit
-        // left with no samples goes. Regression:
-        // a_unit_whose_samples_all_went_stale_is_dropped.
         for map in [&mut self.exact, &mut self.coarse] {
             map.retain(|_, r| {
                 r.runs_kept.retain(|s| fresh(s.at));
@@ -1148,7 +1038,7 @@ impl Stats {
         Ok(stats)
     }
 
-    // XCR claude for claude: [risk/low] This pushes one RunSample per rdstats8 cell, a
+    // CR claude for claude: [risk/low] This pushes one RunSample per rdstats8 cell, a
     // place and load bucket, so a unit that ran in more than RUNS_KEPT of them loads with
     // runs_kept over the cap. `push` trims only when len == cap, so such a queue never
     // shrinks back and grows by one per run until its samples age out at KEEP_S. Not hit
@@ -1164,6 +1054,17 @@ impl Stats {
     // at 21; without the sort the oldest kept is 6 s old. Whether read_sums and
     // SUMS_MAGIC can go is Eric's call once every box has saved an rdstats9 or rdstat10
     // table.
+    // 2026-11-01 claude: push's while-trim and the oldest-first sort hold
+    // (a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_than_any_unit fails at
+    // 21 runs with the if-trim, and with the oldest kept 6 s old without the sort). The
+    // same over-the-cap problem is left in sends: read_sums pushes one UnitSend per cell,
+    // up to BUCKETS.len() (11) at one place, more than UNIT_SENDS_KEPT (8). Record::send
+    // removes only one per send, so that unit keeps 11 sends at that place for good.
+    // Probe (a temporary test in a scratch copy): an rdstats8 unit with a send in each of
+    // 11 cells at a/0, then 20 more sends to a/0, still has 11 of its own sends there,
+    // not 8. Fix: trim in Record::send with a loop (while there >= UNIT_SENDS_KEPT), or
+    // load read_sums' sends through Record::send after the sort, and extend the test to
+    // cover it.
     /// A table of decayed sums: each sum's mean becomes one sample, kept
     /// oldest first.
     fn read_sums(r: &mut impl Read, decay: Decay) -> Result<Self> {

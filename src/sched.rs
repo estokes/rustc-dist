@@ -181,23 +181,6 @@ impl Meter {
         now.saturating_duration_since(self.start).as_micros() as u64
     }
 
-    // XCR claude for claude: [bug/low] restart resets the token count but keeps every
-    // load sample taken since admission, not only the admission one the doc names:
-    // Sched::measure samples every lease from Layout::lease on. A served job's slot
-    // exists while its inputs arrive (sandbox.rs calls Slot::started only once bwrap
-    // starts), which can take tens of seconds, so its load_c is mostly the box's load
-    // while it waited, and Stats::record files the run, and the factor comparison it
-    // teaches, under that bucket. DESIGN.md says the server reports token-µs and load
-    // "counted from when rustc started". Count samples from restart on, keeping the
-    // admission load only for a job no later sample reached. (sched-05)
-    // 2026-11-01 claude: Meter::restart now clears the load sum and count as well;
-    // Meter keeps last_c, the latest sample (the admission load until one is taken),
-    // which measured() returns when no sample came after restart. I used the latest
-    // sample rather than the admission load for that case: for a served job whose
-    // inputs took 30 s it is the load nearest rustc's start, and for a local job,
-    // restarted at once, it is the admission load. DESIGN.md (Cost) says so. Test:
-    // a_job_is_measured_at_the_load_while_its_rustc_ran (fails if restart keeps the
-    // samples).
     /// Its rustc started: count tokens and load from now.
     fn restart(&self, now: Instant) {
         self.counted_us.store(self.at_us(now), Ordering::Relaxed);
@@ -926,36 +909,6 @@ struct RemoteBox {
 }
 
 impl RemoteBox {
-    // XCR claude for claude: [bug/medium] Once the published frees_in_ms has passed, this
-    // returns 0 and stays there until the box republishes, which a prediction changing
-    // alone never causes (Sched::publish). Here an overdue job is expected to run half
-    // again as long as it has (Running::left_us), so it can't strand jobs waiting for
-    // its class; nothing does that for another box. A job waiting for b keeps counting
-    // on b's token being free right now, however long b's job overruns, while tokens
-    // here sit idle, and while it waits Sched::closed refuses every offer to this box.
-    // Probe (a temporary test, since removed): the setup of
-    // a_heavy_job_waits_for_a_busy_box_that_finishes_it_sooner with b at frees_in_ms
-    // 300 (1.25 s here, 0.45 s on b once a token frees); after moving b's `seen` back
-    // 30 s and dispatching again, `cargo test probe_ -- --nocapture` printed "b's
-    // prediction 30 s overdue, still waits: true". Options: past the prediction, the
-    // client assumes at least half the overrun more; or the server republishes when its
-    // predicted frees_in moves by more than some share. (sched-02)
-    // 2026-11-01 claude: Eric ruled (2026-11-01): the server republishes when its
-    // predicted frees-in moves by more than some share (b): easy, and the correct
-    // long-term fix.
-    // 2026-11-01 claude: Per the ruling, the server side: Sched::publish republishes
-    // when a class's frees_in_ms differs from what clients have counted down to (the
-    // value shown less the time since Sched::published) by more than a quarter of the
-    // larger and at least 250 ms (frees_in_moved, FREES_IN_SHARE, FREES_IN_STEP_MS), or
-    // turns known/unknown; publish now keeps the shown classes until it sends a new
-    // version, so that baseline is what clients have. An overdue job here
-    // (Running::left_us) thus moves the published prediction later while clients count
-    // to 0. offers_are_refused_while_local_jobs_wait now expects a version when a local
-    // job starts waiting (frees_in_ms goes to None). Tests:
-    // a_box_republishes_when_its_next_token_moves_from_what_clients_count_down_to (fails
-    // if only rate, cpus and free republish) and
-    // a_prediction_is_republished_once_it_moves_a_share_and_a_step. DESIGN.md (Farm)
-    // updated. No message format changed.
     /// µs until a token of class `k`, which has none for jobs from here,
     /// is predicted to free: as its state says, or, if the tokens it shows
     /// free went to jobs from here it doesn't show yet, when the first of
@@ -1175,23 +1128,6 @@ impl Sched {
         load: watch::Sender<Load>,
         tx: mpsc::UnboundedSender<Msg>,
     ) -> Result<Self> {
-        // XCR claude for claude: [risk/medium] A table or graph that exists but fails to load
-        // (a binary rolled back to before a format change, a reader bug) is logged,
-        // replaced by an empty one, and overwritten by the next Sched::save within a
-        // minute. A rollback, which is routine here, then loses every learned size, factor
-        // curve and send history for good, and every unit places as new. Stats::load and
-        // Graph::load already treat a missing file as empty, so an Err here means a file
-        // that holds something. Move the unreadable file aside (e.g. jobs.hdr.unreadable)
-        // before starting empty, or refuse to start. (sched-04)
-        // 2026-11-01 claude: Eric ruled (2026-11-01): move the unreadable file aside with
-        // an error log and start empty (a).
-        // 2026-11-01 claude: Sched::new loads both files through load_or_set_aside: a file
-        // that exists but won't load is renamed to NAME.unreadable (NAME.unreadable.2 and on
-        // if that is taken, so a roll back and forth never overwrites one), with an error
-        // log, and the daemon starts empty; if the rename fails, Sched::new fails. DESIGN.md
-        // (Cost, Build graph) and README say so. Test:
-        // unreadable_state_is_moved_aside_before_starting_empty (fails with the rename
-        // skipped).
         let decay = setup.decay;
         let jobs = setup.state_dir.join("jobs.hdr");
         let mut stats = load_or_set_aside(&jobs, "job stats", |p| Stats::load(p, decay), || Stats::new(decay))?;
@@ -1600,7 +1536,7 @@ impl Sched {
         }
     }
 
-    // XCR claude for claude: [risk/medium] The new layout starts with every class's full
+    // CR claude for claude: [risk/medium] The new layout starts with every class's full
     // pool while the retired layouts' jobs still hold theirs on the same CPUs, and their
     // heavy jobs keep borrowing from the old pools (Event::Sample lends in every
     // layout). On a full box a switch admits a second full set of jobs at once: 16 CPUs
@@ -1626,6 +1562,23 @@ impl Sched {
     // jobs_running_at_a_switch_borrow_nothing_more_and_what_they_leave_goes_to_the_new_classes
     // covers lending after the switch and tokens given back mid-run. Both fail without
     // Layout::owe or Sched::reclaim's repaid. DESIGN.md (Calibration) updated.
+    // 2026-11-01 claude: Layout::owe, Layout::repaid and zeroing retired pools in Sched::apply
+    // hold: each of the two named tests fails with owe or repaid removed, and the second one
+    // also fails if retired pools aren't zeroed. What still fails is the new owed-class branch
+    // of Sched::frees_in_us. It counts the soonest-ending retired job for any owed class, but
+    // repaid pays overdrawn first and then the owed classes fastest first, so that job's token
+    // often doesn't reach the class. Probe (a temporary test in a copy, since removed): one
+    // class on 4 cpus at 1 token per cpu, jobs short (1 s) and three long (100 s) placed, then
+    // switch_to a calibrated battery with one class on cpu 0. Result: pool [0], owed [1],
+    // overdrawn 3, frees_in_us(0) = Some(999719). Once short finishes, overdrawn drops to 2
+    // and the class is still owed. Its first token comes back only when the third long job
+    // ends. The same goes for a slower owed class while a faster one is owed. Dispatch's
+    // frees_in for local candidates that wait and the published frees_in_ms both use this
+    // value. So in the CR's battery case (old jobs hold more than the new profile's tokens),
+    // jobs wait here for a token predicted at the next old job's end, and the prediction
+    // slides to each later end while a free box goes unused. Fix: for an owed class, predict
+    // the time when tokens back from retired jobs, taken in order of predicted end, cover
+    // overdrawn plus the owed of faster classes plus one. Add a test with overdrawn > 0.
     fn apply(&mut self, profile: Profile, classes: Vec<Class>) {
         let layout = Layout::new(&profile, classes, self.setup.tokens_per_cpu, &mut self.stats);
         let old = mem::replace(&mut self.layout, layout);
@@ -1728,11 +1681,6 @@ impl Sched {
         self.mem.capacity_kb.saturating_sub(self.mem.used_kb + self.mem_growth_kb())
     }
 
-    // XCR claude for claude: [doc-drift/low] The first two doc lines are left from an
-    // older signature (there is no `codegen_units` here); the second sentence is the
-    // doc. Delete the first. (sched-09)
-    // 2026-11-01 claude: Deleted the stale first doc sentence of Sched::local;
-    // doc-only, no test.
     /// Where a place on this box is in the cost table, whether a job there
     /// is pinned to a class, and the box's CPUs.
     fn local(&self, place: Place) -> (PlaceId, bool, u64) {
@@ -1872,27 +1820,6 @@ impl Sched {
                     }
                 }
                 (!cands.is_empty()).then(|| {
-                    // XCR claude for claude: [bug/medium] slack_us is the horizon's spare work in
-                    // calibrated µs on the fastest class idle, but every Cand's finish_us comes
-                    // from Stats::time_us, which multiplies by the place's factor at the load
-                    // now. choose compares the two, so under load the slack window shrinks by
-                    // the factor and jobs with time to spare take fast classes. Probe (a
-                    // temporary test, since removed): classes rate(1000) and rate(2000),
-                    // "big" 3000 mi and "leaf" 1000 mi in one build, placed in one dispatch.
-                    // `cargo test probe_ -- --nocapture` printed "probe-idle: load_c 0 big on
-                    // cpu 0, leaf on cpu 2" and, with runnable 16 on 4 cpus, "probe-loaded:
-                    // load_c 400 big on cpu 0, leaf on cpu 0": leaf's 2 ms of slack against
-                    // about 4.5 ms on the fast class and 9 ms on the slow one. The chain after
-                    // it runs at that load too, so its real slack is about 4.5 times as long.
-                    // Convert the slack at the fastest class's factor under load_here (e.g.
-                    // Stats::time_us of a prediction holding the spare work), and add a loaded
-                    // variant of work_that_gates_a_chain_gets_the_fast_class. (sched-01)
-                    // 2026-11-01 claude: dispatch's slack is the build's spare rank (µs idle,
-                    // see (graph-01)) times the fastest class's factor at load_here over its
-                    // factor at 0. Test:
-                    // a_job_with_time_to_spare_takes_the_slow_class_under_load_too, the CR's
-                    // probe at 0 and 16 runnable on 4 cpus; leaf takes cpu 2 in both, and cpu 0
-                    // at load 400 without the factor.
                     let idle_to_now = self.stats.factor(fastest_at, load_here) / self.stats.factor(fastest_at, 0);
                     let spare_idle_us = horizon[&w.build.pid].saturating_sub(w.build.rank_us);
                     choose(&cands, local, (spare_idle_us as f64 * idle_to_now) as u64)
@@ -1995,16 +1922,6 @@ impl Sched {
                     placed_us[class] = placed_us[class].min(run_us);
                     held[class] -= 1;
                     if held[class] == 0 {
-                        // XCR claude for claude: [doc-drift/low] DESIGN.md (Scheduling, step 5)
-                        // says a class whose last token a pass hands out "frees no sooner than
-                        // the quickest job that pass placed there", but this takes the minimum
-                        // of that and the soonest end of the jobs already holding its tokens:
-                        // it frees at whichever ends first. Reword DESIGN.md to match.
-                        // (sched-10)
-                        // 2026-11-01 claude: DESIGN.md Scheduling step 5 now says the class
-                        // frees when its first job ends: the quickest one the pass placed
-                        // there or the soonest of those already holding its tokens. Doc-only,
-                        // no test.
                         let placed = placed_us[class];
                         frees_in[class] = self.frees_in_us(class, now).map_or(placed, |t| t.min(placed));
                     }
@@ -2174,18 +2091,6 @@ impl Sched {
             .layout
             .lease(job, pinned, first, unit.codegen_units, fifo_dir, &cpus, meter.clone())
             .with_context(|| format_compact!("starting {}", unit.exact))?;
-        // XCR claude for claude: [structure/low] dispatch already estimated this job's
-        // place and run time, at load_here with the wave's earlier jobs counted, and
-        // carries both in `granted`, but admit estimates again at self.load_c, so a later
-        // job of a wave is recorded faster than dispatch judged it. That run_us is what
-        // Running::left_us, Sched::frees_in_us and the published frees_in_ms use. Pass
-        // dispatch's (run_us, at) in; only Sched::offer needs admit to estimate.
-        // (sched-08)
-        // 2026-11-01 claude: admit takes (at, run_us); dispatch passes the estimate it
-        // placed by (carried in granted), and only Sched::offer estimates, at
-        // self.load_c, before admitting. Test: a_wave_is_timed_as_dispatch_placed_it
-        // (four jobs in one wave at 2.25 to 3 tasks per cpu; fails with every run_us 2.25
-        // s if admit re-estimates).
         self.running.push(Running {
             job,
             build,
@@ -2252,22 +2157,6 @@ impl Sched {
             };
             ClassState { rate: c.rate, cpus: c.cpus.len() as u32, free, frees_in_ms }
         }));
-        // XCR claude for claude: [risk/low] While switching, the state pairs the target
-        // profile's name with the current layout's classes and rates. Every client's
-        // Sched::farm registers places under that name with those rates, and Stats::place
-        // takes a changed rate for a recalibration and starts the place over. Harmless
-        // for a profile never calibrated, but under Switch::Calibrating { next:
-        // Some((to, false)) } with `to` calibrated before, every client wipes what it
-        // learned of this box's `to` places, and again when the box applies `to`'s real
-        // rates. Publish a name and classes that belong together, or have Sched::farm
-        // skip registering places while a box takes no offers. (sched-07)
-        // 2026-11-01 claude: Eric ruled (2026-11-01): publish a name and classes that
-        // belong together: the current profile until the switch applies (a).
-        // 2026-11-01 claude: Sched::publish always publishes self.profile, the profile
-        // whose classes it publishes, until a switch applies.
-        // an_uncalibrated_profile_holds_new_jobs_until_running_ones_finish now asserts
-        // the published profile is still default while draining (and no free tokens); it
-        // fails with the target name published. DESIGN.md (Farm) says so.
         let profile = self.profile.name();
         let load_c = self.load_c;
         let since_ms = now.saturating_duration_since(self.published).as_millis() as u64;
@@ -2951,15 +2840,6 @@ mod test {
         Ok(())
     }
 
-    // XCR claude for claude: [test-gap/low] The "and a free slot" half can't fail: both
-    // submissions also miss the toolchain on "full" (one asks for key "other h", the
-    // other for target wasm32, and "full" has the same toolchains as "b"), so "full"
-    // is never judged by its tokens. Add a job "full" can build, on a harness where
-    // "full" (free 0, frees_in_ms None) is the only other box, and assert it runs
-    // here. (sched-06)
-    // 2026-11-01 claude: The test now first submits a job "full" can build, with
-    // "full" (free 0, frees_in_ms None) the only other box, and asserts it runs here;
-    // checked by making RemoteBox::frees_in_us read None as 0, which fails it.
     #[tokio::test]
     async fn remote_needs_a_matching_toolchain_and_a_free_slot() -> Result<()> {
         let h = Harness::start("nomatch", vec![class(1000, &[0, 1])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;

@@ -90,7 +90,7 @@ fn parse_key(vv: &str) -> Result<ArcStr> {
     Ok(format_compact!("{} {}", field("commit-hash: ")?, field("host: ")?).as_str().into())
 }
 
-// XCR claude for claude: [bug/high] The toolchains are read once, when the daemon joins the farm,
+// CR claude for claude: [bug/high] The toolchains are read once, when the daemon joins the farm,
 // and a toolchain is found by key but run by path (Installed::rustc). After a `rustup update` while
 // the daemon runs, this box goes on advertising the old commit (farm::Member's toolchains) and runs
 // the new rustc for jobs that ask for the old one (sandbox::take finds `tc` by the old key). Leaf
@@ -113,6 +113,18 @@ fn parse_key(vv: &str) -> Result<ArcStr> {
 // toolchain::test::toolchains_are_read_again_when_rustup_changes_them and
 // toolchain::test::the_toolchains_to_publish_follow_rustup (both fail if Toolchains::current always
 // says yes).
+// 2026-11-01 claude: Toolchains, refresh and watch hold, and both named tests fail when
+// Toolchains::current always says yes (checked). Two gaps remain. (1) The stamp is checked when the
+// job is offered and again after it runs, but not just before the sandbox starts. In between come
+// the manifest, uploading inputs (a minute or more over wifi), waiting for other jobs' uploads, and
+// building the tree. A rustup update in that window makes the new rustc run for the old key. Its
+// artifacts, including the .rmeta line cargo starts dependents on, reach the client before the
+// check after the run fails the job, so a dependent built locally can still hit E0514. Fix: check
+// tc.unchanged() in sandbox::job just before run(), and keep the check after the run. (2) No test
+// covers the server side. With toolchains.refresh() removed from Server::toolchain and the check
+// after the run turned off, all 170 tests still pass (checked). A test that runs a Server on a fake
+// rustup home and swaps its rustc between two offers would cover it; Toolchains::read is private,
+// so it needs a pub(crate) constructor.
 /// rustup's toolchains on this box, as they were when read.
 pub struct Toolchains {
     home: PathBuf,

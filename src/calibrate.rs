@@ -280,28 +280,6 @@ mod test {
         assert_eq!(group(speeds(&[(0, 1000), (1, 1050)])).len(), 1);
     }
 
-    // XCR claude for claude: [test-gap/low] In the usual debug `cargo test` this checks
-    // only ratio > 0.95, which a debug build always passes, so nothing notices
-    // RUN_INSTRUCTIONS going stale for the binary a box actually runs (a release build,
-    // here with `-C target-cpu=x86-64-v3` from ~/.cargo/config.toml). A box without
-    // counters then gets rates off by that ratio against boxes that count, which
-    // matters because calibrations are compared across the farm. Run the upper bound
-    // under `--release` somewhere routine, or say in RUN_INSTRUCTIONS's doc which
-    // build and flags 697 M was measured with. (calibrate-01)
-    // 2026-11-01 claude: Measured: a release `cargo test` here (washu-chan, Core Ultra
-    // X7 358H, rustc 1.99.1, ~/.cargo/config.toml flags) gives a run 632.87 M
-    // instructions, stable to 100 instructions over three runs, ratio 0.908 against 697
-    // M. So this release check failed, and nothing had noticed. A baseline x86-64 build
-    // (no target-cpu) gives 632.70 M, so the flags do not explain it. Neither the load
-    // nor immutable-chunkmap or arcstr changed since b8c6d96 set 697 M on 2026-10-30; a
-    // glibc update or another CPU (glibc picks memcmp by CPU features) is likelier.
-    // RUN_INSTRUCTIONS is now 633_000_000, and its doc names where and with what it was
-    // measured, says the count can move with the compiler, C library and CPU, and gives
-    // the release command that checks it. The release test passes again. DESIGN.md says
-    // 633 M. The test still only bounds above under --release, which nothing routine
-    // runs; the doc gives the command, the CR's second option. Eric: this changes the
-    // published rates of boxes without counters (and classes::fallback) by -9% on their
-    // next calibration.
     #[test]
     fn a_run_retires_about_the_fallback_count() -> Result<()> {
         let Some(c) = perf::Counter::start() else { return Ok(()) };

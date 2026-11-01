@@ -338,25 +338,6 @@ pub struct Staged {
 }
 
 impl Staged {
-    // XCR claude for claude: [bug/low] This reports every late rlib's `.rmeta` as
-    // held by the server, but sandbox::job claims `r.meta` only for rlibs the
-    // store lacks (`rlibs.iter().filter(|r| !store.has(&r.hash))`). When the
-    // server already had the rlib, it never received the rmeta, yet
-    // sched::Held::used records it as held, so a later library job that reads
-    // that `.rmeta` (Reads::Metadata) is priced as sending nothing and then
-    // sends it. Fix: have the server say what it holds (e.g. in Need or Exit),
-    // or leave out the meta of rlibs that weren't asked for. It also stats
-    // every crate file on an async worker, after the exit. (remote-03)
-    // 2026-11-01 claude: Took the CR's second option, no protocol change:
-    // Staged::crates(asked) counts a late rlib's .rmeta only when the server's
-    // Need asked for the rlib (later) or the .rmeta (now); a server that had the
-    // rlib never claimed it. That can under-report (rlib and .rmeta both coming
-    // through another job's upload), which only prices a later send a little
-    // high. Sizes now come from staging (Staged.blobs holds each blob's length),
-    // so nothing is stat'd after the exit. Test:
-    // remote::test::a_server_holds_a_late_rlibs_metadata_only_if_it_asked_for_one_of_them
-    // (fails if the meta is always counted, or if sizes come from stat: the
-    // files are removed first).
     /// The crate files among its inputs the server holds once the job has
     /// run, by hash with their size in kB. That leaves out the metadata of
     /// a late rlib unless the server `asked` for it or for the rlib: a
@@ -547,22 +528,6 @@ impl<'a> Collect<'a> {
                     if recursive && !skip {
                         stack.push(path);
                     }
-                // XCR claude for claude: [bug/low] WALK_LIMIT counts a symlink at
-                // its own size: DirEntry::metadata doesn't follow links, but the
-                // check above and Hashes::name do, so a package with a symlink to
-                // a large file is sent whole while `walked` grows by a few bytes.
-                // Use the length from the followed fs::metadata already taken one
-                // line up. Symlinked directories are never walked (file_type says
-                // symlink, the followed metadata says not a file); a test should
-                // say whether that is intended. (remote-02)
-                // 2026-11-01 claude: The walk counts the length from the followed
-                // fs::metadata it already takes. Not walking symlinked
-                // directories is kept on purpose (a link may lead anywhere, even
-                // into a cycle; dep-info still sends what rustc read through
-                // one), and the test says so. Test:
-                // remote::test::a_symlink_counts_at_its_files_size_and_a_symlinked_directory_is_not_walked
-                // (a symlink to a sparse file past WALK_LIMIT must fail the walk;
-                // it passed without the fix).
                 } else if let Ok(m) = fs::metadata(e.path())
                     && m.is_file()
                 {
@@ -790,20 +755,6 @@ pub async fn send_blob(out: &Out, staged: &Staged, hash: Hash, level: i32, sent:
     Ok(())
 }
 
-// XCR claude for claude: [bug/medium] A partly written output is never
-// removed. remote::receive returns early on any error while a file is open
-// (the link failing mid-file, Packed::unpack or write_all failing, a Failed
-// or unexpected message), and Writing has no Drop, so `<stem>.rustc-dist-<pid>`
-// stays in the user's --out-dir. Cargo never cleans unknown files there, the
-// name changes with every daemon restart, and on the lanes target dirs are on
-// a RAM-backed tmpfs, so a link that drops during a 338 MB rlib leaves 338 MB
-// of RAM used until someone notices. Fix: a Drop on Writing that removes `tmp`
-// unless the rename happened (e.g. take the path out on success). (remote-01)
-// 2026-11-01 claude: Writing now has create/write/finish and a Drop that
-// removes `tmp` unless finish renamed it (tmp is emptied then), so any early
-// return from remote::receive leaves nothing in --out-dir. Test:
-// remote::test::an_output_cut_short_leaves_nothing_behind (fails without the
-// Drop).
 /// An output arriving in chunks, written beside its destination, which it
 /// replaces once whole. Dropped before then, it is removed.
 struct Writing {

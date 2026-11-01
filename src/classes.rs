@@ -10,13 +10,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-// XCR claude for claude: [doc-drift/low] Calibration loads one thread per core, on its
-// first CPU, with the SMT siblings idle (calibrate::run), not every CPU; the siblings
-// join the class at the core's rate, about four times what each of two threads sharing
-// a core got on aieka (DESIGN.md's Calibration section). Say "with one thread on every
-// core". (classes-01)
-// 2026-11-01 claude: The Class doc now says the rate is from running the calibration
-// load with one thread on every core. Doc only; no test.
 /// CPUs of equal measured speed. `rate` is the instructions per CPU-µs
 /// each retired running the calibration load with one thread on every
 /// core.

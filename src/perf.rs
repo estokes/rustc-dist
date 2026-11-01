@@ -71,28 +71,6 @@ impl Counter {
         Some(Self(fds))
     }
 
-    // XCR claude for claude: [risk/low] A failed or short read counts as 0, and the
-    // counter sets no read_format, so a count the kernel multiplexed (another perf user
-    // holding the PMU during calibration) comes back unscaled and low with nothing to
-    // say so. calibrate::worker then computes a low class rate from it, which feeds
-    // every Place's fast and rate, or a rate of 0, which classes::load rejects on the
-    // next start. Fix: set read_format to TOTAL_TIME_ENABLED | TOTAL_TIME_RUNNING, read
-    // the three u64s, and make a short read or running < enabled an error, so
-    // calibration falls back to RUN_INSTRUCTIONS or fails loudly. (perf-01)
-    // 2026-11-01 claude: Counter sets read_format TOTAL_TIME_ENABLED |
-    // TOTAL_TIME_RUNNING and Counter::read returns Result<u64>. A failed or short read
-    // is an error. So is a sum of running time across the core types more than SHORT_NS
-    // (1 ms) under the largest enabled time. On this hybrid box (cpu_core and cpu_atom)
-    // both counters are enabled whenever the thread runs, but only the one for the core
-    // it is on runs. Pinned (calibration), the sum equals enabled exactly. Unpinned, it
-    // fell 8 to 11 us short over 6.5 s and up to about 0.1 ms on a first read, so a
-    // share of enabled time (first tried at 99%) fails at start. calibrate::worker
-    // propagates the error, so the calibration fails with the message, and
-    // Sched::calibrated logs it and uses classes::fallback unsaved. `rustc-dist
-    // calibrate --seconds 2` ran clean here. Regression:
-    // perf::test::counters_that_ran_less_than_the_thread_count_low on synthetic
-    // readings (pinned, moving and shared); counts_the_calling_thread_only reads real
-    // counters unpinned.
     /// The instructions counted since `start`. An error if a counter can't
     /// be read or the counters count low.
     pub fn read(&self) -> Result<u64> {

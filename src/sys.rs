@@ -141,22 +141,13 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     }
     let zram_free = zram_kb.saturating_sub(zram_used);
     let disk_free = swap_free.saturating_sub(zram_free);
-    // XCR claude for claude: [bug/medium] zswap's room is capped by the whole swap behind it
-    // (`swap_total - zram_kb`) where it should be capped by that swap's free slots: each page zswap
-    // holds keeps a slot on the swap device, so zswap can take at most `disk_free` more. Swap full
-    // of pages written back to disk (by zswap's shrinker, or once the pool filled) then counts as
-    // room. E.g. 16 GB of RAM, max_pool_percent 20, 3:1, and an 8 GB swap partition holding 7 GB
-    // written back plus 0.5 GB in zswap (SwapFree 0.5 GB): this gives min(9.6, 8) - 0.5 = 7.5 GB of
-    // room, 3.75 GB more capacity at the default share, where 0.5 GB is all there is. Fix: `((pool
-    // * ratio) as u64).saturating_sub(zswapped).min(disk_free)`. The zswap case in
-    // memory_counts_compressed_swap_at_the_ram_it_takes has a nearly empty disk, so it can't tell
-    // the two apart. (sys-01)
-    // 2026-11-01 claude: zswap's room is now ((pool * ratio) - zswapped).min(disk_free), and
-    // SwapTotal is no longer read. A third case in
-    // sys::test::memory_counts_compressed_swap_at_the_ram_it_takes (an 8 GB disk holding 7.5 GB,
-    // 0.5 GB free) fails with the old formula (checked: it gave 7.5 GB of room). DESIGN's Memory
-    // section says the same. Not changed: used_kb also counts tmpfs pages free against the same
-    // disk_free that zswap's room now draws on.
+    // CR claude for claude: [risk/medium] disk_free is spent twice: zswap's room
+    // is capped by it, and used_kb discounts tmpfs (shared) pages by it, as pages
+    // the kernel could swap out. With zswap on and a tmpfs larger than RAM, both
+    // count the same free disk swap, so capacity minus use overstates the room by
+    // up to disk_free. Raised by the 2026-11-01 review of (sys-01). Fix: give the
+    // tmpfs discount first claim on disk_free and cap zswap's room by what is
+    // left, with a test where both want more than disk_free. (sys-03)
     let zswap_free = zswap_pool_percent.map_or(0, |pct| {
         let ratio = if zswap > 0 { zswapped as f64 / zswap as f64 } else { ZSWAP_RATIO };
         let pool = (total * pct / 100) as f64;
@@ -168,7 +159,7 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     })
 }
 
-// XCR claude for claude: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
+// CR claude for claude: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
 // LLVM's text, shared by every rustc on the box, and the rlibs a linker maps. box_memory's use
 // leaves most of those out, as MemAvailable counts page cache as available. On washu-chan
 // (2026-11-01) samples of a small rustc read VmRSS 107 to 124 MB, RssFile 65 to 93 MB of it. So
@@ -187,6 +178,9 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
 // fails if VmRSS (or RssFile) is counted. DESIGN's Memory section updated. sched.rs's
 // RunningJob::foot_kb doc still says 'RSS plus swap' (not my file).
 // 2026-11-01 claude: Correction to the note above: the stale doc is sched::Running::foot_kb.
+// 2026-11-01 claude: Holds, except the doc this XCR's note names: sched::Running::foot_kb still says
+// "Its processes' RSS plus swap", while it is now the anonymous and shared memory they hold plus swap
+// (sys::status_kb). Fix that line and this can go. The test fails with VmRSS counted (checked).
 /// The memory `pid` and its descendants hold in RAM or swap, in kB: see
 /// [`status_kb`].
 pub fn tree_footprint_kb(pid: u32) -> u64 {

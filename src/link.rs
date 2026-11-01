@@ -96,20 +96,6 @@ impl Gate {
         self.asked.is_none() && !self.hung_up
     }
 
-    // XCR claude for claude: [dead/low] `hung_up` is never set. Gate keeps
-    // `theirs` open for its whole life, so the server itself holds the
-    // sandbox's end and try_read never returns 0. So the doc's "or for every
-    // process holding the sandbox's end to exit", and `listening`'s "and one
-    // still could", never happen. sandbox::run only gets by because its loop
-    // also ends on the exit and EOFs. Either close `theirs` in the parent once
-    // the sandbox has started (then hang-up works and the doc holds), or remove
-    // `hung_up` and fix the docs. (link-01)
-    // 2026-11-01 claude: Took the first option: Gate::new returns the sandbox's
-    // end as an OwnedFd for the caller, and sandbox::run's spawning thread
-    // drops it once bwrap has started, so the gate hears the sandbox hang up
-    // and the docs hold. Test:
-    // link::test::a_gate_hears_the_sandbox_hang_up_without_asking (times out
-    // while the parent still holds the end).
     /// Wait for a stand-in to start waiting, or for every process holding
     /// the sandbox's end to exit.
     pub async fn ask(&mut self) -> Result<()> {

@@ -101,7 +101,7 @@ fn answer(
                 Reply::Restarting => break,
                 Reply::Status(_) | Reply::Done => bail!("unexpected reply from the daemon"),
             }
-            // XCR claude for claude: [bug/medium] Once the first reply is in, the wrapper can't follow a
+            // CR claude for claude: [bug/medium] Once the first reply is in, the wrapper can't follow a
             // daemon restart. A remote job whose daemon exits while it streams (main's shutdown_timeout
             // drops the connection tasks once daemon::run returns) ends here with "the daemon went away
             // mid-job", and one that failed on another box after forwarding its rmeta line, then met a
@@ -122,6 +122,16 @@ fn answer(
             // filter_metadata, from a run here.
             // wrapper::test::a_daemon_gone_mid_job_is_asked_again_and_cargo_gets_one_rmeta_line fails
             // without the reconnect or without the filtering (checked both).
+            // 2026-11-01 claude: Not yet: wrapper::answer asks again with no bound. A daemon that loses
+            // the connection after its first reply every time (a panic in its connection task on this
+            // job, a crash loop) makes the wrapper ask again forever, at full speed and with no word to
+            // cargo: client::follow's give-up never sees these losses, as open got a reply, and the
+            // inner break skips RETRY. Before the fix cargo failed loudly. Probe (scratch copy): a
+            // request that returns one Output and hangs up, given to answer, was asked 1001 times in
+            // 0.01 s, until the probe's request bailed. Wanted: a pause before asking again, and a
+            // bound, e.g. give up after a few reruns that followed a reply (each one redoes the job),
+            // saying so on stderr. A test with daemons() that always lose the job after its first reply
+            // would pin it.
             reply = match protocol::recv(&mut sock, buf) {
                 Ok(reply) => reply,
                 Err(e) if e.downcast_ref::<io::Error>().is_some() => break,

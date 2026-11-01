@@ -287,7 +287,7 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
                     let _ = tx.send(Msg::Farm { name, state });
                 }
             }
-            // XCR claude for claude: [bug/high] A resolver error ends the farm for good.
+            // CR claude for claude: [bug/high] A resolver error ends the farm for good.
             // check_changed and list return Err once netidx's read client gives up on the resolver
             // (four tries with random waits of 1 to 12 s), and `?` ends run: this box's state
             // columns are unpublished as `cells` drops, it stops watching the others, and it stays
@@ -307,6 +307,19 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
             // seconds first. Still standing: while a resolver call retries inside the tick's
             // handler, the loop neither publishes nor reads states; moving the listing into its own
             // task would fix that, left out to keep this change to error handling.
+            // 2026-11-01 claude: Not yet: the listing still runs inline in run's select loop. While
+            // the resolver is down each check_changed or list holds the loop for up to tens of
+            // seconds (netidx's four tries), and list is a tokio interval with the default
+            // MissedTickBehavior::Burst, so the missed ticks fire at once and the loop goes
+            // straight back into the resolver. For the whole outage this box neither publishes its
+            // state nor reads the others' (their updates wait in the 64-batch channel, and netidx
+            // stops reading that publisher connection while it is full), so both sides place jobs
+            // by a frozen snapshot, the harm this CR names, now until the resolver returns rather
+            // than for good. The fix's note lists this as still standing, and a partial fix stays a
+            // CR. Wanted: list in its own task (or a spawned future the select polls), so resolver
+            // trouble never holds up publishing or reading states, and Delay or Skip missed list
+            // ticks. Also untested: turning the retry back into `?` fails no test (checked); only
+            // the state: None on exit is pinned.
             _ = list.tick() => {
                 let resolver = m.subscriber.resolver();
                 let listing: Result<Option<_>> = async {
