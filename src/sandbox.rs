@@ -1,11 +1,11 @@
 use crate::{
-    blobs::{self, Claim, Coming, Hash, Hasher, Store, Upload},
+    blobs::{self, Claim, Coming, Hash, Hasher, Sending, Store, Upload, When},
     link::{self, Gate},
-    protocol::{self, Front, Ran, Unit},
+    protocol::{self, Front, Measured, Ran, Unit},
     remote::{self, ExchangeId, FileEntry, FromBox, FromServer, Late, Part, Rlib, SYSTEM, ToBox, ToServer},
     sched::{Answer, Msg, Slot},
     sys,
-    toolchain::Installed,
+    toolchain::{Installed, Toolchains},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
@@ -21,14 +21,16 @@ use netidx_protocols::{
     channel::server::session,
     pack_channel::server::{Connection, singleton_with_flags},
 };
+use parking_lot::Mutex;
+use poolshark::local::LPooled;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File},
     future::Future,
     io::{self, BufRead, BufReader, Read},
     mem,
     os::{
-        fd::{FromRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{
             fs::PermissionsExt,
             process::{CommandExt, ExitStatusExt},
@@ -45,8 +47,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
+    runtime::Handle,
     sync::{mpsc, oneshot},
-    task::{AbortHandle, JoinSet},
+    task::{self, AbortHandle, JoinSet},
     time,
 };
 
@@ -58,7 +61,8 @@ const DROPPED_ENV: &[&str] =
 pub struct Server {
     pub store: Store,
     pub jobs_dir: PathBuf,
-    pub toolchains: Vec<Installed>,
+    /// Read again whenever rustup changes them.
+    toolchains: Mutex<Toolchains>,
     pub tx: mpsc::UnboundedSender<Msg>,
     /// The stand-in linker, which waits for late rlibs.
     stand_in: PathBuf,
@@ -71,7 +75,7 @@ impl Server {
     pub fn new(
         store: Store,
         jobs_dir: PathBuf,
-        toolchains: Vec<Installed>,
+        toolchains: Toolchains,
         tx: mpsc::UnboundedSender<Msg>,
         level: i32,
     ) -> Result<Self> {
@@ -79,7 +83,16 @@ impl Server {
         fs::create_dir_all(&jobs_dir).with_context(|| format_compact!("creating {}", jobs_dir.display()))?;
         let stand_in = jobs_dir.join("linker");
         link::write_stand_in_linker(&stand_in)?;
+        let toolchains = Mutex::new(toolchains);
         Ok(Self { store, jobs_dir, toolchains, tx, stand_in, next_job: AtomicU64::new(0), level })
+    }
+
+    /// The toolchain `key` with `target`'s standard library, if this box has
+    /// it now: rustup's toolchains are read again if they changed.
+    fn toolchain(&self, key: &str, target: Option<&str>) -> Option<triomphe::Arc<Installed>> {
+        let mut toolchains = self.toolchains.lock();
+        toolchains.refresh();
+        toolchains.find(key, target).cloned()
     }
 }
 
@@ -159,7 +172,7 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
                         data.unpack()?;
                         con.send_one(&FromBox { id, msg: FromServer::Heartbeat }).await?;
                     }
-                    // CR claude for claude: [risk/medium] Each job's inbox has no
+                    // XCR claude for claude: [risk/medium] Each job's inbox has no
                     // bound, and this loop never waits on it, so nothing pushes
                     // back on the client. Its client sends late rlibs right after
                     // Run, but the job doesn't read them until its sandbox is
@@ -174,6 +187,16 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
                     // 2026-11-01 claude: Eric ruled (2026-11-01): a, with
                     // (sandbox-03): receive late uploads into the store as soon
                     // as Run arrives.
+                    // 2026-11-01 claude: Fixed with (sandbox-03): from Run on,
+                    // receive_late drains the inbox into the store as chunks
+                    // come, while the job waits for other uploads, evicts and
+                    // builds its tree, so late chunks no longer pile up in
+                    // memory; the inbox stays unbounded but is drained as fast as
+                    // the store writes. Test:
+                    // e2e_test::late_rlibs_are_stored_as_they_come_while_the_job_waits_for_another_jobs_upload
+                    // (the late rlib must reach the store while the job still
+                    // waits for another job's stalled upload; fails if the
+                    // receiver starts only after that wait).
                     ToServer::Offer { unit, key, target, class } => {
                         let (tx, inbox) = mpsc::unbounded_channel();
                         let reply = Reply { con: con.clone(), id };
@@ -210,14 +233,14 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
 async fn take(
     server: Arc<Server>,
     reply: Reply,
-    mut inbox: Inbox,
+    inbox: Inbox,
     unit: Unit,
     key: ArcStr,
     target: Option<ArcStr>,
     class: Option<u32>,
 ) {
     let run = async {
-        let Some(tc) = server.toolchains.iter().find(|t| t.toolchain.builds(&key, target.as_deref())) else {
+        let Some(tc) = task::block_in_place(|| server.toolchain(&key, target.as_deref())) else {
             bail!("no toolchain {key}");
         };
         let (answer, admitted) = oneshot::channel();
@@ -228,11 +251,14 @@ async fn take(
             return reply.send(FromServer::Busy { version }).await;
         };
         reply.send(FromServer::Accepted { version }).await?;
-        match job(&server, &reply, &mut inbox, tc, &slot).await? {
-            Some((ran, linker_waited_us)) => slot.finish(ran, linker_waited_us),
-            None => info!("{exact}, another box's job, failed here"),
+        let Exited { code, ran, linker_waited_us, measured } = job(&server, &reply, inbox, &tc, slot).await?;
+        if !tc.unchanged() {
+            bail!("rustup changed the toolchain {key} while the job ran");
         }
-        Ok(())
+        if code != 0 {
+            info!("{exact}, another box's job, failed here");
+        }
+        reply.send(FromServer::Exit { code, ran, linker_waited_us, measured }).await
     };
     if let Err(e) = run.await {
         warn!("remote job: {e:#}");
@@ -241,16 +267,19 @@ async fn take(
     }
 }
 
-/// The Ran of a successful compile, and how long its linker waited for
-/// late rlibs.
-async fn job(
-    server: &Server,
-    reply: &Reply,
-    inbox: &mut Inbox,
-    tc: &Installed,
-    slot: &Slot,
-) -> Result<Option<(Ran, u64)>> {
-    let ToServer::Manifest { files, dirs, late } = next(inbox).await? else {
+/// How a job's rustc exited: its code and run, how long its linker waited
+/// for late rlibs, and what the scheduler measured of it.
+struct Exited {
+    code: i32,
+    ran: Ran,
+    linker_waited_us: u64,
+    measured: Measured,
+}
+
+/// Run a job the box took in `slot`, and return once its rustc has exited
+/// and the late rlibs other jobs wait for are in.
+async fn job(server: &Arc<Server>, reply: &Reply, mut inbox: Inbox, tc: &Installed, slot: Slot) -> Result<Exited> {
+    let ToServer::Manifest { files, dirs, late } = next(&mut inbox).await? else {
         bail!("expected a manifest");
     };
     let rlibs = late.as_ref().map_or(&[][..], |l| &l.rlibs);
@@ -266,107 +295,145 @@ async fn job(
     // client sends, and those another job's client is already sending.
     let (mut send_now, mut send_later) = (HashMap::new(), HashMap::new());
     let (mut coming_now, mut coming_later) = (Vec::new(), Vec::new());
-    let mut claimed = HashSet::new();
-    let mut claim = |hash: Hash, send: &mut HashMap<Hash, _>, coming: &mut Vec<Coming>| {
-        if claimed.insert(hash) {
-            match store.claim(&hash) {
-                Claim::Have => (),
-                Claim::Send(s) => drop(send.insert(hash, s)),
-                Claim::Coming(c) => coming.push(c),
+    task::block_in_place(|| {
+        let mut claimed: LPooled<HashSet<Hash>> = LPooled::take();
+        let mut claim = |hash: Hash, when, send: &mut HashMap<Hash, Option<Sending>>, coming: &mut Vec<Coming>| {
+            if claimed.insert(hash) {
+                match store.claim(&hash, when) {
+                    Claim::Have => (),
+                    Claim::Send(s) => drop(send.insert(hash, Some(s))),
+                    Claim::SendToo => drop(send.insert(hash, None)),
+                    Claim::Coming(c) => coming.push(c),
+                }
             }
+        };
+        for f in &files {
+            claim(f.hash, When::Now, &mut send_now, &mut coming_now);
         }
-    };
-    for f in &files {
-        claim(f.hash, &mut send_now, &mut coming_now);
-    }
-    for r in rlibs.iter().filter(|r| !store.has(&r.hash)) {
-        claim(r.meta, &mut send_now, &mut coming_now);
-        claim(r.hash, &mut send_later, &mut coming_later);
-    }
+        for r in rlibs.iter().filter(|r| !store.has(&r.hash)) {
+            claim(r.meta, When::Now, &mut send_now, &mut coming_now);
+            claim(r.hash, When::Late, &mut send_later, &mut coming_later);
+        }
+    });
     let need = FromServer::Need { now: send_now.keys().copied().collect(), later: send_later.keys().copied().collect() };
     reply.send(need).await?;
-    let now = send_now.keys().copied().collect();
-    receive(inbox, store, now, |hash| {
-        send_now.remove(&hash);
-        Ok(())
-    })
-    .await?;
-    let ToServer::Run { args, env, cwd } = next(inbox).await? else {
+    let mut now = Uploads::new(send_now);
+    while !now.done() {
+        now.take(store, next(&mut inbox).await?)?;
+    }
+    let ToServer::Run { args, env, cwd } = next(&mut inbox).await? else {
         bail!("expected run");
     };
     check(&cwd)?;
-    // CR claude for claude: [bug/medium] A Coming waits on an upload that moves
-    // only while the sending job is alive, and late rlibs are read from the
-    // inbox only inside run's loop, i.e. while the sender's rustc runs. (1)
-    // When the job whose client sends a shared late rlib exits first, a compile
-    // error for example, run returns, its `send_later` drops the Sending, and
-    // every job waiting on that rlib fails with "never arrived", although its
-    // own client could have sent it. Each then reruns locally and the daemon
-    // sends Msg::Mismatch, so a compile error in one test can get the other
-    // tests that share its rlibs kept local until restart. (2) If X needs now a
-    // hash that is Y's late rlib, and Y needs now a hash that is X's late rlib,
-    // both wait here before starting rustc, neither reads its late chunks, and
-    // both hang, holding their slots, with no timeout on either side. That
-    // needs two lanes whose rlibs differ in having an .rmeta beside them (see
-    // remote::crate_files), so it is rare. Fix options: when a Coming fails,
-    // ask this job's own client for the blob (another Need, which changes the
-    // protocol); or keep reading a job's late uploads until they finish, even
-    // after its rustc exits, while another job waits on them; and do not wait
-    // here on a hash another job will receive only once its rustc runs.
-    // (sandbox-03)
-    // 2026-11-01 claude: Eric ruled (2026-11-01): a: receive a job's late
-    // uploads into the store from Run on, to completion even after its rustc
-    // exits while another job waits on them; when a job needs now a blob that
-    // is another job's late rlib, ask its own client for it.
-    for c in coming_now {
-        c.arrived(store).await?;
+    let later: LPooled<HashSet<Hash>> = send_later.keys().copied().chain(coming_later.iter().map(Coming::hash)).collect();
+    let sent_later = send_later.len();
+    // From Run on the client sends only late rlibs, which a task of their
+    // own receives into the store whatever the job is doing, so no chunk
+    // waits for the job, and a job that waits for one gets it even once
+    // this job's rustc has exited.
+    let (stored_tx, mut stored) = mpsc::unbounded_channel();
+    let (exited, exit) = oneshot::channel();
+    let mut receiving = JoinSet::new();
+    if send_later.is_empty() {
+        drop((inbox, stored_tx, exit));
+    } else {
+        receiving.spawn(receive_late(server.clone(), inbox, Uploads::new(send_later), stored_tx, exit));
     }
-    // CR claude for claude: [perf/medium] sandbox::job does blocking filesystem
-    // work on a tokio worker: Store::claim calls Store::has, an open plus
-    // futimens, once per input file (thousands for a graphix test);
-    // sandbox::receive writes each 1 MB chunk and decompresses it inline;
-    // Store::evict below reads and stats every blob in the store;
-    // JobDir::build makes a hard link per input; JobDir's Drop runs
-    // remove_dir_all on the whole tree. Each blocks a worker for tens of ms or
-    // more on a large job, and with many jobs at once they block the serve
-    // loops and other jobs' sends. Move them to spawn_blocking or
-    // block_in_place, as daemon::run_remote does for remote::stage.
-    // (sandbox-04)
-    store.evict();
-    let n = server.next_job.fetch_add(1, Ordering::Relaxed);
-    let root = JobDir(server.jobs_dir.join(format_compact!("{n}").as_str()));
-    let later: HashSet<Hash> = send_later.keys().copied().chain(coming_later.iter().map(Coming::hash)).collect();
-    root.build(store, &files, rlibs, &later, &dirs, &cwd)?;
-    let tops: BTreeSet<&str> = files
-        .iter()
-        .map(|f| &f.path)
-        .chain(rlibs.iter().map(|r| &r.path))
-        .chain(&dirs)
-        .chain([&cwd])
-        .filter_map(|p| p.split('/').nth(1))
-        .collect();
-    let linker = late.as_ref().map(|l| &l.linker).filter(|_| !later.is_empty());
-    let mut cmd = sandbox(&root.0, &tops, tc, &slot.grant.jobserver, &env, &cwd)?;
-    if let Some(linker) = linker {
-        cmd.arg("--ro-bind").arg(&server.stand_in).arg(format_compact!("{}/{linker}", link::BIN).as_str());
-        let path = format_compact!("{}:{PATH}", link::BIN);
-        cmd.args(["--setenv", "PATH", path.as_str()]);
-    }
-    cmd.arg("--").arg(tc.rustc()).args(args.iter().map(|a| a.as_str()));
-    let place = |hash: Hash| {
-        for r in rlibs.iter().filter(|r| r.hash == hash) {
-            blobs::replace(store, &hash, &root.at(&r.path))?;
+    let work = async {
+        // XCR claude for claude: [bug/medium] A Coming waits on an upload that moves
+        // only while the sending job is alive, and late rlibs are read from the
+        // inbox only inside run's loop, i.e. while the sender's rustc runs. (1)
+        // When the job whose client sends a shared late rlib exits first, a compile
+        // error for example, run returns, its `send_later` drops the Sending, and
+        // every job waiting on that rlib fails with "never arrived", although its
+        // own client could have sent it. Each then reruns locally and the daemon
+        // sends Msg::Mismatch, so a compile error in one test can get the other
+        // tests that share its rlibs kept local until restart. (2) If X needs now a
+        // hash that is Y's late rlib, and Y needs now a hash that is X's late rlib,
+        // both wait here before starting rustc, neither reads its late chunks, and
+        // both hang, holding their slots, with no timeout on either side. That
+        // needs two lanes whose rlibs differ in having an .rmeta beside them (see
+        // remote::crate_files), so it is rare. Fix options: when a Coming fails,
+        // ask this job's own client for the blob (another Need, which changes the
+        // protocol); or keep reading a job's late uploads until they finish, even
+        // after its rustc exits, while another job waits on them; and do not wait
+        // here on a hash another job will receive only once its rustc runs.
+        // (sandbox-03)
+        // 2026-11-01 claude: Eric ruled (2026-11-01): a: receive a job's late
+        // uploads into the store from Run on, to completion even after its rustc
+        // exits while another job waits on them; when a job needs now a blob that
+        // is another job's late rlib, ask its own client for it.
+        // 2026-11-01 claude: Per the ruling, with no message added: after Run a
+        // task of its own (sandbox::receive_late, holding the inbox) receives the
+        // job's late rlibs into the store whatever the job does, and tells the job
+        // of each through a channel; the job's rustc exiting (or the job failing
+        // after Run) makes it give up only uploads nobody waits for
+        // (Sending::release, checked under the arriving lock), and the job sends
+        // Exit/Failed only once the awaited ones are in, which keeps the client
+        // sending until then. The ask-its-own-client half needs no mid-job message:
+        // Store::claim now records whether an upload is late (When), and a job that
+        // needs now a blob that is another job's late rlib gets Claim::SendToo, so
+        // that blob goes in its first Need.now. Both halves also end the deadlock
+        // in (2). Tests:
+        // e2e_test::a_late_rlib_comes_through_another_jobs_upload_even_when_that_job_fails_first
+        // (fails if release ignores waiters),
+        // e2e_test::a_job_that_needs_another_jobs_late_rlib_before_rustc_starts_has_its_own_client_send_it
+        // (fails without SendToo),
+        // blobs::test::a_blob_needed_now_is_sent_again_rather_than_waited_for_as_another_jobs_late_rlib.
+        for c in coming_now {
+            c.arrived(store).await?;
         }
-        Ok::<_, anyhow::Error>(())
-    };
-    let late = match linker {
-        None => None,
-        Some(_) => {
-            let sent = send_later.keys().copied().collect();
-            let sent = receive(inbox, store, sent, |hash| {
-                send_later.remove(&hash);
-                place(hash)
-            });
+        // XCR claude for claude: [perf/medium] sandbox::job does blocking filesystem
+        // work on a tokio worker: Store::claim calls Store::has, an open plus
+        // futimens, once per input file (thousands for a graphix test);
+        // sandbox::receive writes each 1 MB chunk and decompresses it inline;
+        // Store::evict below reads and stats every blob in the store;
+        // JobDir::build makes a hard link per input; JobDir's Drop runs
+        // remove_dir_all on the whole tree. Each blocks a worker for tens of ms or
+        // more on a large job, and with many jobs at once they block the serve
+        // loops and other jobs' sends. Move them to spawn_blocking or
+        // block_in_place, as daemon::run_remote does for remote::stage.
+        // (sandbox-04)
+        // 2026-11-01 claude: Claims, chunk writes and stores (Uploads::take), evict
+        // and JobDir::build run under block_in_place; JobDir's Drop removes the
+        // tree on spawn_blocking (inline only outside a runtime), and the toolchain
+        // check in take is under block_in_place too. No test: which thread runs the
+        // work isn't observable here; the e2e tests cover that the moved work still
+        // happens.
+        task::block_in_place(|| store.evict());
+        let n = server.next_job.fetch_add(1, Ordering::Relaxed);
+        let root = JobDir(server.jobs_dir.join(format_compact!("{n}").as_str()));
+        task::block_in_place(|| root.build(store, &files, rlibs, &later, &dirs, &cwd))?;
+        let tops: BTreeSet<&str> = files
+            .iter()
+            .map(|f| &f.path)
+            .chain(rlibs.iter().map(|r| &r.path))
+            .chain(&dirs)
+            .chain([&cwd])
+            .filter_map(|p| p.split('/').nth(1))
+            .collect();
+        let linker = late.as_ref().map(|l| &l.linker).filter(|_| !later.is_empty());
+        let mut cmd = sandbox(&root.0, &tops, tc, &slot.grant.jobserver, &env, &cwd)?;
+        if let Some(linker) = linker {
+            cmd.arg("--ro-bind").arg(&server.stand_in).arg(format_compact!("{}/{linker}", link::BIN).as_str());
+            let path = format_compact!("{}:{PATH}", link::BIN);
+            cmd.args(["--setenv", "PATH", path.as_str()]);
+        }
+        cmd.arg("--").arg(tc.rustc()).args(args.iter().map(|a| a.as_str()));
+        let place = |hash: Hash| {
+            for r in rlibs.iter().filter(|r| r.hash == hash) {
+                blobs::replace(store, &hash, &root.at(&r.path))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let arrive = linker.map(|_| async {
+            let sent = async {
+                for _ in 0..sent_later {
+                    let hash = stored.recv().await.context("the late rlibs stopped coming")??;
+                    place(hash)?;
+                }
+                Ok(())
+            };
             let others = async {
                 for c in coming_later {
                     let hash = c.hash();
@@ -375,40 +442,112 @@ async fn job(
                 }
                 Ok(())
             };
-            Some((Gate::new()?, async { futures::try_join!(sent, others).map(|_| ()) }))
-        }
+            futures::try_join!(sent, others).map(|_| ())
+        });
+        run(reply, store, cmd, &root.0, slot, arrive, server.level).await
     };
-    run(reply, store, cmd, &root.0, slot, late, server.level).await
-}
-
-/// Receive chunks until every blob in `need` is stored, telling `stored`
-/// of each as it is.
-async fn receive(
-    inbox: &mut Inbox,
-    store: &Store,
-    mut need: HashSet<Hash>,
-    mut stored: impl FnMut(Hash) -> Result<()>,
-) -> Result<()> {
-    let mut uploads: HashMap<Hash, Upload> = HashMap::new();
-    while !need.is_empty() {
-        let ToServer::Chunk { hash, data, last } = next(inbox).await? else {
-            bail!("expected a chunk");
-        };
-        if !need.contains(&hash) {
-            bail!("unrequested blob {hash}");
-        }
-        let up = match uploads.entry(hash) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(store.upload(hash)?),
-        };
-        up.write(&data.unpack()?)?;
-        if last {
-            uploads.remove(&hash).expect("present").finish(store)?;
-            need.remove(&hash);
-            stored(hash)?;
+    let worked = work.await;
+    let _ = exited.send(());
+    while let Some(r) = stored.recv().await {
+        if let Err(e) = r {
+            info!("a late rlib another job waited for: {e:#}");
         }
     }
-    Ok(())
+    worked
+}
+
+/// Blobs a job's client sends, each stored once its last chunk is in.
+struct Uploads {
+    /// Each blob still to come: the guard jobs waiting for it wait on, none
+    /// when another job's client sends it too, and its upload once begun.
+    blobs: HashMap<Hash, (Option<Sending>, Option<Upload>)>,
+    /// Blobs given up, whose chunks are dropped.
+    released: HashSet<Hash>,
+}
+
+impl Uploads {
+    fn new(sends: HashMap<Hash, Option<Sending>>) -> Self {
+        Self { blobs: sends.into_iter().map(|(h, s)| (h, (s, None))).collect(), released: HashSet::new() }
+    }
+
+    fn done(&self) -> bool {
+        self.blobs.is_empty()
+    }
+
+    /// Write a chunk the client sent; the blob's hash once it is stored.
+    fn take(&mut self, store: &Store, msg: ToServer) -> Result<Option<Hash>> {
+        let ToServer::Chunk { hash, data, last } = msg else {
+            bail!("expected a chunk");
+        };
+        let Some((_, up)) = self.blobs.get_mut(&hash) else {
+            if self.released.contains(&hash) {
+                return Ok(None);
+            }
+            bail!("unrequested blob {hash}");
+        };
+        task::block_in_place(|| {
+            let up = match up {
+                Some(up) => up,
+                None => up.insert(store.upload(hash)?),
+            };
+            up.write(&data.unpack()?).context("writing a blob")
+        })?;
+        if !last {
+            return Ok(None);
+        }
+        let (sending, up) = self.blobs.remove(&hash).expect("present");
+        task::block_in_place(|| up.expect("written").finish(store))?;
+        // Jobs waiting for it find it stored.
+        drop(sending);
+        Ok(Some(hash))
+    }
+
+    /// Give up each blob no other job waits for.
+    fn release_unawaited(&mut self) {
+        let released = &mut self.released;
+        self.blobs.retain(|hash, (sending, _)| {
+            let keep = sending.as_ref().is_some_and(|s| !s.release());
+            if !keep {
+                released.insert(*hash);
+            }
+            keep
+        });
+    }
+}
+
+/// Receive late rlibs into the store until each is in, telling `stored`
+/// of each, or of why it stopped. Once `exit` fires or drops, only those
+/// another job waits for.
+async fn receive_late(
+    server: Arc<Server>,
+    mut inbox: Inbox,
+    mut uploads: Uploads,
+    stored: mpsc::UnboundedSender<Result<Hash>>,
+    mut exit: oneshot::Receiver<()>,
+) {
+    let mut exited = false;
+    let received = async {
+        while !uploads.done() {
+            tokio::select! {
+                _ = &mut exit, if !exited => {
+                    exited = true;
+                    uploads.release_unawaited();
+                }
+                msg = next(&mut inbox) => {
+                    if let Some(hash) = uploads.take(&server.store, msg?)? {
+                        let _ = stored.send(Ok(hash));
+                    }
+                    if exited {
+                        uploads.release_unawaited();
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    if let Err(e) = received.await {
+        let _ = stored.send(Err(e));
+    }
 }
 
 /// A program name the stand-in linker may take: a file name.
@@ -471,7 +610,11 @@ impl JobDir {
 
 impl Drop for JobDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let dir = mem::take(&mut self.0);
+        match Handle::try_current() {
+            Ok(rt) => drop(rt.spawn_blocking(move || fs::remove_dir_all(dir))),
+            Err(_) => drop(fs::remove_dir_all(dir)),
+        }
     }
 }
 
@@ -534,35 +677,49 @@ enum Ev {
     Exit(ExitStatus, libc::rusage, Instant),
 }
 
-/// Kills the sandbox if the job is abandoned. A pidfd can't hit a reused
-/// pid.
-struct Kill(Option<OwnedFd>);
+/// Kills the sandbox when dropped, which does nothing once it has been
+/// reaped: a pidfd can't hit a reused pid.
+struct Kill(OwnedFd);
 
-impl Drop for Kill {
-    fn drop(&mut self) {
-        if let Some(fd) = &self.0 {
-            use std::os::fd::AsRawFd;
-            unsafe {
-                libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<()>(), 0)
-            };
+impl Kill {
+    fn open(pid: libc::pid_t) -> Result<Self> {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error()).context("opening a pidfd for the sandbox");
         }
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd as i32) }))
     }
 }
 
-/// With `late`, a future stores late rlibs, and the gate holds the
+impl Drop for Kill {
+    fn drop(&mut self) {
+        unsafe {
+            libc::syscall(libc::SYS_pidfd_send_signal, self.0.as_raw_fd(), libc::SIGKILL, std::ptr::null::<()>(), 0)
+        };
+    }
+}
+
+/// The sandbox's pid, what kills it, and its stdout and stderr.
+type Spawned = (libc::pid_t, Kill, (Option<std::process::ChildStdout>, Option<std::process::ChildStderr>));
+
+/// Run the sandbox in `slot`, which it gives back once rustc exits. With
+/// `arrive`, a future that puts late rlibs in place, a gate holds the
 /// linker until it has.
 async fn run(
     reply: &Reply,
     store: &Store,
     mut cmd: Command,
     root: &Path,
-    slot: &Slot,
-    late: Option<(Gate, impl Future<Output = Result<()>>)>,
+    slot: Slot,
+    arrive: Option<impl Future<Output = Result<()>>>,
     level: i32,
-) -> Result<Option<(Ran, u64)>> {
-    let (mut gate, arrive) = late.unzip();
+) -> Result<Exited> {
+    let (mut gate, theirs) = match &arrive {
+        Some(_) => Gate::new().map(|(gate, theirs)| (Some(gate), Some(theirs)))?,
+        None => (None, None),
+    };
     let cpus = slot.grant.cpus.clone();
-    let gate_fd = gate.as_ref().map(Gate::fd);
+    let gate_fd = theirs.as_ref().map(|t| t.as_raw_fd());
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     unsafe {
         cmd.pre_exec(move || {
@@ -572,30 +729,43 @@ async fn run(
     }
     let start = Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (spawned_tx, spawned) = oneshot::channel();
+    let (spawned_tx, spawned) = oneshot::channel::<Result<Spawned>>();
     // A thread of its own starts the sandbox and waits for it, for its
     // resource use.
     let xtx = tx.clone();
     thread::spawn(move || {
-        let mut child = match cmd.spawn() {
+        let child = cmd.spawn();
+        // The sandbox holds its end of the gate now; the gate hears it hang up.
+        drop(theirs);
+        let mut child = match child {
             Ok(child) => child,
             Err(e) => {
-                let _ = spawned_tx.send(Err(e));
+                let _ = spawned_tx.send(Err(anyhow::Error::from(e).context("starting bwrap")));
                 return;
             }
         };
         let pid = child.id() as libc::pid_t;
+        let kill = match Kill::open(pid) {
+            Ok(kill) => kill,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = spawned_tx.send(Err(e));
+                return;
+            }
+        };
         let pipes = (child.stdout.take(), child.stderr.take());
         // wait4 reaps it; the Child must not try.
         mem::forget(child);
-        let _ = spawned_tx.send(Ok((pid, pipes)));
+        // A job dropped meanwhile drops the Kill here, which stops the sandbox.
+        let _ = spawned_tx.send(Ok((pid, kill, pipes)));
         let mut status = 0;
         let mut ru: libc::rusage = unsafe { mem::zeroed() };
         if unsafe { libc::wait4(pid, &mut status, 0, &mut ru) } == pid {
             let _ = xtx.send(Ev::Exit(ExitStatus::from_raw(status), ru, Instant::now()));
         }
     });
-    // CR claude for claude: [risk/low] There are two ways a dropped job's
+    // XCR claude for claude: [risk/low] There are two ways a dropped job's
     // sandbox can keep running with no one killing it, and neither is logged.
     // pidfd_open failing leaves Kill(None). And Kill is armed only once
     // `spawned` resolves, so a job aborted (Stop, channel closed) between
@@ -603,10 +773,17 @@ async fn run(
     // slot already given back. Fail the job when pidfd_open fails, and open the
     // pidfd on the spawning thread so the Kill exists before the task can be
     // dropped. (sandbox-06)
-    let (pid, (stdout, stderr)) = spawned.await?.context("starting bwrap")?;
+    // 2026-11-01 claude: The thread that spawns bwrap opens the pidfd at once
+    // and sends Kill(OwnedFd) with the pid and pipes; if the job is gone the
+    // send fails and the Kill drops there, killing the sandbox. A pidfd_open
+    // failure kills and reaps the child and fails the job. Kill is no longer an
+    // Option or disarmed: once reaped, its SIGKILL does nothing. The thread
+    // also closes the gate's sandbox end after spawning (link-01). No test for
+    // the race itself;
+    // e2e_test::a_running_sandbox_is_killed_when_its_client_drops_the_job_or_the_channel_fails
+    // fails if Kill doesn't kill.
+    let (pid, _kill, (stdout, stderr)) = spawned.await.context("the sandbox's thread died")??;
     slot.started(pid as u32);
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    let mut kill = Kill((pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as i32) }));
     let stderr = stderr.context("stderr")?;
     let etx = tx.clone();
     thread::spawn(move || {
@@ -660,15 +837,17 @@ async fn run(
                 if gate.as_ref().is_some_and(Gate::listening) => asked?,
         }
     }
-    kill.0 = None;
     let (status, ru, exited) = exit.expect("loop ends with an exit");
     let wall_us = exited.saturating_duration_since(start).as_micros() as u64;
     let ran = Ran { wall_us, maxrss_kb: ru.ru_maxrss as u64, front };
     let code = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     debug!("sandbox exited {code}");
     let linker_waited_us = gate.map_or(0, |g| g.waited_us());
-    reply.send(FromServer::Exit { code, ran, linker_waited_us, measured: slot.measured() }).await?;
-    Ok((code == 0).then_some((ran, linker_waited_us)))
+    let measured = slot.measured();
+    if code == 0 {
+        slot.finish(ran, linker_waited_us);
+    }
+    Ok(Exited { code, ran, linker_waited_us, measured })
 }
 
 /// Send the file an artifact line names, before the line. A crate file

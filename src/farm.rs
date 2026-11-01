@@ -7,7 +7,11 @@
 //! - `BASE/vN/api/NAME/jobs`: where a box takes remote jobs.
 //! - `BASE/vN/units/NAME/UNIT/COLUMN`: the units a box has run.
 
-use crate::{protocol::PROTOCOL, sched::Msg, toolchain::Toolchain};
+use crate::{
+    protocol::PROTOCOL,
+    sched::Msg,
+    toolchain::{self, Toolchain},
+};
 use anyhow::{Result, bail};
 use compact_str::format_compact;
 use arcstr::ArcStr;
@@ -206,10 +210,12 @@ impl Watched {
 /// Publish this box's state and tell the scheduler about every other
 /// box's.
 pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::UnboundedSender<Msg>) -> Result<()> {
-    let state = |load: &Load| BoxState {
+    let mut toolchains = toolchain::watch(m.toolchains.clone());
+    let mut watching = true;
+    let state = |load: &Load, toolchains: &[Toolchain]| BoxState {
         profile: load.profile.clone(),
         version: load.version,
-        toolchains: m.toolchains.clone(),
+        toolchains: toolchains.to_vec(),
         cache_gb: m.cache_gb,
         load_c: load.load_c,
         classes: load.classes.clone(),
@@ -217,7 +223,7 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
     let row = status_path(&m.base, &m.name);
     let mut cells = STATE
         .iter()
-        .zip(state(&load.borrow_and_update()).columns())
+        .zip(state(&load.borrow_and_update(), &toolchains.borrow_and_update()).columns())
         .map(|(col, v)| Cell::publish(&m.publisher, row.append(col), v))
         .collect::<Result<Vec<_>>>()?;
     info!("publishing {row}");
@@ -238,10 +244,18 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
                 }
                 changed = true;
             }
+            r = toolchains.changed(), if watching => {
+                watching = r.is_ok();
+                if !watching {
+                    warn!("no longer watching rustup's toolchains");
+                }
+                changed |= watching;
+            }
             _ = publish.tick(), if changed => {
                 changed = false;
                 let mut batch = m.publisher.start_batch();
-                for (cell, v) in cells.iter_mut().zip(state(&load.borrow_and_update()).columns()) {
+                let state = state(&load.borrow_and_update(), &toolchains.borrow_and_update());
+                for (cell, v) in cells.iter_mut().zip(state.columns()) {
                     cell.set(&mut batch, v);
                 }
                 batch.commit(None).await;

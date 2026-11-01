@@ -314,33 +314,76 @@ pub struct Store {
     /// under the cap, until a pin drops; 0 if none did. Until a pin drops or
     /// more is stored, another pass could free no more.
     stuck: AtomicU64,
-    /// Blobs a job's client is sending, which other jobs wait for rather
-    /// than ask their own clients for: each one's receiver, whose sender
-    /// goes when the upload ends, stored or not.
-    arriving: Mutex<HashMap<Hash, watch::Receiver<()>>>,
+    arriving: Arriving,
+    next_upload: AtomicU64,
 }
 
+/// When a job reads a blob: before its rustc starts, or, a late rlib, only
+/// once its linker runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    Now,
+    Late,
+}
+
+/// A blob a job's client is sending, which other jobs wait for rather than
+/// ask their own clients for.
+struct Arrival {
+    /// Which upload it is, so only its own guard removes it.
+    upload: u64,
+    when: When,
+    /// Its sender goes when the upload ends, stored or not.
+    done: watch::Receiver<()>,
+}
+
+type Arriving = triomphe::Arc<Mutex<HashMap<Hash, Arrival>>>;
+
 /// Where a job gets a blob it reads.
-pub enum Claim<'a> {
+pub enum Claim {
     /// The store has it.
     Have,
     /// No job is sending it: the job's own client must, and other jobs wait
     /// for it until the guard drops.
-    Send(Sending<'a>),
+    Send(Sending),
+    /// The job needs it now, and another job's client sends it late, after
+    /// that job's own inputs: the job's own client sends it too.
+    SendToo,
     /// Another job's client is sending it.
     Coming(Coming),
 }
 
 /// A blob this job's client sends, which other jobs wait for.
-pub struct Sending<'a> {
-    store: &'a Store,
+pub struct Sending {
+    arriving: Arriving,
     hash: Hash,
-    _done: watch::Sender<()>,
+    upload: u64,
+    done: watch::Sender<()>,
 }
 
-impl Drop for Sending<'_> {
+impl Sending {
+    fn unlist(&self, arriving: &mut HashMap<Hash, Arrival>) {
+        if arriving.get(&self.hash).is_some_and(|a| a.upload == self.upload) {
+            arriving.remove(&self.hash);
+        }
+    }
+
+    /// Stop offering the blob to jobs that claim it later, unless a job
+    /// waits for it already; whether it stopped.
+    pub fn release(&self) -> bool {
+        let mut arriving = self.arriving.lock();
+        // Claims clone the store's receiver under this lock: past it, each
+        // receiver is a job waiting.
+        if self.done.receiver_count() > 1 {
+            return false;
+        }
+        self.unlist(&mut arriving);
+        true
+    }
+}
+
+impl Drop for Sending {
     fn drop(&mut self) {
-        self.store.arriving.lock().remove(&self.hash);
+        self.unlist(&mut self.arriving.lock());
     }
 }
 
@@ -379,7 +422,8 @@ impl Store {
             next_tmp: AtomicU64::new(0),
             pinned: Mutex::new(HashMap::new()),
             stuck: AtomicU64::new(0),
-            arriving: Mutex::new(HashMap::new()),
+            arriving: Arriving::default(),
+            next_upload: AtomicU64::new(0),
         })
     }
 
@@ -404,22 +448,26 @@ impl Store {
     // sentence about has. Move it down to has. (blobs-03)
     // 2026-11-01 claude: Moved the line to Store::has; claim's doc is now just
     // its own sentence. Doc only, no test.
-    /// Where a job gets the blob `h`: see `Claim`.
-    pub fn claim(&self, h: &Hash) -> Claim<'_> {
+    /// Where a job that reads the blob `h` `when` gets it: see `Claim`.
+    pub fn claim(&self, h: &Hash, when: When) -> Claim {
         if self.has(h) {
             return Claim::Have;
         }
         let mut arriving = self.arriving.lock();
-        if let Some(done) = arriving.get(h) {
-            return Claim::Coming(Coming { hash: *h, done: done.clone() });
+        if let Some(a) = arriving.get(h) {
+            return match (when, a.when) {
+                (When::Now, When::Late) => Claim::SendToo,
+                _ => Claim::Coming(Coming { hash: *h, done: a.done.clone() }),
+            };
         }
         // An upload may have ended between the two looks.
         if self.has(h) {
             return Claim::Have;
         }
-        let (tx, rx) = watch::channel(());
-        arriving.insert(*h, rx);
-        Claim::Send(Sending { store: self, hash: *h, _done: tx })
+        let (done, rx) = watch::channel(());
+        let upload = self.next_upload.fetch_add(1, Ordering::Relaxed);
+        arriving.insert(*h, Arrival { upload, when, done: rx });
+        Claim::Send(Sending { arriving: self.arriving.clone(), hash: *h, upload, done })
     }
 
     /// Whether the blob is present, marking it used.
@@ -780,6 +828,26 @@ mod test {
         assert_eq!(stored.iter().map(|h| store.path(h).exists()).collect::<Vec<_>>(), [false, true, true, true]);
         assert_eq!(store.used.load(Ordering::Relaxed), 27);
         assert!(store.pinned.lock().is_empty());
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_blob_needed_now_is_sent_again_rather_than_waited_for_as_another_jobs_late_rlib() -> Result<()> {
+        let dir = scratch("claims");
+        let store = Store::open(dir.join("store"), 1 << 20)?;
+        let h = Hash::of(b"an rlib");
+        let Claim::Send(late) = store.claim(&h, When::Late) else { panic!("nobody sends it") };
+        assert!(matches!(store.claim(&h, When::Now), Claim::SendToo), "needed now, so not waited for");
+        let Claim::Coming(waiting) = store.claim(&h, When::Late) else { panic!("needed late, so waited for") };
+        assert!(!late.release(), "a job waits for it");
+        drop(waiting);
+        assert!(late.release(), "nobody waits for it");
+        let Claim::Send(again) = store.claim(&h, When::Now) else { panic!("released, so sent again") };
+        drop(late);
+        assert!(matches!(store.claim(&h, When::Late), Claim::Coming(_)), "the old guard leaves the new upload listed");
+        drop(again);
+        assert!(matches!(store.claim(&h, When::Late), Claim::Send(_)));
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
