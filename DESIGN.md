@@ -228,9 +228,11 @@ load: one value per bucket at 0, ¼, ½, ¾, 1, 1½, 2, 3, 4, 6 and 8 runnable
 tasks per CPU, interpolated between them and growing with load past the last.
 
 A box's load is its runnable tasks per CPU (`procs_running` in `/proc/stat`),
-sampled every 250 ms, so test binaries and other work the daemon doesn't run
-count. A run's load is the mean of the samples while it ran. Boxes publish
-their load.
+so test binaries and other work the daemon doesn't run count. The count swings
+from one moment to the next, so it is sampled every 250 ms into a moving
+average in which a sample counts `1/e` as much after 10 s, and placement,
+publishing and the samples a run takes all use the average. A run's load is
+the mean of the average while it ran. Boxes publish their load.
 
 A unit's size is the work it takes, in millions of the calibration load's
 instructions: its front end, the compile up to rustc's `.rmeta` line, which
@@ -953,6 +955,7 @@ Every number below is a guess. None has been tested on an idle box.
 | sent runs count half toward time moving files after | 1 hour | `copy_half_life_s` in the config |
 | load buckets, runnable tasks per CPU | 0, ¼, ½, ¾, 1, 1½, 2, 3, 4, 6, 8 | `src/stats.rs` `BUCKETS` |
 | republish load alone once it moves | ¼ task per CPU | `src/sched.rs` `LOAD_STEP_C` |
+| a load sample counts `1/e` as much after | 10 s | `src/sched.rs` `LOAD_TAU` |
 | share of compressed swap predicted peaks may use beyond RAM | 50% | `src/config.rs` `compressed_swap_share` |
 | zswap compression ratio before it has stored anything | 3:1 | `src/sys.rs` `ZSWAP_RATIO` |
 | sample memory and job footprints every | 250 ms | `src/sched.rs` `MEASURE` |

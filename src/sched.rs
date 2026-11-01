@@ -74,6 +74,10 @@ const LIGHT_WIDTH_C: u64 = 150;
 /// A change in load this large, in hundredths of a task per CPU, is
 /// published even if nothing else changed.
 const LOAD_STEP_C: u32 = 25;
+/// A sample of the box's runnable tasks counts `1/e` as much after this
+/// long: long enough that one sample doesn't swing placement, short
+/// enough to follow test runs starting and stopping.
+const LOAD_TAU: Duration = Duration::from_secs(10);
 
 atomic_id!(LayoutId);
 atomic_id!(JobId);
@@ -800,6 +804,30 @@ fn adds_c(threads: f64, cpus: u64) -> u32 {
     (threads * 100. / cpus.max(1) as f64).round() as u32
 }
 
+/// An average of samples in which each counts `1/e` as much after `tau`.
+struct Ewma {
+    tau: Duration,
+    value: f64,
+    at: Option<Instant>,
+}
+
+impl Ewma {
+    fn new(tau: Duration) -> Self {
+        Self { tau, value: 0., at: None }
+    }
+
+    fn add(&mut self, x: f64, now: Instant) {
+        self.value = match self.at {
+            None => x,
+            Some(at) => {
+                let a = 1. - (-now.saturating_duration_since(at).as_secs_f64() / self.tau.as_secs_f64()).exp();
+                self.value + a * (x - self.value)
+            }
+        };
+        self.at = Some(now);
+    }
+}
+
 /// Where a job runs in the cost table, the threads it gets there, and the
 /// load it adds, in hundredths of a task per CPU.
 #[derive(Clone, Copy)]
@@ -842,7 +870,9 @@ pub struct Sched {
     /// The box's memory at the last sample, less the footprints of jobs
     /// that finished since.
     mem: BoxMemory,
-    /// Runnable tasks per CPU at the last sample, in hundredths.
+    /// Runnable tasks per CPU, in hundredths: their average over the
+    /// samples, and that rounded, which decisions use.
+    runnable: Ewma,
     load_c: u32,
     measured: Option<Instant>,
     queue: Vec<Waiting>,
@@ -894,6 +924,7 @@ impl Sched {
             switch,
             running: Vec::new(),
             mem: BoxMemory::default(),
+            runnable: Ewma::new(LOAD_TAU),
             load_c: 0,
             measured: None,
             queue: Vec::new(),
@@ -1287,7 +1318,10 @@ impl Sched {
             Err(e) => warn!("measuring memory: {e:#}"),
         }
         match (self.setup.runnable)() {
-            Ok(n) => self.load_c = (n as u64 * 100 / self.setup.allowed.len().max(1) as u64) as u32,
+            Ok(n) => {
+                self.runnable.add(n as f64 * 100. / self.setup.allowed.len().max(1) as f64, now);
+                self.load_c = self.runnable.value.round() as u32;
+            }
             Err(e) => warn!("counting runnable tasks: {e:#}"),
         }
         for lease in std::iter::once(&self.layout).chain(&self.retired).flat_map(|l| &l.leases) {
@@ -2023,14 +2057,15 @@ mod test {
     struct Room {
         memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
         tokens_per_cpu: f64,
-        /// Tasks runnable on the box, whatever runs there.
-        runnable: u32,
+        /// Counts the tasks runnable on the box, whatever runs there.
+        runnable: Box<dyn Fn() -> Result<u32> + Send + Sync>,
     }
 
     /// An idle box with `capacity_kb` that nothing else uses, and a token
     /// per CPU.
     fn room(capacity_kb: u64) -> Room {
-        Room { memory: Box::new(move || Ok(BoxMemory { capacity_kb, used_kb: 0 })), tokens_per_cpu: 1., runnable: 0 }
+        let memory = Box::new(move || Ok(BoxMemory { capacity_kb, used_kb: 0 }));
+        Room { memory, tokens_per_cpu: 1., runnable: Box::new(|| Ok(0)) }
     }
 
     /// A scheduler on the state in `dir`, in the default profile.
@@ -2040,10 +2075,7 @@ mod test {
             fifo_dir: dir.to_path_buf(),
             allowed: (0..4).collect(),
             memory: room.memory,
-            runnable: {
-                let n = room.runnable;
-                Box::new(move || Ok(n))
-            },
+            runnable: room.runnable,
             tokens_per_cpu: room.tokens_per_cpu,
             calibration_seconds: 4,
             decay: Decay::default(),
@@ -2346,6 +2378,30 @@ mod test {
     }
 
     #[tokio::test]
+    async fn decisions_use_the_load_averaged_over_samples() -> Result<()> {
+        let dir = scratch("load-average");
+        let tasks = std::sync::Arc::new(AtomicU64::new(0));
+        let seen = tasks.clone();
+        let room = Room { runnable: Box::new(move || Ok(seen.load(Ordering::Relaxed) as u32)), ..room(u64::MAX) };
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
+        let t0 = Instant::now();
+        s.measure(t0);
+        assert_eq!(s.load_c, 0);
+        // One sample of 100 tasks per cpu barely moves it.
+        tasks.store(400, Ordering::Relaxed);
+        s.measure(t0 + MEASURE);
+        assert!(s.load_c < 300, "{}", s.load_c);
+        // Kept up for one time constant, it gets about 63% of the way.
+        for i in 2..=40 {
+            s.measure(t0 + MEASURE * i);
+        }
+        assert!((6000..6700).contains(&s.load_c), "{}", s.load_c);
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn status_measures_memory_before_any_job_runs() -> Result<()> {
         let h = Harness::start("status-mem", vec![class(1000, &[0])], 1000, &[], &[])?;
         assert_eq!(h.status().await.mem_capacity_kb, 1000);
@@ -2370,7 +2426,7 @@ mod test {
         let memory =
             Box::new(move || Ok(BoxMemory { capacity_kb: 1000, used_kb: used.load(Ordering::Relaxed) }));
         let costs = [("small", 10, 100), ("big", 10, 600)];
-        let room = Room { memory, tokens_per_cpu: 1., runnable: 0 };
+        let room = Room { memory, tokens_per_cpu: 1., runnable: Box::new(|| Ok(0)) };
         let h = Harness::start_with("others", vec![class(1000, &[0, 1, 2, 3])], room, &costs, &[])?;
         let small = slot(h.submit("small")).await?;
         let mut big = h.submit("big");
@@ -2850,7 +2906,7 @@ mod test {
         // times its calibrated 1 s, and more as more run. b is as fast and
         // idle but full: a token frees in 1.5 s, and each job takes 1.2 s
         // there, moving files included.
-        let room = Room { runnable: 50, ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|| Ok(50)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         s.farm("b".into(), Some(busy_box(1000, 1, 0, 1500, 1)));
         history(&mut s, "narrow", 1_000_000, 100);
@@ -2873,7 +2929,7 @@ mod test {
     async fn a_job_with_no_history_goes_where_it_runs_fastest_now() -> Result<()> {
         let dir = scratch("unknown-load");
         // A token is free here, but tests keep 12.5 tasks per cpu runnable.
-        let room = Room { runnable: 50, ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|| Ok(50)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         s.farm("b".into(), Some(remote_box(1000, 4, 4, 1)));
         // What other units take says a new one takes 5 s on a cpu.
