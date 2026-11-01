@@ -4,11 +4,12 @@ use compact_str::format_compact;
 use log::{info, warn};
 use netidx_core::pack::{Pack, PackError};
 use parking_lot::Mutex;
+use poolshark::local::LPooled;
 use std::{
     collections::{HashMap, hash_map::Entry},
     fmt,
     fs::{self, File, Metadata},
-    io::{self, ErrorKind, Write},
+    io::{self, ErrorKind, Read, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -55,12 +56,32 @@ impl Pack for Hash {
     }
 }
 
+/// Bytes of a file read at once to hash, spread over every CPU: on a box
+/// whose CPUs are shared with a build, one thread hashing an rlib makes
+/// the job sending it wait for its share of one CPU.
+const HASH_BLOCK: usize = 16 << 20;
+
 fn hash_file(path: &Path) -> Result<Hash> {
+    let mut file = File::open(path).with_context(|| format_compact!("opening {}", path.display()))?;
+    let len = file.metadata()?.len();
     let mut hasher = blake3::Hasher::new();
-    hasher
-        .update_reader(File::open(path).with_context(|| format_compact!("opening {}", path.display()))?)
-        .with_context(|| format_compact!("reading {}", path.display()))?;
-    Ok(Hash(*hasher.finalize().as_bytes()))
+    let mut buf: LPooled<Vec<u8>> = LPooled::take();
+    buf.resize((len as usize).clamp(1, HASH_BLOCK), 0);
+    loop {
+        let mut n = 0;
+        while n < buf.len() {
+            match file.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == ErrorKind::Interrupted => (),
+                Err(e) => return Err(e).with_context(|| format_compact!("reading {}", path.display())),
+            }
+        }
+        hasher.update_rayon(&buf[..n]);
+        if n < buf.len() {
+            return Ok(Hash(*hasher.finalize().as_bytes()));
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,40 +97,57 @@ impl Stamp {
     }
 }
 
-/// Hashes of the files jobs read, each kept until its file changes.
+/// A file's hash as of its stamp, locked while a job hashes it.
+type Known = triomphe::Arc<Mutex<Option<(Stamp, Hash)>>>;
+
+/// Hashes of the files jobs read, each kept until its file changes. A job
+/// that needs a file another job is hashing waits for that hash rather than
+/// hash it too.
 #[derive(Default)]
-pub struct Hashes(Mutex<HashMap<PathBuf, (Stamp, Hash)>>);
+pub struct Hashes(Mutex<HashMap<PathBuf, Known>>);
 
 impl Hashes {
+    fn entry(&self, path: &Path) -> Known {
+        let mut map = self.0.lock();
+        match map.get(path) {
+            Some(k) => k.clone(),
+            None => map.entry(path.to_path_buf()).or_default().clone(),
+        }
+    }
+
     pub fn get(&self, path: &Path) -> Result<(Hash, u64)> {
         let meta = fs::metadata(path).with_context(|| format_compact!("stat {}", path.display()))?;
         if !meta.is_file() {
             bail!("{} is not a file", path.display());
         }
         let stamp = Stamp::of(&meta);
-        if let Some((s, h)) = self.0.lock().get(path)
-            && *s == stamp
+        let known = self.entry(path);
+        let mut known = known.lock();
+        if let Some((s, h)) = *known
+            && s == stamp
         {
-            return Ok((*h, stamp.len));
+            return Ok((h, stamp.len));
         }
         let hash = hash_file(path)?;
-        self.0.lock().insert(path.to_path_buf(), (stamp, hash));
+        *known = Some((stamp, hash));
         Ok((hash, stamp.len))
     }
 
     /// The size of the file at `path` and, if it was hashed since it last
-    /// changed, its hash; none if there is no such file. It reads no file.
+    /// changed, its hash; none if there is no such file. It reads no file,
+    /// and doesn't wait for a job hashing it.
     pub fn known(&self, path: &Path) -> Option<(Option<Hash>, u64)> {
         let meta = fs::metadata(path).ok().filter(|m| m.is_file())?;
         let stamp = Stamp::of(&meta);
-        let hash = self.0.lock().get(path).filter(|(s, _)| *s == stamp).map(|(_, h)| *h);
+        let known = self.0.lock().get(path).cloned();
+        let hash = known.and_then(|k| *k.try_lock()?).filter(|(s, _)| *s == stamp).map(|(_, h)| h);
         Some((hash, stamp.len))
     }
 
     /// The hash of a file just written, so it needn't be read again.
     pub fn insert(&self, path: &Path, hash: Hash) -> Result<()> {
         let meta = fs::metadata(path).with_context(|| format_compact!("stat {}", path.display()))?;
-        self.0.lock().insert(path.to_path_buf(), (Stamp::of(&meta), hash));
+        *self.entry(path).lock() = Some((Stamp::of(&meta), hash));
         Ok(())
     }
 }
@@ -400,6 +438,43 @@ pub fn replace(store: &Store, h: &Hash, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn a_file_hashes_the_same_in_blocks_over_every_cpu() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("rustc-dist-hash-{}", std::process::id()));
+        for len in [0, 1, 4096, HASH_BLOCK, 2 * HASH_BLOCK + 7] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            fs::write(&path, &data)?;
+            assert_eq!(hash_file(&path)?.0, *blake3::hash(&data).as_bytes(), "{len}");
+        }
+        fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_another_job_is_hashing_is_waited_for_not_hashed_again() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("rustc-dist-hashing-{}", std::process::id()));
+        fs::write(&path, b"contents")?;
+        let hashes = Hashes::default();
+        let stamp = Stamp::of(&fs::metadata(&path)?);
+        // One job holds the file while it hashes it.
+        let known = hashes.entry(&path);
+        let hashing = known.lock();
+        assert_eq!(hashes.known(&path), Some((None, 8)), "pricing doesn't wait");
+        let theirs = Hash([7; 32]);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| hashes.get(&path));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!waiter.is_finished(), "it waits for the hash");
+            let mut hashing = hashing;
+            *hashing = Some((stamp, theirs));
+            drop(hashing);
+            assert_eq!(waiter.join().unwrap().unwrap(), (theirs, 8), "and takes it");
+        });
+        assert_eq!(hashes.known(&path), Some((Some(theirs), 8)));
+        fs::remove_file(&path)?;
+        Ok(())
+    }
     use std::time::Duration;
 
     fn scratch(name: &str) -> PathBuf {

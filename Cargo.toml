@@ -18,7 +18,7 @@ debug = false
 [dependencies]
 anyhow = "1"
 arcstr = "1"
-blake3 = "1.8.7"
+blake3 = { version = "1.8.7", features = ["rayon"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 compact_str = "0.9"

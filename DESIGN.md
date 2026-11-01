@@ -585,7 +585,15 @@ Inputs are addressed by content. The client daemon caches
 Each server keeps a read-only blob store in `cache_dir` (`~/.cache/rustc-dist`
 by default; a tmpfs keeps it in memory), evicting the least recently used past
 `cache_gb` down to 90% of it, except blobs a running job reads, which are
-pinned from its manifest until it ends. The client sends a manifest of paths and hashes; the server
+pinned from its manifest until it ends. The client hashes the files a job
+reads when it sends the job, keeping each hash until the file's size, mtime
+or inode changes. It hashes a file in 16 MB blocks spread over every CPU,
+and a job that needs a file another job is hashing waits for that hash. On
+2026-11-01, with washu-chan at 8 to 14 runnable tasks per CPU, staging took
+8.4 s for a graphix test that links, 31 s for a rustc-dist test, and 1.3 s
+for each of ten build scripts sent at once, which hashed the same 355 MB
+each; a release build hashed graphix_types' 338 MB rlib there in 1.88 s on
+one thread and 0.26 s over every CPU. The client sends a manifest of paths and hashes; the server
 answers with the hashes it lacks; the client sends those in 1 MB chunks and
 the server checks each blob's hash before storing it. Each chunk goes
 compressed with zstd at the sender's `compression_level` (1 by default, 0 for
