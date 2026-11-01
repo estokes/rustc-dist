@@ -398,9 +398,10 @@ counted a wide job as if it ran on one thread: on 2026-11-01
 `graphix_package_core` had 98.6 s of work at width 9.6, about 12 s on the
 fast class with its threads, and added 98.6 s to every chain through it.
 Ranks are cached and recomputed when the graph changes, the profile
-switches, or each minute when costs change. On a clean build of this crate the top ranks were the
-`proc_macro2` build script, `unicode_ident`, `proc_macro2`, `quote`, `syn`,
-and `regex_syntax`: several of them tiny, but everything waits on them.
+switches, or each minute when costs change. On a clean build of this crate
+the top ranks were the `proc_macro2` build script, `unicode_ident`,
+`proc_macro2`, `quote`, `syn`, and `regex_syntax`: several of them tiny, but
+everything waits on them.
 
 For agentic rebuilds the graph is nearly exact about the future. Editing a
 crate makes cargo rebuild it and everything depending on it, so when a rebuilt
@@ -569,8 +570,8 @@ jobs and free tokens; heavy jobs, their threads and each one's speed now;
 each other box, its load, its classes' and threads' speeds as this box has
 learned them, the time jobs sent there spend moving files, for libraries and
 for jobs that link, the MB per second its sends moved at, and its free tokens. Every unit the box has run is listed with its rank in seconds
-(see Build graph) and its work in
-seconds on one thread of the fastest class idle, its front end's share, its
+(see Build graph), its work in seconds on one thread of the fastest class
+idle, its front end's share, its
 width, its predicted time here now and its measured wall time, and runs split
 three ways: this box's builds run here, this box's builds run elsewhere, and
 other boxes' builds run here. Units outside this box's build graph have no
