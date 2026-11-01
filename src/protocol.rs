@@ -155,9 +155,9 @@ pub struct Status {
     /// Jobs still running under an earlier profile's layout.
     pub finishing: u32,
     pub waiting: u32,
-    /// RAM plus the allowed share of compressed swap.
+    /// RAM plus the allowed share of free compressed swap.
     pub mem_capacity_kb: u64,
-    /// What the box holds, swapped pages at their uncompressed size.
+    /// What RAM holds, less shared pages swap on disk has room for.
     pub mem_used_kb: u64,
     /// What running jobs are predicted to add.
     pub mem_growth_kb: u64,

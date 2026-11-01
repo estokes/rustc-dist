@@ -80,8 +80,7 @@ pub fn thread_cpu_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
-/// Memory in kB of uncompressed data: how much the box may hold, and how
-/// much it holds now.
+/// Memory in kB: how much the box may hold, and how much it holds now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BoxMemory {
     pub capacity_kb: u64,
@@ -91,12 +90,11 @@ pub struct BoxMemory {
 /// zswap's compression ratio before it has stored anything.
 const ZSWAP_RATIO: f64 = 3.;
 
-/// The box's memory now. Capacity is RAM plus `swap_share` of compressed
-/// swap: zram swap devices, and zswap's pool at its compression ratio.
-/// Use counts pages in compressed swap at their uncompressed size and
-/// leaves out the RAM their compressed copies take. Pages in swap on disk
-/// take neither, and shared pages in RAM, such as tmpfs files, count as
-/// free while swap on disk has room for them.
+/// The box's memory now. Use is what RAM holds, compressed swap's data at
+/// the RAM it takes, less shared pages, such as tmpfs files, that swap on
+/// disk has room for. Capacity is RAM plus `swap_share` of the data
+/// compressed swap can still take: free zram swap, and the rest of zswap's
+/// pool at its compression ratio.
 pub fn box_memory(swap_share: f64) -> Result<BoxMemory> {
     let meminfo = fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
     let swaps = fs::read_to_string("/proc/swaps").context("reading /proc/swaps")?;
@@ -106,22 +104,10 @@ pub fn box_memory(swap_share: f64) -> Result<BoxMemory> {
         Ok(on) if on.trim() == "Y" => param("max_pool_percent")?.trim().parse().ok(),
         _ => None,
     };
-    memory(&meminfo, &swaps, zram_ram_kb, zswap_pool_percent, swap_share)
+    memory(&meminfo, &swaps, zswap_pool_percent, swap_share)
 }
 
-/// RAM a zram device's compressed data takes.
-fn zram_ram_kb(name: &str) -> u64 {
-    let stat = fs::read_to_string(format_compact!("/sys/block/{name}/mm_stat").as_str()).unwrap_or_default();
-    stat.split_whitespace().nth(2).and_then(|b| b.parse::<u64>().ok()).unwrap_or(0) / 1024
-}
-
-fn memory(
-    meminfo: &str,
-    swaps: &str,
-    zram_ram_kb: impl Fn(&str) -> u64,
-    zswap_pool_percent: Option<u64>,
-    swap_share: f64,
-) -> Result<BoxMemory> {
+fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_share: f64) -> Result<BoxMemory> {
     let field = |name: &str| -> Option<u64> {
         meminfo.lines().find_map(|l| l.strip_prefix(name))?.trim().trim_end_matches("kB").trim().parse().ok()
     };
@@ -130,27 +116,25 @@ fn memory(
     let (swap_total, swap_free) = (need("SwapTotal:")?, need("SwapFree:")?);
     let (zswap, zswapped) = (field("Zswap:").unwrap_or(0), field("Zswapped:").unwrap_or(0));
     let shared = field("Shmem:").unwrap_or(0);
-    let (mut zram_kb, mut zram_used, mut zram_ram) = (0, 0, 0);
+    let (mut zram_kb, mut zram_used) = (0, 0);
     for line in swaps.lines().skip(1) {
         let mut cols = line.split_whitespace();
         let (Some(dev), Some(size), Some(used)) = (cols.next(), cols.nth(1), cols.next()) else { continue };
-        if let Some(name) = dev.strip_prefix("/dev/").filter(|n| n.starts_with("zram")) {
+        if dev.strip_prefix("/dev/").is_some_and(|n| n.starts_with("zram")) {
             zram_kb += size.parse::<u64>().unwrap_or(0);
             zram_used += used.parse::<u64>().unwrap_or(0);
-            zram_ram += zram_ram_kb(name);
         }
     }
-    let disk_free = swap_free.saturating_sub(zram_kb.saturating_sub(zram_used));
-    let zswap_kb = zswap_pool_percent.map_or(0, |pct| {
+    let zram_free = zram_kb.saturating_sub(zram_used);
+    let disk_free = swap_free.saturating_sub(zram_free);
+    let zswap_free = zswap_pool_percent.map_or(0, |pct| {
         let ratio = if zswap > 0 { zswapped as f64 / zswap as f64 } else { ZSWAP_RATIO };
         let pool = (total * pct / 100) as f64;
-        ((pool * ratio) as u64).min(swap_total.saturating_sub(zram_kb))
+        ((pool * ratio) as u64).min(swap_total.saturating_sub(zram_kb)).saturating_sub(zswapped)
     });
     Ok(BoxMemory {
-        capacity_kb: total + ((zram_kb + zswap_kb) as f64 * swap_share) as u64,
-        used_kb: total.saturating_sub(available).saturating_sub(zram_ram + zswap + shared.min(disk_free))
-            + zram_used
-            + zswapped,
+        capacity_kb: total + ((zram_free + zswap_free) as f64 * swap_share) as u64,
+        used_kb: total.saturating_sub(available).saturating_sub(shared.min(disk_free)),
     })
 }
 
@@ -266,24 +250,22 @@ mod test {
     }
 
     #[test]
-    fn memory_counts_compressed_swap_uncompressed() -> Result<()> {
-        // This box: 64 GB of RAM and a 64 GB zram device holding 11 GB in
-        // 3.3 GB of RAM.
+    fn memory_counts_compressed_swap_at_the_ram_it_takes() -> Result<()> {
+        // 64 GB of RAM and a 64 GB zram device holding 11 GB.
         let meminfo = "MemTotal:       65301996 kB\nMemFree:        25249360 kB\n\
                        MemAvailable:   50326284 kB\nSwapTotal:      65301500 kB\n\
                        SwapFree:       53757096 kB\nZswap:                 0 kB\nZswapped:              0 kB\n";
         let swaps = "Filename\tType\tSize\tUsed\tPriority\n/dev/zram0  partition\t65301500\t11544404\t100\n";
-        let zram = |name: &str| if name == "zram0" { 3_449_284 } else { 0 };
-        let m = memory(meminfo, swaps, zram, None, 0.5)?;
-        assert_eq!(m.capacity_kb, 65_301_996 + 65_301_500 / 2);
-        assert_eq!(m.used_kb, (65_301_996 - 50_326_284) - 3_449_284 + (65_301_500 - 53_757_096));
-        // zswap with a 20% pool, holding 4 GB in 1 GB, in front of a disk.
+        let m = memory(meminfo, swaps, None, 0.5)?;
+        assert_eq!(m.capacity_kb, 65_301_996 + (65_301_500 - 11_544_404) / 2);
+        assert_eq!(m.used_kb, 65_301_996 - 50_326_284);
+        // zswap with a 20% pool, holding 400 MB in 100 MB, in front of a
+        // disk: room for 400 MB more at 4:1.
         let meminfo = "MemTotal: 1000000 kB\nMemAvailable: 600000 kB\nSwapTotal: 8000000 kB\n\
                        SwapFree: 7000000 kB\nZswap: 100000 kB\nZswapped: 400000 kB\n";
-        let m = memory(meminfo, "Filename Type Size Used Priority\n", |_| 0, Some(20), 0.5)?;
-        assert_eq!(m.capacity_kb, 1_000_000 + 200_000 * 4 / 2);
-        // The 600 MB written through to disk take no RAM.
-        assert_eq!(m.used_kb, 400_000 - 100_000 + 400_000);
+        let m = memory(meminfo, "Filename Type Size Used Priority\n", Some(20), 0.5)?;
+        assert_eq!(m.capacity_kb, 1_000_000 + (200_000 * 4 - 400_000) / 2);
+        assert_eq!(m.used_kb, 400_000);
         Ok(())
     }
 
@@ -296,14 +278,13 @@ mod test {
         let swaps = "Filename\tType\tSize\tUsed\tPriority\n\
                      /var/swap/swap   file\t134217724\t7802304\t1\n\
                      /dev/zram0  partition\t65301500\t62784576\t100\n";
-        let zram = |_: &str| 18_874_368;
-        let m = memory(meminfo, swaps, zram, None, 0.5)?;
-        assert_eq!(m.capacity_kb, 65_301_992 + 65_301_500 / 2);
-        assert_eq!(m.used_kb, (65_301_992 - 20_964_736) - 18_874_368 - 7_674_072 + 62_784_576);
+        let m = memory(meminfo, swaps, None, 0.5)?;
+        assert_eq!(m.capacity_kb, 65_301_992 + (65_301_500 - 62_784_576) / 2);
+        assert_eq!(m.used_kb, (65_301_992 - 20_964_736) - 7_674_072);
         // With the swap file full, they stay in RAM.
         let full = meminfo.replace("128932344", "2516924");
-        let m = memory(&full, swaps, zram, None, 0.5)?;
-        assert_eq!(m.used_kb, (65_301_992 - 20_964_736) - 18_874_368 + 62_784_576);
+        let m = memory(&full, swaps, None, 0.5)?;
+        assert_eq!(m.used_kb, 65_301_992 - 20_964_736);
         Ok(())
     }
 

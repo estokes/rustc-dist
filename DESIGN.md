@@ -102,21 +102,20 @@ caps how many wrappers wait. Set it at or above the farm's slot count.
 
 ### Memory
 
-Boxes overcommit RAM into compressed swap. Capacity is RAM plus half of
-compressed swap (`compressed_swap_share`). For zram, compressed swap is the
-size of its swap devices; for zswap, it is the pool limit times the compression
-ratio zswap is getting, or 3:1 until it has stored something, and never more
-than the swap behind it. Everything is counted as uncompressed data.
+Boxes overcommit RAM into compressed swap. Capacity is RAM plus half of the
+data compressed swap can still take (`compressed_swap_share`). For zram, that
+is its swap devices' free space; for zswap, the pool limit times the
+compression ratio zswap is getting, or 3:1 until it has stored something, never
+more than the swap behind it, less what the pool holds.
 
 The daemon measures the box rather than trusting its own bookkeeping, so other
-processes count. Use is what RAM holds (`MemTotal - MemAvailable`), less the
-RAM that compressed swap takes, plus the data in compressed swap at its
-uncompressed size. Swap on disk takes neither RAM nor compressed swap, so what
-it holds doesn't count. Shared pages in RAM (`Shmem`), mostly tmpfs files,
-count as free while swap on disk has room for them, since the kernel can move
-them there. A tmpfs that holds target directories would otherwise look like
-jobs' memory. Its pages already in zram do count: they hold RAM, and without a
-writeback device zram never moves them to disk.
+processes count. Use is what RAM holds (`MemTotal - MemAvailable`), which
+counts compressed swap's data at the RAM it takes. Swap on disk takes no RAM.
+Shared pages in RAM (`Shmem`), mostly tmpfs files, count as free while swap on
+disk has room for them, since the kernel can move them there. A tmpfs that
+holds target directories would otherwise look like jobs' memory. Its pages
+already in zram count at their compressed size: without a writeback device,
+zram never moves them to disk.
 Each job's footprint is the RSS plus swap of its processes: the wrapper and
 everything under it, or bwrap and everything under it for another box's job.
 The daemon walks every thread's children, since rustc starts the linker from
