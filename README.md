@@ -77,7 +77,9 @@ Across boxes (a farm):
 - Linux. It uses `/proc`, CPU affinity, FIFO jobservers and `perf_event_open`.
 - Toolchains installed with [rustup](https://rustup.rs). In a farm, a job only
   goes to a box with the same toolchain, matched by rustc's commit hash and
-  host, and with the target's standard library for `--target` builds.
+  host, and with the target's standard library for `--target` builds. A
+  box serves toolchains rustup installs or updates while it runs, and stops
+  serving the ones they replace.
 - A systemd user session, for `rustc-dist install`. Without one, the wrapper
   starts the daemon itself.
 - On boxes that take other boxes' jobs: `bwrap`, the linker your cargo config

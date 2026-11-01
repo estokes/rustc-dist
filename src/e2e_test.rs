@@ -7,7 +7,7 @@ use crate::{
     classes::{self, Class, Profile},
     farm::Load,
     protocol::{Job, Reads, Unit},
-    remote::{self, CHUNK, Event, FromServer, Links, Moved, Outcome, Packed, Sent, ToServer},
+    remote::{self, CHUNK, Event, FromServer, In, Links, Moved, Out, Outcome, Packed, Sent, Staged, ToServer},
     sandbox::{self, Server},
     sched::{Msg, Sched, Setup},
     stats::Decay,
@@ -20,6 +20,7 @@ use bytes::Bytes;
 use netidx::{InternalOnly, path::Path as NPath, subscriber::Value};
 use std::{
     fs,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -180,41 +181,161 @@ async fn send(
 
 /// Run a job that links on `b` as `remote::run` does, but send the late
 /// rlibs only after `delay`. Its exit code and how long its linker waited.
-async fn send_late(b: &ServerBox, (job, unit): &(Job, Unit), crates: &[ArcStr], delay: Duration) -> Result<(i32, u64)> {
-    let staged = remote::stage(job, crates, &Hashes::default())?;
-    let (out, mut inbox) = b.links.get(&b.jobs).await?.open()?;
-    let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
-    out.send(ToServer::Offer { unit: unit.clone(), key, target: None, class: None })?;
-    let FromServer::Accepted { .. } = inbox.recv().await? else { bail!("not accepted") };
-    let manifest =
-        ToServer::Manifest { files: staged.files.clone(), dirs: staged.dirs.clone(), late: staged.late.clone() };
-    out.send(manifest)?;
-    let FromServer::Need { now, later } = inbox.recv().await? else { bail!("expected need") };
-    assert!(!later.is_empty(), "nothing comes late");
-    let sent = Sent::default();
-    for hash in now {
-        remote::send_blob(&out, &staged, hash, LEVEL, &sent).await?;
-    }
-    out.send(ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
+async fn send_late(b: &ServerBox, job: &(Job, Unit), crates: &[ArcStr], delay: Duration) -> Result<(i32, u64)> {
+    let mut m = Manual::offer(b, job, crates).await?;
+    assert!(!m.later.is_empty(), "nothing comes late");
+    m.send(&m.now).await?;
+    m.run().await?;
     time::sleep(delay).await;
-    for hash in later {
-        remote::send_blob(&out, &staged, hash, LEVEL, &sent).await?;
+    m.send(&m.later).await?;
+    m.exit().await
+}
+
+/// A job sent a step at a time, as `remote::run` sends it.
+struct Manual {
+    job: Job,
+    staged: Staged,
+    out: Out,
+    inbox: In,
+    /// What the server asked for: before Run, and late rlibs.
+    now: Vec<Hash>,
+    later: Vec<Hash>,
+}
+
+impl Manual {
+    /// Offer the job, which reads `crates`, to `b`, and send its manifest.
+    async fn offer(b: &ServerBox, (job, unit): &(Job, Unit), crates: &[ArcStr]) -> Result<Self> {
+        let staged = remote::stage(job, crates, &Hashes::default())?;
+        let (out, mut inbox) = b.links.get(&b.jobs).await?.open()?;
+        let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
+        out.send(ToServer::Offer { unit: unit.clone(), key, target: None, class: None })?;
+        out.flush().await?;
+        let FromServer::Accepted { .. } = inbox.recv().await? else { bail!("not accepted") };
+        let manifest =
+            ToServer::Manifest { files: staged.files.clone(), dirs: staged.dirs.clone(), late: staged.late.clone() };
+        out.send(manifest)?;
+        out.flush().await?;
+        let FromServer::Need { now, later } = inbox.recv().await? else { bail!("expected need") };
+        Ok(Self { job: job.clone(), staged, out, inbox, now, later })
     }
-    loop {
-        if let FromServer::Exit { code, linker_waited_us, .. } = inbox.recv().await? {
-            return Ok((code, linker_waited_us));
+
+    /// The hash of the input at a path ending with `name`.
+    fn hash(&self, name: &str) -> Result<Hash> {
+        let files = self.staged.files.iter().map(|f| (&f.path, f.hash));
+        let rlibs = self.staged.late.iter().flat_map(|l| &l.rlibs).map(|r| (&r.path, r.hash));
+        files.chain(rlibs).find(|(p, _)| p.ends_with(name)).map(|(_, h)| h).with_context(|| format!("no {name}"))
+    }
+
+    async fn send(&self, hashes: &[Hash]) -> Result<()> {
+        for hash in hashes {
+            remote::send_blob(&self.out, &self.staged, *hash, LEVEL, &Sent::default()).await?;
+        }
+        Ok(())
+    }
+
+    async fn run(&self) -> Result<()> {
+        let job = &self.job;
+        self.out.send(ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
+        self.out.flush().await
+    }
+
+    /// Its exit code and how long its linker waited.
+    async fn exit(&mut self) -> Result<(i32, u64)> {
+        loop {
+            match self.inbox.recv().await? {
+                FromServer::Exit { code, linker_waited_us, .. } => return Ok((code, linker_waited_us)),
+                FromServer::Failed(why) => bail!("{why}"),
+                _ => (),
+            }
+        }
+    }
+
+    /// Wait for rustc to print an error.
+    async fn error(&mut self) -> Result<()> {
+        loop {
+            match self.inbox.recv().await? {
+                FromServer::Stderr(line) if line.windows(7).any(|w| w == b"\"error\"") => return Ok(()),
+                FromServer::Exit { .. } | FromServer::Failed(_) => bail!("ended without an error"),
+                _ => (),
+            }
         }
     }
 }
 
-/// A binary on `late`, built here, which the server has never seen.
-fn binary_on_a_new_crate(dir: &Path) -> Result<((Job, Unit), Vec<ArcStr>)> {
+/// Where the store at `dir` keeps the blob `h`.
+fn blob(dir: &Path, h: &Hash) -> PathBuf {
+    let name = format!("{h}");
+    dir.join(&name[..2]).join(name)
+}
+
+/// Wait up to `secs` for `done`.
+async fn until(secs: u64, what: &str, mut done: impl FnMut() -> bool) -> Result<()> {
+    for _ in 0..secs * 10 {
+        if done() {
+            return Ok(());
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("{what} took over {secs} s")
+}
+
+/// How many other boxes' jobs `b` serves.
+async fn serving(b: &ServerBox) -> Result<u32> {
+    let (reply, status) = oneshot::channel();
+    b.tx.send(Msg::Status { reply })?;
+    let st = status.await?;
+    Ok(st.classes.iter().map(|c| c.serving).sum::<u32>() + st.spread.serving)
+}
+
+/// The processes whose command line names `path`.
+fn running(path: &Path) -> Vec<u32> {
+    let needle = path.as_os_str().as_bytes();
+    let Ok(procs) = fs::read_dir("/proc") else { return vec![] };
+    procs
+        .flatten()
+        .filter_map(|p| {
+            let pid = p.file_name().to_str()?.parse().ok()?;
+            let cmdline = fs::read(p.path().join("cmdline")).ok()?;
+            cmdline.windows(needle.len()).any(|w| w == needle).then_some(pid)
+        })
+        .collect()
+}
+
+/// A library that never finishes compiling: its static spins in const
+/// eval.
+fn endless(dir: &Path) -> Result<(Job, Unit)> {
+    fs::create_dir_all(dir.join("spin/src"))?;
+    fs::create_dir_all(dir.join("target/deps"))?;
+    fs::write(
+        dir.join("spin/src/lib.rs"),
+        "#![allow(long_running_const_eval)]\npub static SPIN: u64 = { let mut i = 0u64; while i < u64::MAX { i += 1; } i };\n",
+    )?;
+    let deps = dir.join("target/deps");
+    job(
+        dir,
+        "spin",
+        &[
+            "--crate-name", "spin", "--crate-type", "lib", "--edition", "2021", "spin/src/lib.rs",
+            "--error-format=json", "--json=artifacts", "--emit=dep-info,metadata,link", "-C", "extra-filename=-s1",
+            "--out-dir", deps.to_str().unwrap(),
+        ],
+    )
+}
+
+/// Jobs that build binaries on the crate `late`, and the crate files below
+/// them.
+struct OnLate {
+    bins: Vec<(Job, Unit)>,
+    crates: Vec<ArcStr>,
+}
+
+/// Binaries named `names` on `late`, built here, each printing what it
+/// returns, and broken if its name says so.
+fn binaries_on_a_new_crate(dir: &Path, names: &[&str]) -> Result<OnLate> {
     let deps = dir.join("target/deps");
     fs::create_dir_all(dir.join("late/src"))?;
-    fs::create_dir_all(dir.join("main2/src"))?;
-    // Not inlined, so linking a stand-in instead of the rlib fails.
+    fs::create_dir_all(&deps)?;
     fs::write(dir.join("late/src/lib.rs"), "#[inline(never)]\npub fn three() -> u32 { 3 }\n")?;
-    fs::write(dir.join("main2/src/main.rs"), "fn main() { println!(\"{}\", late::three()); }\n")?;
     let status = Command::new(rustc())
         .current_dir(dir)
         .args(["--crate-name", "late", "--crate-type", "lib", "--edition", "2021", "late/src/lib.rs"])
@@ -223,50 +344,31 @@ fn binary_on_a_new_crate(dir: &Path) -> Result<((Job, Unit), Vec<ArcStr>)> {
         .status()?;
     assert!(status.success());
     let rlib = format!("{}/liblate-l1.rlib", deps.display());
-    let bin = job(
-        dir,
-        "main2",
-        &[
-            "--crate-name", "main2", "--crate-type", "bin", "--edition", "2021", "main2/src/main.rs",
-            "--error-format=json", "--json=artifacts", "--emit=dep-info,link", "-C", "extra-filename=-n1",
-            "--out-dir", deps.to_str().unwrap(), "--extern", &format!("late={rlib}"),
-        ],
-    )?;
-    Ok((bin, vec![ArcStr::from(rlib.as_str())]))
+    let bins = names
+        .iter()
+        .map(|name| {
+            fs::create_dir_all(dir.join(name).join("src"))?;
+            let main = match name.starts_with("broken") {
+                true => "fn main() { let n: u32 = \"no\"; println!(\"{n} {}\", late::three()); }\n",
+                false => "fn main() { println!(\"{}\", late::three()); }\n",
+            };
+            fs::write(dir.join(name).join("src/main.rs"), main)?;
+            let (src, extra) = (format!("{name}/src/main.rs"), format!("extra-filename=-{name}"));
+            job(
+                dir,
+                name,
+                &[
+                    "--crate-name", name, "--crate-type", "bin", "--edition", "2021", &src, "--error-format=json",
+                    "--json=artifacts", "--emit=dep-info,link", "-C", &extra, "--out-dir", deps.to_str().unwrap(),
+                    "--extern", &format!("late={rlib}"),
+                ],
+            )
+        })
+        .collect::<Result<_>>()?;
+    Ok(OnLate { bins, crates: vec![ArcStr::from(rlib.as_str())] })
 }
 
-/// A binary that fails to compile, on `big`, built here, whose rlib takes
-/// a while to send.
-fn broken_binary_on_a_big_crate(dir: &Path) -> Result<((Job, Unit), Vec<ArcStr>)> {
-    let deps = dir.join("target/deps");
-    fs::create_dir_all(&deps)?;
-    fs::create_dir_all(dir.join("big/src"))?;
-    fs::create_dir_all(dir.join("broken/src"))?;
-    // The data is in the object code, not the metadata, which comes first.
-    fs::write(
-        dir.join("big/src/lib.rs"),
-        "#[inline(never)]\npub fn data() -> &'static [u8] { static DATA: [u8; 64 << 20] = [7; 64 << 20]; &DATA }\n",
-    )?;
-    fs::write(dir.join("broken/src/main.rs"), "fn main() { let n: u32 = \"no\"; println!(\"{n} {}\", big::data()[0]); }\n")?;
-    let status = Command::new(rustc())
-        .current_dir(dir)
-        .args(["--crate-name", "big", "--crate-type", "lib", "--edition", "2021", "big/src/lib.rs"])
-        .args(["--emit=dep-info,metadata,link", "-C", "extra-filename=-g1", "--out-dir"])
-        .arg(&deps)
-        .status()?;
-    assert!(status.success());
-    let rlib = format!("{}/libbig-g1.rlib", deps.display());
-    let bin = job(
-        dir,
-        "broken",
-        &[
-            "--crate-name", "broken", "--crate-type", "bin", "--edition", "2021", "broken/src/main.rs",
-            "--error-format=json", "--json=artifacts", "--emit=dep-info,link", "-C", "extra-filename=-b1",
-            "--out-dir", deps.to_str().unwrap(), "--extern", &format!("big={rlib}"),
-        ],
-    )?;
-    Ok((bin, vec![ArcStr::from(rlib.as_str())]))
-}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_compile_error_ends_a_job_whose_rlibs_are_still_coming() -> Result<()> {
@@ -275,18 +377,24 @@ async fn a_compile_error_ends_a_job_whose_rlibs_are_still_coming() -> Result<()>
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
     let b = server(&dir.join("box")).await?;
-    let (bin, crates) = broken_binary_on_a_big_crate(&dir.join("ws"))?;
-    let rlib = fs::metadata(crates[0].as_str())?.len();
-    // The server stops reading the rlib when rustc exits, and closes the
-    // channel. Which side notices first varies, so try a few times.
-    let mut early = 0;
-    for _ in 0..6 {
-        let (outcome, events) = send(&b, &bin, &crates, &Hashes::default(), None).await?;
-        let Outcome::Exit { code, moved, .. } = outcome else { bail!("busy") };
-        assert_eq!(code, 1, "{:?}", stderr(&events));
-        early += usize::from(moved.bytes < rlib);
-    }
-    assert!(early > 0, "the rlib always came before rustc failed");
+    let OnLate { bins, crates } = binaries_on_a_new_crate(&dir.join("ws"), &["broken_bin"])?;
+    let mut m = Manual::offer(&b, &bins[0], &crates).await?;
+    let rlib = m.hash("liblate-l1.rlib")?;
+    assert_eq!(m.later, [rlib]);
+    m.send(&m.now).await?;
+    m.run().await?;
+    // Part of the rlib, which never comes whole.
+    let data = fs::read(crates[0].as_str())?;
+    let part = Bytes::copy_from_slice(&data[..data.len() / 2]);
+    m.out.send(ToServer::Chunk { hash: rlib, data: Packed::pack(part, LEVEL), last: false })?;
+    m.out.flush().await?;
+    let (code, _) = time::timeout(Duration::from_secs(60), m.exit()).await.context("the job waited for the rlib")??;
+    assert_eq!(code, 1);
+    assert!(!blob(&b.store_dir, &rlib).exists());
+    // No other job waited for it, so the next asks for it again.
+    let again = Manual::offer(&b, &bins[0], &crates).await?;
+    assert_eq!(again.later, [rlib]);
+    drop(again);
     drop(b);
     let _ = fs::remove_dir_all(&dir);
     Ok(())
@@ -362,7 +470,7 @@ async fn a_box_answers_a_heartbeat() -> Result<()> {
     Ok(())
 }
 
-// CR claude for claude: [test-gap/medium] The name promises that the job
+// XCR claude for claude: [test-gap/medium] The name promises that the job
 // "stops on the box", but the client drops it before sending Run, so no
 // sandbox ever starts. Nothing tests that a running rustc is killed (Kill's
 // pidfd SIGKILL in sandbox::run) when its client drops the job or the channel
@@ -370,6 +478,14 @@ async fn a_box_answers_a_heartbeat() -> Result<()> {
 // sleeps in a proc macro or const eval, or one held at the link gate by a
 // late rlib that never comes) and checks that the bwrap pid is gone and the
 // slot comes back. (e2e-01)
+// 2026-11-01 claude: Added
+// e2e_test::a_running_sandbox_is_killed_when_its_client_drops_the_job_or_the_channel_fails:
+// a library whose static spins in const eval forever; once its bwrap and rustc
+// show in /proc (found by the workspace path in their command lines), the
+// client drops the job, and then in a second round fails the channel; each time
+// every such process must go within 10 s and the box must stop serving. Fails
+// if Kill sends no signal. This test keeps its name and its case (dropped
+// before Run).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Result<()> {
     let _ = env_logger::try_init();
@@ -400,14 +516,8 @@ async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Res
     }
     // The box gives back its slot, and drops its claim on the blob, so the
     // next job sends it rather than wait for it forever.
-    let serving = async || -> Result<u32> {
-        let (reply, status) = oneshot::channel();
-        b.tx.send(Msg::Status { reply })?;
-        let st = status.await?;
-        Ok(st.classes.iter().map(|c| c.serving).sum::<u32>() + st.spread.serving)
-    };
     let mut tries = 0;
-    while serving().await? > 0 {
+    while serving(&b).await? > 0 {
         tries += 1;
         assert!(tries < 50, "the box still serves the dropped job");
         time::sleep(Duration::from_millis(100)).await;
@@ -419,6 +529,47 @@ async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Res
     // On the same channel all along.
     let same = b.links.get(&b.jobs).await?;
     assert!(Arc::ptr_eq(&link, &same) && !link.failed());
+    drop(b);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_running_sandbox_is_killed_when_its_client_drops_the_job_or_the_channel_fails() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-kill-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    let ws = dir.join("ws");
+    let lib = endless(&ws)?;
+    for fail_the_channel in [false, true] {
+        let mut m = Manual::offer(&b, &lib, &[]).await?;
+        m.send(&m.now).await?;
+        m.run().await?;
+        until(30, "starting the sandbox", || !running(&ws).is_empty()).await?;
+        assert_eq!(serving(&b).await?, 1);
+        if fail_the_channel {
+            // An exchange offered twice breaks the protocol, and the box
+            // closes the channel.
+            let (out, _inbox) = b.links.get(&b.jobs).await?.open()?;
+            let key = toolchain::key_of(Path::new(lib.0.rustc.as_str()))?;
+            for _ in 0..2 {
+                out.send(ToServer::Offer { unit: lib.1.clone(), key: key.clone(), target: None, class: None })?;
+            }
+            out.flush().await?;
+            assert!(m.exit().await.is_err(), "the channel failed");
+        } else {
+            drop(m);
+        }
+        until(10, "killing the sandbox", || running(&ws).is_empty()).await?;
+        let mut tries = 0;
+        while serving(&b).await? > 0 {
+            tries += 1;
+            assert!(tries < 100, "the box still serves the job");
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     drop(b);
     fs::remove_dir_all(&dir)?;
     Ok(())
@@ -451,7 +602,7 @@ async fn a_channel_that_fails_is_replaced() -> Result<()> {
     Ok(())
 }
 
-// CR claude for claude: [test-gap/medium] This covers a shared input needed
+// XCR claude for claude: [test-gap/medium] This covers a shared input needed
 // before rustc starts (coming_now). The late path, where a link job's rlib
 // comes through another job's upload (`coming_later` and the `others` future
 // in sandbox::job, then `place` behind the gate), has no test, although it is
@@ -459,6 +610,16 @@ async fn a_channel_that_fails_is_replaced() -> Result<()> {
 // rlibs). Nor is there a test of what happens when the job doing the sending
 // ends first; see (sandbox-03). Add two link jobs sharing a late rlib, once
 // with both succeeding and once with the sender failing to compile. (e2e-02)
+// 2026-11-01 claude: Added
+// e2e_test::a_late_rlib_comes_through_another_jobs_upload_even_when_that_job_fails_first:
+// two link jobs on one late rlib, driven step by step (e2e_test::Manual); the
+// second must get no Need for it and link (exit 0, so not against the stand-in)
+// once the first's client sends it, first with both compiling, then with the
+// first failing to compile before it sends. Also
+// e2e_test::a_job_that_needs_another_jobs_late_rlib_before_rustc_starts_has_its_own_client_send_it
+// and
+// e2e_test::late_rlibs_are_stored_as_they_come_while_the_job_waits_for_another_jobs_upload
+// for the rest of (sandbox-03) and (sandbox-05).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jobs_sent_together_send_a_blob_they_share_once() -> Result<()> {
     let _ = env_logger::try_init();
@@ -488,6 +649,125 @@ async fn jobs_sent_together_send_a_blob_they_share_once() -> Result<()> {
     fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_rlib_comes_through_another_jobs_upload_even_when_that_job_fails_first() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-shared-late-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    for (sender, ws) in [("shared_a", "ws1"), ("broken_a", "ws2")] {
+        let ws = dir.join(ws);
+        let OnLate { bins, crates } = binaries_on_a_new_crate(&ws, &[sender, "shared_b"])?;
+        let mut a = Manual::offer(&b, &bins[0], &crates).await?;
+        let rlib = a.hash("liblate-l1.rlib")?;
+        assert_eq!(a.later, [rlib], "a's client sends the rlib");
+        let mut waiter = Manual::offer(&b, &bins[1], &crates).await?;
+        assert!(waiter.later.is_empty() && !waiter.now.contains(&rlib), "the other waits for a's upload");
+        for m in [&a, &waiter] {
+            m.send(&m.now).await?;
+            m.run().await?;
+        }
+        let broken = sender.starts_with("broken");
+        if broken {
+            // a's rustc fails before a's client sends the rlib.
+            a.error().await?;
+        }
+        time::sleep(Duration::from_secs(1)).await;
+        a.send(&a.later).await?;
+        let (code, _) = a.exit().await?;
+        assert_eq!(code, i32::from(broken), "{sender}");
+        let (code, _) = time::timeout(Duration::from_secs(60), waiter.exit()).await??;
+        assert_eq!(code, 0, "linked against a's upload, as the stand-in has no code");
+    }
+    drop(b);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_that_needs_another_jobs_late_rlib_before_rustc_starts_has_its_own_client_send_it() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-send-too-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    let (ws1, ws2) = (dir.join("ws1"), dir.join("ws2"));
+    let OnLate { bins, crates } = binaries_on_a_new_crate(&ws1, &["shared_a"])?;
+    // The same rlib in another lane, with no metadata beside it to stand
+    // in for it, so a job there needs it before rustc starts.
+    let other = binaries_on_a_new_crate(&ws2, &["shared_b"])?.bins;
+    let deps2 = ws2.join("target/deps");
+    fs::remove_file(deps2.join("liblate-l1.rmeta"))?;
+    fs::copy(ws1.join("target/deps/liblate-l1.rlib"), deps2.join("liblate-l1.rlib"))?;
+    let crates2 = vec![ArcStr::from(deps2.join("liblate-l1.rlib").to_str().unwrap())];
+    let a = Manual::offer(&b, &bins[0], &crates).await?;
+    let rlib = a.hash("liblate-l1.rlib")?;
+    assert_eq!(a.later, [rlib]);
+    a.send(&a.now).await?;
+    let mut needs = Manual::offer(&b, &other[0], &crates2).await?;
+    assert!(needs.now.contains(&rlib), "its own client sends it rather than wait for a's after a's rustc starts");
+    needs.send(&needs.now).await?;
+    needs.run().await?;
+    // a's client never sends it.
+    let (code, _) = time::timeout(Duration::from_secs(60), needs.exit()).await??;
+    assert_eq!(code, 0);
+    drop(a);
+    drop(b);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_rlibs_are_stored_as_they_come_while_the_job_waits_for_another_jobs_upload() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-late-store-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    // Two lanes with the same 4 MB beside their sources: a library, and a
+    // binary with a late rlib.
+    let big: Vec<u8> = (0..4 << 20).map(|i: u32| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let (ws1, ws2) = (dir.join("ws1"), dir.join("ws2"));
+    let lib = project(&ws1)?;
+    fs::write(ws1.join("app/src/big.bin"), &big)?;
+    let lib_crates: Vec<ArcStr> = lib.1.deps.iter().filter_map(|d| d.file.clone()).collect();
+    let OnLate { bins, crates } = binaries_on_a_new_crate(&ws2, &["shared_b"])?;
+    fs::write(ws2.join("shared_b/big.bin"), &big)?;
+    // The library's client sends a chunk of the shared file, then stalls.
+    let sender = Manual::offer(&b, &lib, &lib_crates).await?;
+    let shared = sender.hash("big.bin")?;
+    assert!(sender.now.contains(&shared));
+    sender.out.send(ToServer::Chunk { hash: shared, data: Packed::pack(Bytes::copy_from_slice(&big[..CHUNK]), LEVEL), last: false })?;
+    sender.out.flush().await?;
+    let mut bin = Manual::offer(&b, &bins[0], &crates).await?;
+    assert!(!bin.now.contains(&shared), "the binary waits for the library's upload");
+    let rlib = bin.hash("liblate-l1.rlib")?;
+    assert_eq!(bin.later, [rlib]);
+    bin.send(&bin.now).await?;
+    bin.run().await?;
+    bin.send(&bin.later).await?;
+    until(10, "storing the late rlib", || blob(&b.store_dir, &rlib).exists()).await?;
+    assert!(time::timeout(Duration::from_millis(200), bin.exit()).await.is_err(), "the binary still waits");
+    // The library's client sends the rest.
+    let rest = &big[CHUNK..];
+    for (i, part) in rest.chunks(CHUNK).enumerate() {
+        let last = i + 1 == rest.len().div_ceil(CHUNK) && part.len() < CHUNK;
+        sender.out.send(ToServer::Chunk { hash: shared, data: Packed::pack(Bytes::copy_from_slice(part), LEVEL), last })?;
+    }
+    if rest.len().is_multiple_of(CHUNK) {
+        sender.out.send(ToServer::Chunk { hash: shared, data: Packed::pack(Bytes::new(), LEVEL), last: true })?;
+    }
+    sender.out.flush().await?;
+    let (code, _) = time::timeout(Duration::from_secs(60), bin.exit()).await??;
+    assert_eq!(code, 0);
+    drop(sender);
+    drop(b);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_file_that_compresses_goes_small_and_its_output_comes_back_whole() -> Result<()> {
@@ -587,8 +867,8 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     let Outcome::Exit { code: 0, moved, .. } = outcome else { bail!("the binary failed again") };
     assert_eq!((moved.bytes, moved.linker_waited_us), (0, 0));
     // The linker waits for an rlib that is slow to come.
-    let (late, crates) = binary_on_a_new_crate(&dir.join("ws"))?;
-    let (code, linker_waited_us) = send_late(&b, &late, &crates, Duration::from_secs(2)).await?;
+    let late = binaries_on_a_new_crate(&dir.join("ws"), &["late_bin"])?;
+    let (code, linker_waited_us) = send_late(&b, &late.bins[0], &late.crates, Duration::from_secs(2)).await?;
     assert_eq!(code, 0, "linked against the real rlib");
     assert!(linker_waited_us > 0, "the linker started before the rlib came");
     // The server recorded both runs as served, with their memory.

@@ -9,7 +9,7 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     os::{
-        fd::{AsRawFd, OwnedFd, RawFd},
+        fd::{OwnedFd, RawFd},
         unix::{fs::PermissionsExt, net::UnixStream as StdUnixStream},
     },
     path::Path,
@@ -61,27 +61,24 @@ pub fn write_stand_in_rlib(metadata: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Holds the stand-in linker until every rlib is in place. The sandbox
-/// inherits one end of a socket pair as fd 9. A stand-in writes a byte when
-/// it starts waiting and reads until this end shuts down.
+/// inherits the other end of a socket pair as fd 9. A stand-in writes a
+/// byte when it starts waiting and reads until this end shuts down.
 pub struct Gate {
     ours: UnixStream,
-    theirs: OwnedFd,
     asked: Option<Instant>,
     hung_up: bool,
     opened: Option<Instant>,
 }
 
 impl Gate {
-    pub fn new() -> Result<Self> {
+    /// The gate, and the sandbox's end, to pass to `inherit` in the
+    /// sandbox's process and close here once it has started, so the gate
+    /// sees the sandbox hang up.
+    pub fn new() -> Result<(Self, OwnedFd)> {
         let (ours, theirs) = StdUnixStream::pair().context("creating the link gate")?;
         ours.set_nonblocking(true)?;
         let ours = UnixStream::from_std(ours)?;
-        Ok(Self { ours, theirs: theirs.into(), asked: None, hung_up: false, opened: None })
-    }
-
-    /// The fd to pass to `inherit` in the sandbox's process.
-    pub fn fd(&self) -> RawFd {
-        self.theirs.as_raw_fd()
+        Ok((Self { ours, asked: None, hung_up: false, opened: None }, theirs.into()))
     }
 
     /// Between fork and exec: make `fd` the sandbox's fd 9.
@@ -99,7 +96,7 @@ impl Gate {
         self.asked.is_none() && !self.hung_up
     }
 
-    // CR claude for claude: [dead/low] `hung_up` is never set. Gate keeps
+    // XCR claude for claude: [dead/low] `hung_up` is never set. Gate keeps
     // `theirs` open for its whole life, so the server itself holds the
     // sandbox's end and try_read never returns 0. So the doc's "or for every
     // process holding the sandbox's end to exit", and `listening`'s "and one
@@ -107,6 +104,12 @@ impl Gate {
     // also ends on the exit and EOFs. Either close `theirs` in the parent once
     // the sandbox has started (then hang-up works and the doc holds), or remove
     // `hung_up` and fix the docs. (link-01)
+    // 2026-11-01 claude: Took the first option: Gate::new returns the sandbox's
+    // end as an OwnedFd for the caller, and sandbox::run's spawning thread
+    // drops it once bwrap has started, so the gate hears the sandbox hang up
+    // and the docs hold. Test:
+    // link::test::a_gate_hears_the_sandbox_hang_up_without_asking (times out
+    // while the parent still holds the end).
     /// Wait for a stand-in to start waiting, or for every process holding
     /// the sandbox's end to exit.
     pub async fn ask(&mut self) -> Result<()> {
@@ -141,7 +144,7 @@ impl Gate {
 mod test {
     use super::*;
     use std::{
-        os::unix::process::CommandExt,
+        os::{fd::AsRawFd, unix::process::CommandExt},
         process::{Command, Stdio},
         time::Duration,
     };
@@ -160,14 +163,15 @@ mod test {
         // Named for the program it stands in for, outside PATH.
         let echo = dir.join("echo");
         write_stand_in_linker(&echo)?;
-        let mut gate = Gate::new()?;
-        let fd = gate.fd();
+        let (mut gate, theirs) = Gate::new()?;
+        let fd = theirs.as_raw_fd();
         let mut cmd = Command::new(&echo);
         cmd.arg("linked").stdout(Stdio::piped());
         unsafe {
             cmd.pre_exec(move || Gate::inherit(fd));
         }
         let mut child = cmd.spawn()?;
+        drop(theirs);
         time::timeout(Duration::from_secs(5), gate.ask()).await??;
         assert!(!gate.listening());
         time::sleep(Duration::from_millis(100)).await;
@@ -186,9 +190,9 @@ mod test {
         let dir = scratch("open");
         let echo = dir.join("echo");
         write_stand_in_linker(&echo)?;
-        let mut gate = Gate::new()?;
+        let (mut gate, theirs) = Gate::new()?;
         gate.open().await?;
-        let fd = gate.fd();
+        let fd = theirs.as_raw_fd();
         let mut cmd = Command::new(&echo);
         cmd.arg("linked").stdout(Stdio::piped());
         unsafe {
@@ -197,6 +201,23 @@ mod test {
         let out = time::timeout(Duration::from_secs(5), async { cmd.output() }).await??;
         assert_eq!(out.stdout, b"linked\n");
         fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_gate_hears_the_sandbox_hang_up_without_asking() -> Result<()> {
+        let (mut gate, theirs) = Gate::new()?;
+        let fd = theirs.as_raw_fd();
+        let mut cmd = Command::new("true");
+        unsafe {
+            cmd.pre_exec(move || Gate::inherit(fd));
+        }
+        let mut child = cmd.spawn()?;
+        drop(theirs);
+        child.wait()?;
+        time::timeout(Duration::from_secs(5), gate.ask()).await.context("the gate never heard the hang-up")??;
+        assert!(!gate.listening(), "no stand-in is left to ask");
+        assert_eq!(gate.waited_us(), 0);
         Ok(())
     }
 

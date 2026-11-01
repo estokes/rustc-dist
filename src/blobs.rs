@@ -149,6 +149,9 @@ pub struct Hashes {
     known: Mutex<HashMap<PathBuf, Known>>,
     /// Some hash was taken since the last save.
     dirty: AtomicBool,
+    /// Held while a save writes the table, so two saves never share its
+    /// temporary file.
+    saving: Mutex<()>,
 }
 
 impl Hashes {
@@ -231,10 +234,10 @@ impl Hashes {
             buf.copy_to_slice(&mut h);
             known.insert(file, triomphe::Arc::new(Mutex::new(Some((stamp, Hash(h))))));
         }
-        Ok(Self { known: Mutex::new(known), dirty: AtomicBool::new(false) })
+        Ok(Self { known: Mutex::new(known), dirty: AtomicBool::new(false), saving: Mutex::new(()) })
     }
 
-    // CR claude for claude: [perf/medium] This stats every file the table
+    // XCR claude for claude: [perf/medium] This stats every file the table
     // knows, writes the table, and fsyncs it, all on the caller's thread, and
     // its caller is Sched::save on the scheduler's event loop, every
     // SAVE_EVERY (60 s) whenever a hash was taken, which during a build is
@@ -243,10 +246,19 @@ impl Hashes {
     // for as long as that takes, and an fsync on a busy disk can take seconds.
     // It also clones every PathBuf into the snapshot. Run it on a blocking
     // thread: Hashes is already shared through triomphe::Arc. (blobs-01)
+    // 2026-11-01 claude: Sched::save now runs Hashes::save on spawn_blocking
+    // (the one call, a few lines), and Hashes::save holds a new `saving` mutex
+    // so the periodic save and the final one at shutdown never share
+    // hashes.tmp. The final save at shutdown now races main's 1 s
+    // shutdown_timeout; if it is cut short the old table stays (tmp plus
+    // rename). No test: what changed is which thread runs it, which no test
+    // here observes.
     /// Save the hashes of files still as they were hashed, if a hash was
     /// taken since the last save, and forget the rest, but those being
-    /// hashed.
+    /// hashed. It stats every file it knows and syncs the table, so it
+    /// belongs on a blocking thread.
     pub fn save(&self, path: &Path) -> Result<()> {
+        let _saving = self.saving.lock();
         if !self.dirty.swap(false, Ordering::Relaxed) {
             return Ok(());
         }
@@ -298,33 +310,80 @@ pub struct Store {
     next_tmp: AtomicU64,
     /// Blobs running jobs read, with how many jobs read each.
     pinned: Mutex<HashMap<Hash, u32>>,
-    /// Blobs a job's client is sending, which other jobs wait for rather
-    /// than ask their own clients for: each one's receiver, whose sender
-    /// goes when the upload ends, stored or not.
-    arriving: Mutex<HashMap<Hash, watch::Receiver<()>>>,
+    /// `used` after the last eviction that pinned blobs kept from getting
+    /// under the cap, until a pin drops; 0 if none did. Until a pin drops or
+    /// more is stored, another pass could free no more.
+    stuck: AtomicU64,
+    arriving: Arriving,
+    next_upload: AtomicU64,
 }
 
+/// When a job reads a blob: before its rustc starts, or, a late rlib, only
+/// once its linker runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    Now,
+    Late,
+}
+
+/// A blob a job's client is sending, which other jobs wait for rather than
+/// ask their own clients for.
+struct Arrival {
+    /// Which upload it is, so only its own guard removes it.
+    upload: u64,
+    when: When,
+    /// Its sender goes when the upload ends, stored or not.
+    done: watch::Receiver<()>,
+}
+
+type Arriving = triomphe::Arc<Mutex<HashMap<Hash, Arrival>>>;
+
 /// Where a job gets a blob it reads.
-pub enum Claim<'a> {
+pub enum Claim {
     /// The store has it.
     Have,
     /// No job is sending it: the job's own client must, and other jobs wait
     /// for it until the guard drops.
-    Send(Sending<'a>),
+    Send(Sending),
+    /// The job needs it now, and another job's client sends it late, after
+    /// that job's own inputs: the job's own client sends it too.
+    SendToo,
     /// Another job's client is sending it.
     Coming(Coming),
 }
 
 /// A blob this job's client sends, which other jobs wait for.
-pub struct Sending<'a> {
-    store: &'a Store,
+pub struct Sending {
+    arriving: Arriving,
     hash: Hash,
-    _done: watch::Sender<()>,
+    upload: u64,
+    done: watch::Sender<()>,
 }
 
-impl Drop for Sending<'_> {
+impl Sending {
+    fn unlist(&self, arriving: &mut HashMap<Hash, Arrival>) {
+        if arriving.get(&self.hash).is_some_and(|a| a.upload == self.upload) {
+            arriving.remove(&self.hash);
+        }
+    }
+
+    /// Stop offering the blob to jobs that claim it later, unless a job
+    /// waits for it already; whether it stopped.
+    pub fn release(&self) -> bool {
+        let mut arriving = self.arriving.lock();
+        // Claims clone the store's receiver under this lock: past it, each
+        // receiver is a job waiting.
+        if self.done.receiver_count() > 1 {
+            return false;
+        }
+        self.unlist(&mut arriving);
+        true
+    }
+}
+
+impl Drop for Sending {
     fn drop(&mut self) {
-        self.store.arriving.lock().remove(&self.hash);
+        self.unlist(&mut self.arriving.lock());
     }
 }
 
@@ -362,7 +421,9 @@ impl Store {
             used: AtomicU64::new(used),
             next_tmp: AtomicU64::new(0),
             pinned: Mutex::new(HashMap::new()),
-            arriving: Mutex::new(HashMap::new()),
+            stuck: AtomicU64::new(0),
+            arriving: Arriving::default(),
+            next_upload: AtomicU64::new(0),
         })
     }
 
@@ -382,28 +443,34 @@ impl Store {
         self.dir.join(&name[..2]).join(name.as_str())
     }
 
-    // CR claude for claude: [doc-drift/low] The first doc line belongs to
+    // XCR claude for claude: [doc-drift/low] The first doc line belongs to
     // Store::has, which now has no doc, while claim's doc starts with a
     // sentence about has. Move it down to has. (blobs-03)
-    /// Whether the blob is present, marking it used.
-    /// Where a job gets the blob `h`: see `Claim`.
-    pub fn claim(&self, h: &Hash) -> Claim<'_> {
+    // 2026-11-01 claude: Moved the line to Store::has; claim's doc is now just
+    // its own sentence. Doc only, no test.
+    /// Where a job that reads the blob `h` `when` gets it: see `Claim`.
+    pub fn claim(&self, h: &Hash, when: When) -> Claim {
         if self.has(h) {
             return Claim::Have;
         }
         let mut arriving = self.arriving.lock();
-        if let Some(done) = arriving.get(h) {
-            return Claim::Coming(Coming { hash: *h, done: done.clone() });
+        if let Some(a) = arriving.get(h) {
+            return match (when, a.when) {
+                (When::Now, When::Late) => Claim::SendToo,
+                _ => Claim::Coming(Coming { hash: *h, done: a.done.clone() }),
+            };
         }
         // An upload may have ended between the two looks.
         if self.has(h) {
             return Claim::Have;
         }
-        let (tx, rx) = watch::channel(());
-        arriving.insert(*h, rx);
-        Claim::Send(Sending { store: self, hash: *h, _done: tx })
+        let (done, rx) = watch::channel(());
+        let upload = self.next_upload.fetch_add(1, Ordering::Relaxed);
+        arriving.insert(*h, Arrival { upload, when, done: rx });
+        Claim::Send(Sending { arriving: self.arriving.clone(), hash: *h, upload, done })
     }
 
+    /// Whether the blob is present, marking it used.
     pub fn has(&self, h: &Hash) -> bool {
         match File::open(self.path(h)) {
             Ok(f) => {
@@ -459,17 +526,25 @@ impl Store {
         }
     }
 
-    // CR claude for claude: [perf/low] When pinned blobs keep `used` above the
+    // XCR claude for claude: [perf/low] When pinned blobs keep `used` above the
     // cap (several large link jobs pinning hundreds of MB each, against a cap
     // of a few GB), no pass gets back under 90%, so every following job lists
     // and stats the whole store again (sandbox::job calls this on every job),
     // and logs "evicted 0 MB" each time. Remember that the last pass was held
     // back by pins and skip until a pin drops or `used` grows, and log only
     // when something was freed. (blobs-02)
+    // 2026-11-01 claude: Store::stuck holds `used` after a pass that pins kept
+    // above 90% of the cap; evict skips while used is no higher, and Pins::drop
+    // clears it when a pin count reaches zero. It logs only when it freed
+    // something, plus one line when pins first hold the store over its cap.
+    // Test: blobs::test::an_eviction_pins_held_back_waits_for_a_pin_to_drop (an
+    // uncounted stray blob survives the skipped pass and goes once a pin drops;
+    // fails without the skip).
     /// Delete the least recently used blobs no job is reading until the
     /// store is under 90% of its cap.
     pub fn evict(&self) {
-        if self.used.load(Ordering::Relaxed) <= self.cap_bytes {
+        let used = self.used.load(Ordering::Relaxed);
+        if used <= self.cap_bytes || used <= self.stuck.load(Ordering::Relaxed) {
             return;
         }
         let mut all = blobs(&self.dir, false);
@@ -486,7 +561,14 @@ impl Store {
                 freed += len;
             }
         }
-        info!("evicted {} MB of blobs", freed >> 20);
+        if freed > 0 {
+            info!("evicted {} MB of blobs", freed >> 20);
+        }
+        let left = self.used.load(Ordering::Relaxed);
+        let held = left > keep;
+        if self.stuck.swap(if held { left } else { 0 }, Ordering::Relaxed) == 0 && held {
+            info!("blobs running jobs read keep the store at {} MB, over its cap of {} MB", left >> 20, self.cap_bytes >> 20);
+        }
     }
 }
 
@@ -504,6 +586,7 @@ impl<I: Iterator<Item = Hash> + Clone> Drop for Pins<'_, I> {
                 *e.get_mut() -= 1;
                 if *e.get() == 0 {
                     e.remove();
+                    self.store.stuck.store(0, Ordering::Relaxed);
                 }
             }
         }
@@ -745,6 +828,58 @@ mod test {
         assert_eq!(stored.iter().map(|h| store.path(h).exists()).collect::<Vec<_>>(), [false, true, true, true]);
         assert_eq!(store.used.load(Ordering::Relaxed), 27);
         assert!(store.pinned.lock().is_empty());
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_blob_needed_now_is_sent_again_rather_than_waited_for_as_another_jobs_late_rlib() -> Result<()> {
+        let dir = scratch("claims");
+        let store = Store::open(dir.join("store"), 1 << 20)?;
+        let h = Hash::of(b"an rlib");
+        let Claim::Send(late) = store.claim(&h, When::Late) else { panic!("nobody sends it") };
+        assert!(matches!(store.claim(&h, When::Now), Claim::SendToo), "needed now, so not waited for");
+        let Claim::Coming(waiting) = store.claim(&h, When::Late) else { panic!("needed late, so waited for") };
+        assert!(!late.release(), "a job waits for it");
+        drop(waiting);
+        assert!(late.release(), "nobody waits for it");
+        let Claim::Send(again) = store.claim(&h, When::Now) else { panic!("released, so sent again") };
+        drop(late);
+        assert!(matches!(store.claim(&h, When::Late), Claim::Coming(_)), "the old guard leaves the new upload listed");
+        drop(again);
+        assert!(matches!(store.claim(&h, When::Late), Claim::Send(_)));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_eviction_pins_held_back_waits_for_a_pin_to_drop() -> Result<()> {
+        let dir = scratch("stuck");
+        let store = Store::open(dir.join("store"), 20)?;
+        let mut stored = Vec::new();
+        for (i, content) in [b"blob zero", b"blob one!", b"blob two!"].iter().enumerate() {
+            let h = Hash::of(*content);
+            let mut up = store.upload(h)?;
+            up.write(*content)?;
+            up.finish(&store)?;
+            File::open(store.path(&h))?.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10 + i as u64))?;
+            stored.push(h);
+        }
+        let pins = store.pin(stored.iter().copied());
+        store.evict();
+        assert!(stored.iter().all(|h| store.path(h).exists()), "every blob is pinned");
+        // A blob the store doesn't count, the least recently used: a pass
+        // would remove it.
+        let stray = Hash::of(b"stray");
+        fs::create_dir_all(store.path(&stray).parent().unwrap())?;
+        fs::write(store.path(&stray), b"stray")?;
+        File::open(store.path(&stray))?.set_modified(SystemTime::UNIX_EPOCH)?;
+        store.evict();
+        assert!(store.path(&stray).exists(), "no pass while the same pins hold");
+        drop(pins);
+        store.evict();
+        assert!(!store.path(&stray).exists(), "a pin dropped, so it tries again");
+        assert_eq!(stored.iter().map(|h| store.path(h).exists()).collect::<Vec<_>>(), [false, true, true]);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

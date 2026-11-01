@@ -599,7 +599,14 @@ longer changes.
 Toolchains are rustup's (`~/.rustup/toolchains/*`). A compiler is matched by
 rustc's commit hash and host, and a job with `--target` also needs that
 target's standard library installed. The client learns the key of the rustc
-cargo runs from `rustc -vV`, cached by path and mtime.
+cargo runs from `rustc -vV`, cached by path and mtime. A server notes each
+toolchain's rustc (mtime, inode and size) and `lib/rustlib` before asking
+its key. Before it takes a job it looks again, and reads its toolchains
+afresh if one was added, removed or updated, logging a warning for a rustc
+whose key changed, so a job for a key it no longer has gets "no toolchain"
+and its client builds it. A job whose rustc changes while it runs fails the
+same way. The box republishes its toolchains when they change, looking
+every 10 s.
 
 A server admits a remote job only into a free token of the class asked for,
 or for a heavy job the fastest class with one, and only when none of its own
@@ -683,10 +690,14 @@ chance collisions vanishingly rare. The client daemon caches
 Each server keeps a read-only blob store in `cache_dir` (`~/.cache/rustc-dist`
 by default; a tmpfs keeps it in memory), evicting the least recently used past
 `cache_gb` down to 90% of it, except blobs a running job reads, which are
-pinned from its manifest until it ends. The client hashes the files a job
+pinned from its manifest until it ends. When pins keep it above that, it
+doesn't look again until a pin drops or more is stored. Its work on files
+(claims, chunks, eviction, job trees) runs off the async workers. The
+client hashes the files a job
 reads when it sends the job, keeping each hash until the file's size, mtime
 or inode changes, and saving them with the cost table (`hashes` in the state
-directory) so a restart needn't read files again to name them. On washu-chan
+directory, written on a blocking thread every minute) so a restart needn't
+read files again to name them. On washu-chan
 the lanes' target directories are on a tmpfs larger than RAM, so a file
 built a while ago is often in swap (zram or a swap file on disk), and the
 first read of it after a restart ran at about 110 MB/s. The remote job's log
@@ -710,9 +721,16 @@ none) when that makes it smaller, and is stored as it was; outputs come back
 the same way at the server's level. On graphix's rlibs, rmetas and sources on
 2026-11-01, level 1 took rlibs to a fifth and the rest to a third, level 3
 did 8% better on rlibs, and a dictionary trained on rmetas gained nothing. A blob another job's
-client is already sending isn't asked for again: the job waits for it, before
-rustc starts if it needs it then, or behind a stand-in if it is a late rlib.
-If that upload fails, so does the job, and its client builds it. On
+client is already sending isn't asked for again: the job waits for it, behind
+a stand-in if it is a late rlib, or before rustc starts if it needs it then.
+But a blob it needs then that is another job's late rlib, which comes only
+after that job's own inputs, its own client sends too. A job's late rlibs
+are received into the store from `Run` on, by a task of their own, whatever
+the job is doing, so they never queue up in memory while it waits for
+another job's upload. If its rustc exits before they are in, those another
+job waits for are received to the end before the box sends the exit, which
+is what ends the client's sending; the rest are dropped. If an upload fails,
+so do the jobs waiting for it, and their clients build them. On
 2026-11-01, fifteen graphix tests sent to ryouko at once each sent the same
 520 MB of rlibs, 7.8 GB over wifi, and each linker waited over two minutes. Once a server is warm a
 job sends a manifest and whatever sources changed.
@@ -733,6 +751,12 @@ absolute paths. The server runs rustc under bwrap with:
 - the class FIFO bound in, and CPU affinity set before exec;
 - argv and cwd unchanged; the client's env minus jobserver variables, `LD_*`,
   `PATH`, `TMPDIR` and the wrappers.
+
+The thread that starts bwrap opens a pidfd on it at once and hands it to the
+job, which kills the sandbox with it if the job is dropped; a job whose
+pidfd can't be opened fails, its sandbox killed. A job gives its slot back
+when rustc exits.
+
 
 Because the paths are the client's, nothing is rewritten. Argv, env
 (`env!("CARGO_MANIFEST_DIR")`), diagnostics, dep-info, debuginfo and panic
@@ -758,7 +782,8 @@ their inputs, so they can't read from pipes. So the copy overlaps the compile:
   sees one file or the other). Then it runs the next program of that name on
   `PATH`. Rustc puts its sysroot directories first on the linker's `PATH`,
   which hold no `cc`.
-- The client sends the late rlibs while it receives rustc's output.
+- The client sends the late rlibs while it receives rustc's output, until
+  the exit arrives.
 
 Without LTO, rustc passes rlibs to the linker by path and reads none of
 their object code itself. LTO, static libraries and dylibs do read it, as
