@@ -360,7 +360,9 @@ enum Ev {
     Stderr(Bytes),
     Stdout(Bytes),
     Eof,
-    Exit(ExitStatus, libc::rusage),
+    /// With when it exited, which the loop may see later while it sends
+    /// outputs.
+    Exit(ExitStatus, libc::rusage, Instant),
 }
 
 /// Kills the sandbox if the job is abandoned. A pidfd can't hit a reused
@@ -420,7 +422,7 @@ async fn run(
         let mut status = 0;
         let mut ru: libc::rusage = unsafe { mem::zeroed() };
         if unsafe { libc::wait4(pid, &mut status, 0, &mut ru) } == pid {
-            let _ = xtx.send(Ev::Exit(ExitStatus::from_raw(status), ru));
+            let _ = xtx.send(Ev::Exit(ExitStatus::from_raw(status), ru, Instant::now()));
         }
     });
     let (pid, (stdout, stderr)) = spawned.await?.context("starting bwrap")?;
@@ -467,7 +469,7 @@ async fn run(
                 }
                 Ev::Stdout(data) => con.send_one(&FromServer::Stdout(data)).await?,
                 Ev::Eof => eofs += 1,
-                Ev::Exit(status, ru) => exit = Some((status, ru)),
+                Ev::Exit(status, ru, at) => exit = Some((status, ru, at)),
             },
             arrived = &mut arrive, if arriving => {
                 arrived.context("guarded")??;
@@ -481,8 +483,9 @@ async fn run(
         }
     }
     kill.0 = None;
-    let (status, ru) = exit.expect("loop ends with an exit");
-    let ran = Ran { wall_us: start.elapsed().as_micros() as u64, maxrss_kb: ru.ru_maxrss as u64, front };
+    let (status, ru, exited) = exit.expect("loop ends with an exit");
+    let wall_us = exited.saturating_duration_since(start).as_micros() as u64;
+    let ran = Ran { wall_us, maxrss_kb: ru.ru_maxrss as u64, front };
     let code = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     debug!("sandbox exited {code}");
     let linker_waited_us = gate.map_or(0, |g| g.waited_us());
