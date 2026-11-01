@@ -950,7 +950,11 @@ What the test found:
 
 Known gaps:
 
-- Upload and output file I/O run on async worker threads.
+- Upload and output file I/O run on async worker threads, except reading
+  and compressing what is sent, which runs on blocking threads, eight
+  chunks at once: on 2026-11-01, with washu-chan's load at 100 to 190
+  runnable tasks, a release build packed 200 MB of rlib at level 1 at
+  249 MB/s one chunk at a time and 604 MB/s eight at once.
 - A job stays local if the build graph doesn't know every crate below it,
   which happens when a project's target directory was built before the daemon
   first saw it.

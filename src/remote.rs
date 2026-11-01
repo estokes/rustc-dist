@@ -4,8 +4,9 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use compact_str::format_compact;
+use futures::{Stream, StreamExt, stream};
 use log::debug;
 use netidx::{path::Path as NPath, subscriber::Subscriber};
 use netidx_core::atomic_id;
@@ -18,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{ErrorKind, Read, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{FileExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     pin::pin,
     sync::{
@@ -29,11 +30,14 @@ use std::{
 };
 use tokio::{
     sync::{OnceCell, mpsc},
-    time,
+    task, time,
 };
 
 /// Bytes per message when a file crosses the wire.
 pub const CHUNK: usize = 1 << 20;
+/// Chunks of a file read and packed at once, each on a blocking thread, so
+/// compressing keeps up with the network on a busy box.
+const PACKING: usize = 8;
 /// A job reads at most this much it isn't told about by dep-info. A
 /// package without dep-info is walked whole; past this it stays local.
 const WALK_LIMIT: u64 = 256 << 20;
@@ -231,14 +235,14 @@ pub enum Packed {
 impl Packed {
     /// `data`, compressed at `level` if that makes it smaller; as it is at
     /// level 0.
-    pub fn pack(data: &[u8], level: i32) -> Self {
+    pub fn pack(data: Bytes, level: i32) -> Self {
         if level > 0
-            && let Ok(z) = zstd::bulk::compress(data, level)
+            && let Ok(z) = zstd::bulk::compress(&data, level)
             && z.len() < data.len()
         {
             return Packed::Zstd(z.into());
         }
-        Packed::Raw(Bytes::copy_from_slice(data))
+        Packed::Raw(data)
     }
 
     /// Its size as sent.
@@ -255,6 +259,29 @@ impl Packed {
             Packed::Zstd(z) => Ok(zstd::bulk::decompress(&z, CHUNK).context("decompressing a chunk")?.into()),
         }
     }
+}
+
+/// `file`'s chunks in order, each the bytes it carries, those packed at
+/// `level`, and whether it is the last. The last is shorter than a
+/// `CHUNK`, so a file whose size is a multiple of one ends with an empty
+/// chunk.
+pub fn pack_file(file: File, level: i32) -> Result<impl Stream<Item = Result<(Bytes, Packed, bool)>>> {
+    let len = file.metadata()?.len();
+    let (file, chunks) = (Arc::new(file), len / CHUNK as u64 + 1);
+    let packed = stream::iter(0..chunks).map(move |i| {
+        let file = file.clone();
+        async move {
+            let at = i * CHUNK as u64;
+            task::spawn_blocking(move || {
+                let mut raw = BytesMut::zeroed((len - at).min(CHUNK as u64) as usize);
+                file.read_exact_at(&mut raw, at)?;
+                let raw = raw.freeze();
+                Ok((raw.clone(), Packed::pack(raw, level), i + 1 == chunks))
+            })
+            .await?
+        }
+    });
+    Ok(packed.buffered(PACKING))
 }
 
 /// Bytes sent: of files, and as sent.
@@ -629,9 +656,8 @@ pub async fn run(
         m => bail!("unexpected {m:?}"),
     };
     let sent = Sent::default();
-    let mut buf = vec![0u8; CHUNK];
     for hash in now {
-        send_blob(&out, staged, hash, &mut buf, level, &sent).await.context("sending inputs")?;
+        send_blob(&out, staged, hash, level, &sent).await.context("sending inputs")?;
     }
     out.send(ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
     out.flush().await.context("starting rustc")?;
@@ -639,7 +665,7 @@ pub async fn run(
     // on their way; its exit ends sending them.
     let mut sending = pin!(async {
         for hash in later {
-            send_blob(&out, staged, hash, &mut buf, level, &sent).await?;
+            send_blob(&out, staged, hash, level, &sent).await?;
         }
         Ok::<_, anyhow::Error>(())
     });
@@ -667,7 +693,7 @@ pub async fn heartbeat(links: &Links, jobs: &NPath, kb: u64, level: i32) -> Resu
     let exe = File::open("/proc/self/exe").context("opening this program")?;
     let mut data = Vec::with_capacity(CHUNK);
     exe.take((kb * 1024).min(CHUNK as u64)).read_to_end(&mut data)?;
-    let data = Packed::pack(&data, level);
+    let data = Packed::pack(data.into(), level);
     let (out, mut inbox) = links.get(jobs).await?.open()?;
     let start = Instant::now();
     match ask(&out, &mut inbox, ToServer::Heartbeat(data)).await? {
@@ -677,28 +703,18 @@ pub async fn heartbeat(links: &Links, jobs: &NPath, kb: u64, level: i32) -> Resu
 }
 
 /// Send the blob `hash` compressed at `level`, adding its size to `sent`.
-pub async fn send_blob(
-    out: &Out,
-    staged: &Staged,
-    hash: Hash,
-    buf: &mut [u8],
-    level: i32,
-    sent: &Sent,
-) -> Result<()> {
+pub async fn send_blob(out: &Out, staged: &Staged, hash: Hash, level: i32, sent: &Sent) -> Result<()> {
     let path = staged.blobs.get(&hash).with_context(|| format_compact!("server asked for unknown {hash}"))?;
-    let mut file = File::open(path.as_str()).with_context(|| format_compact!("opening {path}"))?;
-    loop {
-        let n = file.read(buf)?;
-        let last = n < buf.len();
-        let data = Packed::pack(&buf[..n], level);
+    let file = File::open(path.as_str()).with_context(|| format_compact!("opening {path}"))?;
+    let mut chunks = pin!(pack_file(file, level)?);
+    while let Some(chunk) = chunks.next().await {
+        let (raw, data, last) = chunk.with_context(|| format_compact!("reading {path}"))?;
         sent.wire.fetch_add(data.wire_len() as u64, Ordering::Relaxed);
         out.send(ToServer::Chunk { hash, data, last })?;
         out.flush().await?;
-        sent.raw.fetch_add(n as u64, Ordering::Relaxed);
-        if last {
-            return Ok(());
-        }
+        sent.raw.fetch_add(raw.len() as u64, Ordering::Relaxed);
     }
+    Ok(())
 }
 
 /// An output arriving in chunks, written beside its destination.
@@ -779,13 +795,38 @@ mod test {
                 x as u8
             })
             .collect();
+        let (text, noise) = (Bytes::from(text), Bytes::from(noise));
         for (data, level, zstd) in [(&text, 1, true), (&text, 0, false), (&noise, 1, false), (&noise, 3, false)] {
-            let packed = Packed::pack(data, level);
+            let packed = Packed::pack(data.clone(), level);
             assert_eq!(matches!(packed, Packed::Zstd(_)), zstd, "level {level}");
             assert!(packed.wire_len() <= data.len());
-            assert_eq!(packed.unpack()?.as_ref(), data.as_slice());
+            assert_eq!(packed.unpack()?, data);
         }
-        assert!(Packed::pack(&text, 1).wire_len() < CHUNK / 100);
+        assert!(Packed::pack(text, 1).wire_len() < CHUNK / 100);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_is_packed_in_order_ending_with_a_short_chunk() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("rustc-dist-pack-{}", std::process::id()));
+        for len in [0, 1, CHUNK, 3 * CHUNK + 5] {
+            let data: Vec<u8> = (0..len).map(|i| (i / 7 % 251) as u8).collect();
+            fs::write(&path, &data)?;
+            let mut got = Vec::new();
+            let mut lasts = Vec::new();
+            let mut chunks = pin!(pack_file(File::open(&path)?, 1)?);
+            while let Some(chunk) = chunks.next().await {
+                let (raw, packed, last) = chunk?;
+                assert_eq!(packed.unpack()?, raw);
+                assert!(raw.len() <= CHUNK && (raw.len() < CHUNK) == last, "{len}: {} bytes", raw.len());
+                got.extend_from_slice(&raw);
+                lasts.push(last);
+            }
+            assert_eq!(got, data, "{len}");
+            assert_eq!(lasts.len(), len / CHUNK + 1, "{len}");
+            assert_eq!(lasts.iter().filter(|l| **l).count(), 1, "{len}");
+        }
+        fs::remove_file(&path)?;
         Ok(())
     }
 

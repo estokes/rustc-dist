@@ -2,7 +2,7 @@ use crate::{
     blobs::{self, Claim, Coming, Hash, Store, Upload},
     link::{self, Gate},
     protocol::{self, Front, Ran, Unit},
-    remote::{self, CHUNK, ExchangeId, FileEntry, FromBox, FromServer, Late, Packed, Rlib, SYSTEM, ToBox, ToServer},
+    remote::{self, ExchangeId, FileEntry, FromBox, FromServer, Late, Rlib, SYSTEM, ToBox, ToServer},
     sched::{Answer, Msg, Slot},
     sys,
     toolchain::Installed,
@@ -624,20 +624,15 @@ async fn send_artifact(reply: &Reply, store: &Store, root: &Path, line: &[u8], l
     let a: Artifact = serde_json::from_slice(line).context("artifact line")?;
     check(&a.artifact)?;
     let host = root.join(&a.artifact[1..]);
-    let mut file = File::open(&host).with_context(|| format_compact!("opening {}", host.display()))?;
+    let file = File::open(&host).with_context(|| format_compact!("opening {}", host.display()))?;
     let mode = file.metadata()?.permissions().mode() & 0o777;
     let path: ArcStr = a.artifact.as_str().into();
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        let n = file.read(&mut buf)?;
-        let last = n < buf.len();
-        hasher.update(&buf[..n]);
-        let data = Packed::pack(&buf[..n], level);
+    let mut chunks = pin!(remote::pack_file(file, level)?);
+    while let Some(chunk) = chunks.next().await {
+        let (raw, data, last) = chunk.with_context(|| format_compact!("reading {}", host.display()))?;
+        hasher.update(&raw);
         reply.send(FromServer::Output { path: path.clone(), mode, data, last }).await?;
-        if last {
-            break;
-        }
     }
     if remote::kept(&path) {
         store.adopt(&host, &Hash(*hasher.finalize().as_bytes()))?;

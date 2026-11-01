@@ -16,6 +16,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use arcstr::ArcStr;
+use bytes::Bytes;
 use netidx::{InternalOnly, path::Path as NPath, subscriber::Value};
 use std::{
     fs,
@@ -190,14 +191,14 @@ async fn send_late(b: &ServerBox, (job, unit): &(Job, Unit), crates: &[ArcStr], 
     out.send(manifest)?;
     let FromServer::Need { now, later } = inbox.recv().await? else { bail!("expected need") };
     assert!(!later.is_empty(), "nothing comes late");
-    let (sent, mut buf) = (Sent::default(), vec![0u8; CHUNK]);
+    let sent = Sent::default();
     for hash in now {
-        remote::send_blob(&out, &staged, hash, &mut buf, LEVEL, &sent).await?;
+        remote::send_blob(&out, &staged, hash, LEVEL, &sent).await?;
     }
     out.send(ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
     time::sleep(delay).await;
     for hash in later {
-        remote::send_blob(&out, &staged, hash, &mut buf, LEVEL, &sent).await?;
+        remote::send_blob(&out, &staged, hash, LEVEL, &sent).await?;
     }
     loop {
         if let FromServer::Exit { code, linker_waited_us, .. } = inbox.recv().await? {
@@ -386,7 +387,7 @@ async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Res
         let FromServer::Need { now, .. } = inbox.recv().await? else { bail!("expected need") };
         let hash = staged.files.iter().find(|f| f.path.ends_with("big.bin")).context("big.bin")?.hash;
         assert!(now.contains(&hash));
-        out.send(ToServer::Chunk { hash, data: Packed::pack(&big[..CHUNK], LEVEL), last: false })?;
+        out.send(ToServer::Chunk { hash, data: Packed::pack(Bytes::copy_from_slice(&big[..CHUNK]), LEVEL), last: false })?;
         out.flush().await?;
     }
     // The box gives back its slot, and drops its claim on the blob, so the
