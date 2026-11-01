@@ -1212,7 +1212,9 @@ impl Sched {
                 Event::Recheck => (),
                 Event::Sample => self.lend(Instant::now()),
                 Event::Measure => self.measure(Instant::now()),
-                Event::Save => self.save(),
+                Event::Save => {
+                    self.save();
+                }
             }
             self.dispatch();
             self.publish();
@@ -1220,7 +1222,9 @@ impl Sched {
         for w in self.queue.drain(..) {
             let _ = w.reply.send(Admission::Restarting);
         }
-        self.save();
+        if let Err(e) = self.save().await {
+            error!("saving file hashes: {e}");
+        }
     }
 
     fn layouts(&self) -> impl Iterator<Item = &Layout> {
@@ -2342,7 +2346,9 @@ impl Sched {
         }
     }
 
-    fn save(&mut self) {
+    /// Save the job stats and the build graph, and start saving the file
+    /// hashes on a blocking thread, which the returned task finishes.
+    fn save(&mut self) -> task::JoinHandle<()> {
         if self.stats.dirty {
             self.stats.rebuild_global();
             self.graph.invalidate();
@@ -2360,7 +2366,7 @@ impl Sched {
             if let Err(e) = hashes.save(&path) {
                 warn!("saving file hashes: {e:#}");
             }
-        });
+        })
     }
 }
 
@@ -3414,6 +3420,22 @@ mod test {
         let (s, _rx, _load) = open(&dir, room(u64::MAX))?;
         assert_eq!(s.stats.factor(slow, 0), 1., "a new calibration starts over");
         drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_file_hashes_are_saved_before_the_scheduler_stops() -> Result<()> {
+        let dir = scratch("hashes-saved");
+        let (s, rx, _load) = sched(&dir, vec![class(1000, &[0])], room(u64::MAX), &[], &[])?;
+        let (hashes, tx) = (s.setup.hashes.clone(), s.tx.clone());
+        let file = dir.join("input");
+        fs::write(&file, b"crate")?;
+        let (hash, _) = hashes.get(&file)?;
+        tx.send(Msg::Drain)?;
+        s.run(rx).await;
+        let saved = Hashes::load(&dir.join("hashes"))?;
+        assert_eq!(saved.known(&file), Some((Some(hash), 5)));
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

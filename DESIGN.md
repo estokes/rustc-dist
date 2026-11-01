@@ -699,8 +699,8 @@ doesn't look again until a pin drops or more is stored. Its work on files
 client hashes the files a job
 reads when it sends the job, keeping each hash until the file's size, mtime
 or inode changes, and saving them with the cost table (`hashes` in the state
-directory, written on a blocking thread every minute) so a restart needn't
-read files again to name them. On washu-chan
+directory, written on a blocking thread every minute and once more before
+the daemon exits) so a restart needn't read files again to name them. On washu-chan
 the lanes' target directories are on a tmpfs larger than RAM, so a file
 built a while ago is often in swap (zram or a swap file on disk), and the
 first read of it after a restart ran at about 110 MB/s. The remote job's log
