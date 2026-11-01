@@ -26,7 +26,10 @@ use netidx::{
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind},
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileTypeExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -221,17 +224,20 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "rustc-dist".into())
 }
 
-// CR claude for claude: [dead/low] Layout::lease names jobserver FIFOs `job-LAYOUT-JOB`, so this
+// XCR claude for claude: [dead/low] Layout::lease names jobserver FIFOs `job-LAYOUT-JOB`, so this
 // matches nothing the daemon makes now: `class-` and `spread-` are older names. FIFOs of a killed
 // daemon stay in the runtime dir until a later one reuses that exact name. Match `job-`, or remove
 // every FIFO in the dir, which is private to the daemon. (daemon-04)
-/// FIFOs left by a daemon that died without cleaning up.
+// 2026-11-01 claude: remove_stale_fifos now removes every FIFO in the runtime dir (the
+// lock-holding daemon owns them all) rather than matching old name prefixes.
+// daemon::test::a_dead_daemons_fifos_go_and_nothing_else makes a job-N-M FIFO and a plain file and
+// fails if the FIFO stays or the file goes.
+/// Jobserver FIFOs left by a daemon that died without cleaning up. The
+/// daemon that holds the lock owns every FIFO in its runtime dir.
 fn remove_stale_fifos(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("class-") || name.starts_with("spread-") {
+        if entry.file_type().is_ok_and(|t| t.is_fifo()) {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -591,6 +597,33 @@ async fn run_remote(
             r.finish(RemoteOutcome::Failed);
             Ok(Remote::Failed { forwarded_metadata })
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, process};
+
+    fn scratch(name: &str) -> Result<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-{name}-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn a_dead_daemons_fifos_go_and_nothing_else() -> Result<()> {
+        let dir = scratch("fifos")?;
+        let fifo = dir.join("job-3-17");
+        let path = CString::new(fifo.as_os_str().as_bytes())?;
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "{}", io::Error::last_os_error());
+        fs::write(dir.join("lock"), "")?;
+        remove_stale_fifos(&dir);
+        assert!(!fifo.exists(), "the FIFO goes");
+        assert!(dir.join("lock").exists(), "a file that isn't a FIFO stays");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }
 
