@@ -96,7 +96,8 @@ cargo install rustc-dist
 ```
 
 After an upgrade, run `rustc-dist install` again, or restart the service: a
-daemon refuses wrappers of another version, and the wrappers say so.
+daemon refuses wrappers of another version. They wait up to 10 s for it to
+restart, then fail and say so.
 
 ## Set up one box
 

@@ -85,9 +85,11 @@ If a remote run had already passed cargo its `.rmeta` line, the wrapper drops
 that line from the rerun's output, here or on another box.
 
 A daemon refuses a client of another `PROTOCOL`. In place of a reply's length
-it sends `0xFFFFFFFF`, longer than any message, then its own `PROTOCOL`, and
-the client fails, saying which protocol each speaks. The daemon never
-restarts for a client: a deploy restarts it, and `rustc-dist install` stops a
+it sends `0xFFFFFFFF`, longer than any message, then its own `PROTOCOL`. The
+client asks again for up to 10 s, since a deploy installs the new binary a
+moment before it restarts the daemon, then fails, saying which protocol each
+speaks. Refusals don't count toward the restarts a wrapper follows. The
+daemon never restarts for a client: a deploy restarts it, and `rustc-dist install` stops a
 running daemon of any version by sending `0xFFFFFFFF` in place of `PROTOCOL`.
 
 ## Slots
