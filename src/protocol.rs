@@ -1,14 +1,15 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use bytes::{BufMut, Bytes, BytesMut};
 use netidx_core::pack::Pack;
 use netidx_derive::Pack;
+use serde::Deserialize;
 use std::io::{Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 17;
+pub const PROTOCOL: u32 = 18;
 const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under
@@ -126,6 +127,14 @@ pub struct Front {
     pub wall_us: u64,
 }
 
+/// What the wrapper tells the daemon once a compile here succeeds: how it
+/// ran, and the crate files it wrote, which jobs sent elsewhere may read.
+#[derive(Debug, Pack)]
+pub struct Finished {
+    pub ran: Ran,
+    pub crates: Vec<ArcStr>,
+}
+
 /// What the scheduler of the box a job ran on measured while it ran.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Pack)]
 pub struct Measured {
@@ -142,6 +151,17 @@ fn contains(line: &[u8], pat: &[u8]) -> bool {
 /// Whether a line of rustc's JSON stderr announces a written file.
 pub fn is_artifact_line(line: &[u8]) -> bool {
     contains(line, br#""$message_type":"artifact""#)
+}
+
+#[derive(Deserialize)]
+struct Artifact {
+    artifact: String,
+}
+
+/// The file an artifact line names.
+pub fn artifact(line: &[u8]) -> Result<ArcStr> {
+    let a: Artifact = serde_json::from_slice(line).context("artifact line")?;
+    Ok(a.artifact.into())
 }
 
 /// Whether a line of rustc's JSON stderr announces its `.rmeta`.

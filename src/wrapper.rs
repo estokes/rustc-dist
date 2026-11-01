@@ -1,8 +1,8 @@
 use crate::{
     argv::{self, Compile, Invocation},
     client, config,
-    protocol::{self, Ask, Front, Job, Ran, Reply},
-    sys,
+    protocol::{self, Ask, Finished, Front, Job, Ran, Reply},
+    remote, sys,
 };
 use anyhow::{Context, Error, Result, anyhow, bail};
 use arcstr::ArcStr;
@@ -95,8 +95,9 @@ fn exec(args: &[OsString]) -> Error {
 }
 
 /// Run rustc on this box, passing its stderr to `out` so the front end can
-/// be timed. With `filter_metadata`, drop its rmeta notice, because cargo
-/// already got one from a remote run that then failed.
+/// be timed and the crate files it writes noted. With `filter_metadata`,
+/// drop its rmeta notice, because cargo already got one from a remote run
+/// that then failed.
 fn compile(
     sock: &mut UnixStream,
     buf: &mut BytesMut,
@@ -126,6 +127,8 @@ fn compile(
     let mut child =
         cmd.spawn().with_context(|| format_compact!("running {}", Path::new(&args[0]).display()))?;
     let mut front = None;
+    let mut crates = Vec::new();
+    let cwd = env::current_dir()?;
     let stderr = child.stderr.take().context("rustc's stderr")?;
     for line in BufReader::new(stderr).split(b'\n') {
         let line = line?;
@@ -133,6 +136,13 @@ fn compile(
         if metadata && front.is_none() {
             let wall_us = start.elapsed().as_micros() as u64;
             front = Some(Front { wall_us });
+        }
+        if protocol::is_artifact_line(&line)
+            && let Ok(path) = protocol::artifact(&line)
+            && remote::kept(&path)
+            && let Some(path) = remote::absolute(&cwd, &path).to_str()
+        {
+            crates.push(ArcStr::from(path));
         }
         if !(metadata && filter_metadata) {
             out.write_all(&line)?;
@@ -144,7 +154,7 @@ fn compile(
         let wall_us = start.elapsed().as_micros() as u64;
         let ran = Ran { wall_us, maxrss_kb: sys::children_maxrss_kb(), front };
         // A daemon that restarted meanwhile just misses this sample.
-        let _ = protocol::send(sock, buf, &ran);
+        let _ = protocol::send(sock, buf, &Finished { ran, crates });
     }
     Ok(status)
 }
@@ -186,7 +196,9 @@ mod test {
         let mut out = Vec::new();
         let status = compile(&mut ours, &mut buf, &args, "/nonexistent", false, &mut out)?;
         assert!(status.success());
-        let ran: Ran = protocol::recv(&mut daemon, &mut buf)?;
+        let Finished { ran, crates } = protocol::recv(&mut daemon, &mut buf)?;
+        let wrote = |f: &str| ArcStr::from(dir.join(f).to_str().unwrap());
+        assert_eq!(crates, [wrote("libt.rmeta"), wrote("libt.rlib")], "the crate files, not the dep-info");
         let front = ran.front.context("an .rmeta line")?;
         assert!(0 < front.wall_us && front.wall_us < ran.wall_us && ran.maxrss_kb > 0, "{ran:?}");
         let forwarded = |out: &[u8]| out.split(|b| *b == b'\n').any(protocol::is_metadata_line);
@@ -195,7 +207,7 @@ mod test {
         // front end is still timed.
         let mut out = Vec::new();
         assert!(compile(&mut ours, &mut buf, &args, "/nonexistent", true, &mut out)?.success());
-        let ran: Ran = protocol::recv(&mut daemon, &mut buf)?;
+        let Finished { ran, .. } = protocol::recv(&mut daemon, &mut buf)?;
         assert!(!forwarded(&out) && ran.front.is_some());
         fs::remove_dir_all(&dir)?;
         Ok(())

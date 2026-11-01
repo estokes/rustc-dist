@@ -284,6 +284,14 @@ pub fn pack_file(file: File, level: i32) -> Result<impl Stream<Item = Result<(By
     Ok(packed.buffered(PACKING))
 }
 
+/// Where a chunk of an output falls in its file: before the end, or at
+/// it, with the file's hash if the server keeps it as a crate file.
+#[derive(Debug, Clone, Copy, Pack)]
+pub enum Part {
+    Middle,
+    End(Option<Hash>),
+}
+
 /// Bytes sent: of files, and as sent.
 #[derive(Default)]
 pub struct Sent {
@@ -304,7 +312,7 @@ pub enum FromServer {
     /// One line of rustc's stderr. An artifact line comes after the file
     /// it names.
     Stderr(Bytes),
-    Output { path: ArcStr, mode: u32, data: Packed, last: bool },
+    Output { path: ArcStr, mode: u32, data: Packed, part: Part },
     /// `ran` and `measured` are the server's measurements, whatever the
     /// code, and `linker_waited_us` how long its linker waited for late
     /// rlibs.
@@ -745,7 +753,6 @@ struct Writing {
     dest: PathBuf,
     tmp: PathBuf,
     file: File,
-    hasher: blake3::Hasher,
     len: u64,
 }
 
@@ -761,7 +768,7 @@ async fn receive(
     let mut built = Vec::new();
     loop {
         match inbox.recv().await? {
-            FromServer::Output { path, mode, data, last } => {
+            FromServer::Output { path, mode, data, part } => {
                 let data = data.unpack()?;
                 if writing.is_none() {
                     let dest = PathBuf::from(path.as_str());
@@ -770,19 +777,17 @@ async fn receive(
                     }
                     let tmp = dest.with_extension(format_compact!("rustc-dist-{}", std::process::id()).as_str());
                     let file = File::create(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?;
-                    writing = Some(Writing { dest, tmp, file, hasher: blake3::Hasher::new(), len: 0 });
+                    writing = Some(Writing { dest, tmp, file, len: 0 });
                 }
                 let w = writing.as_mut().ok_or_else(|| anyhow!("no output open"))?;
                 w.file.write_all(&data)?;
-                w.hasher.update(&data);
                 w.len += data.len() as u64;
-                if last {
+                if let Part::End(kept) = part {
                     let w = writing.take().expect("open");
                     w.file.set_permissions(fs::Permissions::from_mode(mode))?;
                     fs::rename(&w.tmp, &w.dest).with_context(|| format_compact!("writing {}", w.dest.display()))?;
-                    let hash = Hash(*w.hasher.finalize().as_bytes());
-                    hashes.insert(&w.dest, hash)?;
-                    if kept(path.as_str()) {
+                    if let Some(hash) = kept {
+                        hashes.insert(&w.dest, hash)?;
                         built.push((hash, w.len.div_ceil(1024)));
                     }
                 }

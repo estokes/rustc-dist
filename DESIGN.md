@@ -460,7 +460,7 @@ work, so build times say nothing yet; placement is all that was checked.
 ### Farm
 
 A daemon whose config has `base` (say `/build`) joins the farm. The farm's
-netidx namespace is under the protocol version, `BASE/vN` (`/build/v17`), so
+netidx namespace is under the protocol version, `BASE/vN` (`/build/v18`), so
 boxes of different versions never see each other:
 
 - `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
@@ -587,7 +587,10 @@ by default; a tmpfs keeps it in memory), evicting the least recently used past
 `cache_gb` down to 90% of it, except blobs a running job reads, which are
 pinned from its manifest until it ends. The client hashes the files a job
 reads when it sends the job, keeping each hash until the file's size, mtime
-or inode changes. It hashes a file in 16 MB blocks spread over every CPU,
+or inode changes. Most are known by then: the wrapper tells the daemon the
+crate files a compile here wrote, which the daemon hashes in the background
+once it ends, and crate files built on another box come back with their
+hash. Placement prices a send only by hashes already known. It hashes a file in 16 MB blocks spread over every CPU,
 and a job that needs a file another job is hashing waits for that hash. On
 2026-11-01, with washu-chan at 8 to 14 runnable tasks per CPU, staging took
 8.4 s for a graphix test that links, 31 s for a rustc-dist test, and 1.3 s
@@ -672,9 +675,11 @@ Cargo pipelines builds. It passes `--emit=dep-info,metadata,link
 dep-info, the rmeta and the rlib.
 
 The server reads rustc's stderr line by line. On an artifact line it sends the
-file, then the line. The client writes the file (temp plus rename, keeping the
-server's mode), records its hash so staging a later job needn't read it, and
-forwards the line to the wrapper at once. All other output is held until rustc
+file, then the line. A crate file's last chunk carries its hash, which the
+server takes anyway to keep the file in its store. The client writes the file
+(temp plus rename, keeping the server's mode), records a crate file's hash so
+staging a later job needn't read it, hashes nothing itself, and forwards the
+line to the wrapper at once. All other output is held until rustc
 exits. The client accepts outputs only directly in `--out-dir` and explicit
 `--emit`/`-o` directories.
 

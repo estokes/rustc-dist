@@ -527,6 +527,13 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     }
     let dep_info = fs::read_to_string(deps.join("app-a1.d"))?;
     assert!(dep_info.contains("app/src/data.txt"), "{dep_info}");
+    // The server named the crate files it built, so they weren't hashed
+    // here, and nothing else came back named.
+    for f in ["libapp-a1.rlib", "libapp-a1.rmeta"] {
+        let (named, _) = hashes.known(&deps.join(f)).context("came back")?;
+        assert_eq!(named.map(|h| h.0), Some(*blake3::hash(&fs::read(deps.join(f))?).as_bytes()), "{f}");
+    }
+    assert!(matches!(hashes.known(&deps.join("app-a1.d")), Some((None, _))), "dep-info isn't named");
     // The server holds the crate files it read and the ones it built.
     let cwd = Path::new(lib.0.cwd.as_str());
     let read = lib_crates.iter().map(|c| remote::absolute(cwd, c));
@@ -558,6 +565,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     assert_eq!(artifacts(&events).len(), 2, "dep-info and the binary");
     let out = Command::new(deps.join("main-m1")).output()?;
     assert_eq!(out.stdout, b"42\n");
+    assert!(matches!(hashes.known(&deps.join("main-m1")), Some((None, _))), "a binary isn't hashed");
     // Now the server has every rlib, so nothing comes late.
     let (outcome, _) = send(&b, &bin, &bin_crates, &hashes, None).await?;
     let Outcome::Exit { code: 0, moved, .. } = outcome else { bail!("the binary failed again") };

@@ -2,7 +2,7 @@ use crate::{
     blobs::{self, Claim, Coming, Hash, Store, Upload},
     link::{self, Gate},
     protocol::{self, Front, Ran, Unit},
-    remote::{self, ExchangeId, FileEntry, FromBox, FromServer, Late, Rlib, SYSTEM, ToBox, ToServer},
+    remote::{self, ExchangeId, FileEntry, FromBox, FromServer, Late, Part, Rlib, SYSTEM, ToBox, ToServer},
     sched::{Answer, Msg, Slot},
     sys,
     toolchain::Installed,
@@ -21,7 +21,6 @@ use netidx_protocols::{
     channel::server::session,
     pack_channel::server::{Connection, singleton_with_flags},
 };
-use serde::Deserialize;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
     fs::{self, File},
@@ -613,29 +612,32 @@ async fn run(
     Ok((code == 0).then_some((ran, linker_waited_us)))
 }
 
-#[derive(Deserialize)]
-struct Artifact {
-    artifact: String,
-}
-
 /// Send the file an artifact line names, before the line. A crate file
-/// stays in the store for jobs that read it later.
+/// stays in the store for jobs that read it later, and its last chunk
+/// tells the client its hash.
 async fn send_artifact(reply: &Reply, store: &Store, root: &Path, line: &[u8], level: i32) -> Result<()> {
-    let a: Artifact = serde_json::from_slice(line).context("artifact line")?;
-    check(&a.artifact)?;
-    let host = root.join(&a.artifact[1..]);
+    let path = protocol::artifact(line)?;
+    check(&path)?;
+    let host = root.join(&path[1..]);
     let file = File::open(&host).with_context(|| format_compact!("opening {}", host.display()))?;
     let mode = file.metadata()?.permissions().mode() & 0o777;
-    let path: ArcStr = a.artifact.as_str().into();
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = remote::kept(&path).then(blake3::Hasher::new);
     let mut chunks = pin!(remote::pack_file(file, level)?);
     while let Some(chunk) = chunks.next().await {
         let (raw, data, last) = chunk.with_context(|| format_compact!("reading {}", host.display()))?;
-        hasher.update(&raw);
-        reply.send(FromServer::Output { path: path.clone(), mode, data, last }).await?;
-    }
-    if remote::kept(&path) {
-        store.adopt(&host, &Hash(*hasher.finalize().as_bytes()))?;
+        if let Some(h) = &mut hasher {
+            h.update(&raw);
+        }
+        let part = match (last, &hasher) {
+            (false, _) => Part::Middle,
+            (true, None) => Part::End(None),
+            (true, Some(h)) => {
+                let hash = Hash(*h.finalize().as_bytes());
+                store.adopt(&host, &hash)?;
+                Part::End(Some(hash))
+            }
+        };
+        reply.send(FromServer::Output { path: path.clone(), mode, data, part }).await?;
     }
     Ok(())
 }

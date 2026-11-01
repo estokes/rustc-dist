@@ -4,7 +4,7 @@ use crate::{
     classes::{self, Profile},
     config::{self, Config},
     farm::{self, Load, Member},
-    protocol::{self, Ask, Job, PROTOCOL, Ran, Reads, Reply, Unit},
+    protocol::{self, Ask, Finished, Job, PROTOCOL, Reads, Reply, Unit},
     remote::{self, Event, Links, Moved, Outcome, ToServer},
     sandbox::{self, Server},
     sched::{Admission, Heartbeat, Msg, RemoteOutcome, RemoteSlot, Sched, SentRun, Setup, Want},
@@ -382,10 +382,23 @@ async fn compile(
                 } else {
                     sock.write_all(&slot.grant.frame).await?;
                 }
-                if let Ok(ran) = protocol::recv_async::<Ran>(&mut sock, &mut buf).await {
+                if let Ok(Finished { ran, crates }) = protocol::recv_async(&mut sock, &mut buf).await {
                     slot.finish(ran, 0);
                     if failed_remotely {
                         let _ = ctx.tx.send(Msg::Mismatch { unit });
+                    }
+                    // Hashed now, while no job waits on them, they are
+                    // priced and staged without reading them when a job
+                    // that reads them goes to another box.
+                    if ctx.links.is_some() && !crates.is_empty() {
+                        let hashes = ctx.hashes.clone();
+                        task::spawn_blocking(move || {
+                            for c in &crates {
+                                if let Err(e) = hashes.get(Path::new(c.as_str())) {
+                                    debug!("hashing {c}: {e:#}");
+                                }
+                            }
+                        });
                     }
                 }
                 return Ok(());
