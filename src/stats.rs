@@ -660,7 +660,7 @@ impl Stats {
     pub fn place(&mut self, key: &str, fast: u64, rate: u64) -> PlaceId {
         if let Some(&id) = self.by_key.get(key) {
             let p = &mut self.places[id.0 as usize];
-            // CR claude for claude: [bug/medium] A recalibrated place reads its old runs at
+            // XCR claude for claude: [bug/medium] A recalibrated place reads its old runs at
             // the new rate. RunSample keeps work (front_us * fast, tokens_us * rate) at the
             // calibration current when it ran, and Record::size divides that by the
             // place's factor now. This reset puts the factor back to the starting curve
@@ -706,6 +706,14 @@ impl Stats {
             // live all places have fast != rate (here/low/all: 1814 vs 1498), so that
             // regression would mis-size every converted front end there. Give a/0 a fast
             // unlike its rate in that test, with the expected µs to match.
+            // 2026-11-01 claude:
+            // a_table_of_work_at_calibrated_speeds_loads_as_measured_runs now writes its
+            // place as a/all with fast 2000 and rate 1000, so a:1's 400 MI front end must
+            // load as 200_000 µs (at fast) and its 2400 MI rest as 2_400_000 token-µs over
+            // 600_000 µs (at rate), and still predict (400, 2400, width 400).
+            // WorkSample::measured's front end divided by rate fails it at (400000, 600000,
+            // 2400000); its rest divided by fast fails it at (200000, 300000, 1200000)
+            // (both checked).
             if (p.fast, p.rate) != (fast.max(1), rate.max(1)) {
                 p.recalibrate(fast, rate);
                 self.dirty = true;
@@ -1713,16 +1721,18 @@ mod test {
         let mut w = BufWriter::new(File::create(&path)?);
         w.write_all(WORK_MAGIC)?;
         w.write_all(&2u32.to_be_bytes())?;
-        for (key, rate) in [(SEED, 1u64), ("a/0", 1000)] {
+        // a/all's fastest class, where a front end runs, is twice its CPUs' mean.
+        for (key, fast, rate) in [(SEED, 1u64, 1u64), ("a/all", 2000, 1000)] {
             write_key(&mut w, key)?;
-            w.write_all(&rate.to_be_bytes())?;
+            w.write_all(&fast.to_be_bytes())?;
             w.write_all(&rate.to_be_bytes())?;
             for _ in 0..BUCKETS.len() + 2 {
                 w.write_all(&0u32.to_be_bytes())?;
             }
         }
-        // a:1 ran on a/0 with a front end of 0.4 s, then 0.6 s holding 4
-        // tokens; s:1 is seed history three threads wide.
+        // a:1 ran on a/all with a front end of 0.2 s at its fast rate, then
+        // 0.6 s holding 4 tokens at its rate; s:1 is seed history three
+        // threads wide.
         let now = now_s();
         let mut ser = V2Serializer::new();
         w.write_all(&2u32.to_be_bytes())?;
@@ -1745,7 +1755,7 @@ mod test {
         drop(w);
         let s = Stats::load(&path, Decay::default())?;
         let r = s.exact["a:1"].runs_kept[0];
-        assert_eq!((r.front_us, r.rest_us, r.tokens_us), (400_000., 600_000., 2_400_000.));
+        assert_eq!((r.front_us, r.rest_us, r.tokens_us), (200_000., 600_000., 2_400_000.));
         let p = |u| {
             let p = predict(&s, &unit(u, u));
             (p.front_mi, p.rest_mi, p.width_c)
