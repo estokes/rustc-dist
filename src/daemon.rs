@@ -338,7 +338,7 @@ async fn compile(
                     sock.write_all(&slot.grant.frame).await?;
                 }
                 if let Ok(ran) = protocol::recv_async::<Ran>(&mut sock, &mut buf).await {
-                    slot.finish(ran);
+                    slot.finish(ran, 0);
                     if failed_remotely {
                         let _ = ctx.tx.send(Msg::Mismatch { unit });
                     }

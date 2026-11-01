@@ -135,7 +135,7 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
     };
     con.send_one(&FromServer::Accepted { version }).await?;
     match job(&server, &con, tc, &slot).await {
-        Ok(Some(ran)) => slot.finish(ran),
+        Ok(Some((ran, linker_waited_us))) => slot.finish(ran, linker_waited_us),
         Ok(None) => (),
         Err(e) => {
             let why: ArcStr = format_compact!("{e:#}").as_str().into();
@@ -146,8 +146,9 @@ pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
     Ok(())
 }
 
-/// The Ran of a successful compile.
-async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> Result<Option<Ran>> {
+/// The Ran of a successful compile, and how long its linker waited for
+/// late rlibs.
+async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> Result<Option<(Ran, u64)>> {
     let ToServer::Manifest { files, dirs, late } = con.recv_one().await? else {
         bail!("expected a manifest");
     };
@@ -386,7 +387,7 @@ async fn run(
     root: &Path,
     slot: &Slot,
     late: Option<(Gate, impl Future<Output = Result<()>>)>,
-) -> Result<Option<Ran>> {
+) -> Result<Option<(Ran, u64)>> {
     let (mut gate, arrive) = late.unzip();
     let cpus = slot.grant.cpus.clone();
     let gate_fd = gate.as_ref().map(Gate::fd);
@@ -486,7 +487,7 @@ async fn run(
     debug!("sandbox exited {code}");
     let linker_waited_us = gate.map_or(0, |g| g.waited_us());
     con.send_one(&FromServer::Exit { code, ran, linker_waited_us, measured: slot.measured() }).await?;
-    Ok((code == 0).then_some(ran))
+    Ok((code == 0).then_some((ran, linker_waited_us)))
 }
 
 #[derive(Deserialize)]

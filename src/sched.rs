@@ -86,7 +86,8 @@ pub struct Want {
 
 pub enum Msg {
     Submit { unit: Unit, build: u32, remote: Option<Want>, reply: oneshot::Sender<Admission> },
-    Finished { job: JobId, unit: Unit, ran: Option<Ran> },
+    /// With how long its linker waited for files still on their way.
+    Finished { job: JobId, unit: Unit, ran: Option<(Ran, u64)> },
     /// A job's processes are `pid` and its descendants.
     Started { job: JobId, pid: u32 },
     /// Another box offers this one a job, pinned to `class` or, with none,
@@ -185,7 +186,7 @@ pub struct Slot {
     pub grant: Arc<Grant>,
     job: JobId,
     unit: Unit,
-    ran: Option<Ran>,
+    ran: Option<(Ran, u64)>,
     meter: Arc<Meter>,
     tx: mpsc::UnboundedSender<Msg>,
 }
@@ -198,8 +199,10 @@ impl Slot {
         let _ = self.tx.send(Msg::Started { job: self.job, pid });
     }
 
-    pub fn finish(mut self, ran: Ran) {
-        self.ran = Some(ran);
+    /// Its rustc succeeded. `linker_waited_us` is how long its linker
+    /// waited for files still on their way.
+    pub fn finish(mut self, ran: Ran, linker_waited_us: u64) {
+        self.ran = Some((ran, linker_waited_us));
     }
 
     /// What the scheduler has measured of the job so far.
@@ -745,6 +748,20 @@ impl RemoteBox {
     }
 }
 
+/// A run at `at` as `ran` and `m` measured it, less the time its linker
+/// waited for files, holding the token the job started with.
+fn timed(at: PlaceId, ran: &Ran, m: Measured, linker_waited_us: u64, mem_kb: u64, origin: Origin) -> Run {
+    Run {
+        place: at,
+        load_c: m.load_c,
+        wall_us: ran.wall_us.saturating_sub(linker_waited_us),
+        front_us: ran.front.map(|f| f.wall_us),
+        tokens_us: m.tokens_us.saturating_sub(linker_waited_us),
+        mem_kb,
+        origin,
+    }
+}
+
 /// Predicted µs for `mi` million instructions at `rate` per µs.
 fn time_us(mi: u64, rate: u64) -> u64 {
     mi * 1_000_000 / rate.max(1)
@@ -1011,7 +1028,7 @@ impl Sched {
         self.queue.push(Waiting { unit, build, pred, rank_mi, portable, since: Instant::now(), reply });
     }
 
-    fn finished(&mut self, job: JobId, unit: &Unit, ran: Option<Ran>) {
+    fn finished(&mut self, job: JobId, unit: &Unit, ran: Option<(Ran, u64)>) {
         let Some(r) = self.take_running(job) else { return };
         let (Place::Local { layout: id, .. } | Place::Spread { layout: id, .. }) = r.place else {
             warn!("job {job:?} finished locally but ran remotely");
@@ -1027,7 +1044,7 @@ impl Sched {
         };
         let measured = layout.release(job, Instant::now());
         self.retired.retain(|l| !l.idle());
-        if let (Some(ran), Some(m)) = (ran, measured) {
+        if let (Some((ran, linker_waited_us)), Some(m)) = (ran, measured) {
             debug!(
                 "{} took {} ms holding {} tokens at load {}",
                 unit.exact,
@@ -1036,15 +1053,7 @@ impl Sched {
                 m.load_c as f64 / 100.
             );
             let origin = if r.build.is_some() { Origin::Here } else { Origin::Served };
-            let run = Run {
-                place: r.at,
-                load_c: m.load_c,
-                wall_us: ran.wall_us,
-                front_us: ran.front.map(|f| f.wall_us),
-                tokens_us: m.tokens_us,
-                mem_kb: ran.maxrss_kb.max(r.peak_kb),
-                origin,
-            };
+            let run = timed(r.at, &ran, m, linker_waited_us, ran.maxrss_kb.max(r.peak_kb), origin);
             self.stats.record(unit, &run);
         }
     }
@@ -1065,16 +1074,7 @@ impl Sched {
         match outcome {
             RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer }) => {
                 self.mismatches.remove(&unit.exact);
-                // Its linker waited holding the token the job started with.
-                let run = Run {
-                    place: r.at,
-                    load_c: measured.load_c,
-                    wall_us: ran.wall_us.saturating_sub(linker_waited_us),
-                    front_us: ran.front.map(|f| f.wall_us),
-                    tokens_us: measured.tokens_us.saturating_sub(linker_waited_us),
-                    mem_kb: ran.maxrss_kb,
-                    origin: Origin::Sent(transfer),
-                };
+                let run = timed(r.at, &ran, measured, linker_waited_us, ran.maxrss_kb, Origin::Sent(transfer));
                 self.stats.record(unit, &run);
             }
             RemoteOutcome::Busy { version } => {
@@ -2289,6 +2289,17 @@ mod test {
     }
 
     #[tokio::test]
+    async fn a_served_job_is_timed_without_its_linker_waiting() -> Result<()> {
+        let h = Harness::start("linker-wait", vec![class(1000, &[0])], u64::MAX, &[], &[])?;
+        let slot = h.offer("theirs", Some(0)).await?.slot.expect("a free slot");
+        slot.finish(Ran { wall_us: 10_000_000, maxrss_kb: 1, front: None }, 9_000_000);
+        let st = h.status().await;
+        let u = st.units.iter().find(|u| u.key == "theirs").unwrap();
+        assert!((990..=1010).contains(&u.wall_ms), "10 s, 9 of them waiting for rlibs: {}", u.wall_ms);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn status_measures_memory_before_any_job_runs() -> Result<()> {
         let h = Harness::start("status-mem", vec![class(1000, &[0])], 1000, &[], &[])?;
         assert_eq!(h.status().await.mem_capacity_kb, 1000);
@@ -2348,7 +2359,7 @@ mod test {
         time::sleep(MEASURE * 2).await;
         let foot = sys::tree_footprint_kb(child.id());
         // maxrss says 1 kB, as it would for a job swapped out at its peak.
-        job.finish(Ran { wall_us: 1000, maxrss_kb: 1, front: None });
+        job.finish(Ran { wall_us: 1000, maxrss_kb: 1, front: None }, 0);
         let st = h.status().await;
         child.kill()?;
         child.wait()?;
@@ -2796,8 +2807,8 @@ mod test {
     async fn status_lists_every_unit_run_here_or_sent() -> Result<()> {
         let h = Harness::start("units", vec![class(1000, &[0])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;
         let ran = || Ran { wall_us: 1000, maxrss_kb: 1, front: None };
-        h.offer("theirs", Some(0)).await?.slot.expect("a free slot").finish(ran());
-        slot(h.submit("mine")).await?.finish(ran());
+        h.offer("theirs", Some(0)).await?.slot.expect("a free slot").finish(ran(), 0);
+        slot(h.submit("mine")).await?.finish(ran(), 0);
         h.farm(remote_box(200, 4, 4, 1));
         let Admission::Remote(r) = admitted(h.submit_with("big", want())).await? else {
             bail!("not sent remote");
