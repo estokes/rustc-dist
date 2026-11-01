@@ -541,13 +541,18 @@ impl Places {
 
 /// One profile's classes, their tokens, and the jobs holding them. A
 /// profile switch makes a new layout for new jobs; the old one lives until
-/// its jobs finish.
+/// its jobs finish, and lends them nothing more.
 struct Layout {
     id: LayoutId,
     /// Fastest at calibration first.
     classes: Vec<Class>,
     /// Each class's tokens that no job holds.
     pool: Vec<u32>,
+    /// Each class's tokens that jobs of earlier layouts, on the same CPUs,
+    /// still hold, and what they hold beyond every class's tokens. Tokens
+    /// those jobs give back pay `overdrawn`, then join `pool`.
+    owed: Vec<u32>,
+    overdrawn: u32,
     places: Places,
     leases: Vec<Lease>,
 }
@@ -563,7 +568,39 @@ impl Layout {
             let rate = c.rate as f64 / 1000.;
             info!("{profile} class {k}: {} cpus, {rate:.2} G instructions/s calibrated, factor {factor:.2} idle", c.cpus.len());
         }
-        Self { id, pool, classes, places, leases: Vec::new() }
+        let owed = vec![0; classes.len()];
+        Self { id, pool, owed, overdrawn: 0, classes, places, leases: Vec::new() }
+    }
+
+    /// Jobs of earlier layouts hold `n` tokens on this layout's CPUs: take
+    /// them from the slowest classes first, until those jobs give them back.
+    fn owe(&mut self, mut n: u32) {
+        let order = self.by_speed();
+        for &k in order.iter().rev() {
+            let t = n.min(self.pool[k]);
+            self.pool[k] -= t;
+            self.owed[k] += t;
+            n -= t;
+        }
+        self.overdrawn += n;
+    }
+
+    /// Jobs of earlier layouts gave back `n` tokens: they pay what is
+    /// overdrawn, then each class what it is owed, fastest first.
+    fn repaid(&mut self, mut n: u32) {
+        let t = n.min(self.overdrawn);
+        self.overdrawn -= t;
+        n -= t;
+        let order = self.by_speed();
+        for &k in order.iter() {
+            let t = n.min(self.owed[k]);
+            self.owed[k] -= t;
+            self.pool[k] += t;
+            n -= t;
+        }
+        if n > 0 {
+            warn!("{n} tokens came back from jobs of an earlier profile that no class lent them");
+        }
     }
 
     fn idle(&self) -> bool {
@@ -1214,12 +1251,7 @@ impl Sched {
                     }
                 },
                 Event::Recheck => (),
-                Event::Sample => {
-                    let now = Instant::now();
-                    for l in std::iter::once(&mut self.layout).chain(&mut self.retired) {
-                        l.lend(now);
-                    }
-                }
+                Event::Sample => self.lend(Instant::now()),
                 Event::Measure => self.measure(Instant::now()),
                 Event::Save => self.save(),
             }
@@ -1328,7 +1360,7 @@ impl Sched {
             return;
         };
         let measured = layout.release(job, Instant::now());
-        self.retired.retain(|l| !l.idle());
+        self.reclaim();
         if let (Some((ran, linker_waited_us)), Some(m)) = (ran, measured) {
             debug!(
                 "{} took {} ms holding {} tokens at load {}",
@@ -1544,7 +1576,7 @@ impl Sched {
         }
     }
 
-    // CR claude for claude: [risk/medium] The new layout starts with every class's full
+    // XCR claude for claude: [risk/medium] The new layout starts with every class's full
     // pool while the retired layouts' jobs still hold theirs on the same CPUs, and their
     // heavy jobs keep borrowing from the old pools (Event::Sample lends in every
     // layout). On a full box a switch admits a second full set of jobs at once: 16 CPUs
@@ -1558,12 +1590,29 @@ impl Sched {
     // (sched-03)
     // 2026-11-01 claude: Eric ruled (2026-11-01): start the new pools less what retired
     // leases hold, and hand retired tokens to the new pools as their jobs end (a).
+    // 2026-11-01 claude: Per the ruling: Sched::apply zeroes every retired layout's free
+    // pool (they lend nothing more) and the new Layout::owe takes what retired leases
+    // hold off the new pools, slowest class first, tracking it in Layout::owed (and
+    // Layout::overdrawn past every class's tokens). Sched::reclaim, after each lending
+    // tick (Sched::lend) and each job's end, moves whatever retired pools got back to
+    // Layout::repaid, which pays overdrawn first, then the owed classes fastest first.
+    // Sched::frees_in_us counts retired jobs for a class while it is owed.
+    // a_calibrated_profile_applies_to_new_jobs_at_once now asserts a third job waits
+    // until the old job ends and then runs on the class that lent the token; new test
+    // jobs_running_at_a_switch_borrow_nothing_more_and_what_they_leave_goes_to_the_new_classes
+    // covers lending after the switch and tokens given back mid-run. Both fail without
+    // Layout::owe or Sched::reclaim's repaid. DESIGN.md (Calibration) updated.
     fn apply(&mut self, profile: Profile, classes: Vec<Class>) {
         let layout = Layout::new(&profile, classes, self.setup.tokens_per_cpu, &mut self.stats);
         let old = mem::replace(&mut self.layout, layout);
         if !old.idle() {
             self.retired.push(old);
         }
+        for l in &mut self.retired {
+            l.pool.fill(0);
+        }
+        let held = self.retired.iter().flat_map(|l| &l.leases).map(|l| l.lent.iter().sum::<u32>()).sum();
+        self.layout.owe(held);
         if let Err(e) = classes::set_current(&self.setup.state_dir, &profile) {
             warn!("recording profile {profile}: {e:#}");
         }
@@ -1571,16 +1620,39 @@ impl Sched {
     }
 
     /// µs until a token of local `class` is expected to free, from the
-    /// jobs holding its tokens, if any do.
+    /// jobs holding its tokens, if any do, counting jobs of earlier layouts
+    /// while the class is owed tokens they hold.
     fn frees_in_us(&self, class: usize, now: Instant) -> Option<u64> {
         let l = &self.layout;
+        let owed = l.owed[class] > 0;
         let holds = |r: &&Running| match r.place {
-            Place::Local { layout, .. } | Place::Spread { layout, .. } => {
-                layout == l.id && l.leases.iter().any(|s| s.job == r.job && s.lent[class] > 0)
+            Place::Local { layout, .. } | Place::Spread { layout, .. } if layout == l.id => {
+                l.leases.iter().any(|s| s.job == r.job && s.lent[class] > 0)
             }
+            Place::Local { .. } | Place::Spread { .. } => owed,
             Place::Remote { .. } => false,
         };
         self.running.iter().filter(holds).map(|r| r.left_us(now)).min()
+    }
+
+    /// Tick every job's jobserver: see `Lease::tick`.
+    fn lend(&mut self, now: Instant) {
+        for l in std::iter::once(&mut self.layout).chain(&mut self.retired) {
+            l.lend(now);
+        }
+        self.reclaim();
+    }
+
+    /// Tokens that jobs of earlier layouts gave back go to the current
+    /// layout, and a layout with no jobs left goes.
+    fn reclaim(&mut self) {
+        let mut n = 0;
+        for l in &mut self.retired {
+            n += l.pool.iter().sum::<u32>();
+            l.pool.fill(0);
+        }
+        self.layout.repaid(n);
+        self.retired.retain(|l| !l.idle());
     }
 
     /// Whether any job runs on this box, its own or another box's.
@@ -3804,8 +3876,12 @@ mod test {
         classes::save(&h.dir, &Profile::new("battery")?, &[class(3000, &[0]), class(5000, &[1])])?;
         let old = slot(h.submit("a")).await?;
         h.profile("battery");
-        // The old layout's only token is held, yet the new job runs.
+        // The old job holds a token on the cpus battery's classes cover, so
+        // battery's slowest class is a token short until it ends.
         let new = slot(h.submit("a")).await?;
+        assert_eq!(cpu(&new), 0);
+        let mut third = h.submit("a");
+        assert!(pending(&mut third).await, "no token is left");
         let st = h.status().await;
         assert_eq!(st.profile.as_str(), "battery");
         assert_eq!(st.classes.len(), 2);
@@ -3817,10 +3893,52 @@ mod test {
         };
         assert_eq!(fifos(), 2);
         drop(old);
+        let third = slot(third).await?;
+        assert_eq!(cpu(&third), 1, "the old job's token went to the class it was taken from");
         assert_eq!(h.status().await.finishing, 0);
-        assert_eq!(fifos(), 1, "the finished job's jobserver is removed");
+        assert_eq!(fifos(), 2, "the finished job's jobserver is removed");
         assert_eq!(fs::read_to_string(h.dir.join("profile"))?, "battery");
-        drop(new);
+        drop((new, third));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jobs_running_at_a_switch_borrow_nothing_more_and_what_they_leave_goes_to_the_new_classes() -> Result<()> {
+        let dir = scratch("switch-tokens");
+        // 12 tokens on 4 cpus; battery has 6 on its fast class and 6 on its slow one.
+        let room = Room { tokens_per_cpu: 3., ..room(u64::MAX) };
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
+        classes::save(&dir, &Profile::new("battery")?, &[class(1000, &[0, 1]), class(2000, &[2, 3])])?;
+        let slot = granted(&mut place(&mut s, &["h"], false)[0]);
+        let mut fifo = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(slot.grant.jobserver.as_str())?;
+        // Codegen takes every token it is lent, twice what it holds each tick,
+        // till it holds 8.
+        for n in [1, 2, 4] {
+            fifo.read_exact(&mut vec![0u8; n])?;
+            if n < 4 {
+                s.lend(Instant::now());
+            }
+        }
+        s.switch_to(Profile::new("battery")?, false)?;
+        let tokens = |s: &Sched| (s.layout.pool.to_vec(), s.layout.owed.to_vec());
+        assert_eq!(tokens(&s), (vec![4, 0], vec![2, 6]), "its 8 come off the slow class first");
+        s.lend(Instant::now());
+        assert_eq!(s.retired[0].leases[0].fifo.free(), 0, "the old classes' 4 free tokens are lent no more");
+        // Five threads finish; a whole tick later they are back, and go to
+        // battery's classes, fastest first.
+        fifo.write_all(b"+++++")?;
+        s.lend(Instant::now());
+        s.lend(Instant::now());
+        assert_eq!(tokens(&s), (vec![6, 3], vec![0, 3]));
+        s.finished(slot.job, &slot.unit, None);
+        assert_eq!(tokens(&s), (vec![6, 6], vec![0, 0]));
+        assert!(s.retired.is_empty());
+        drop((slot, s));
+        fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

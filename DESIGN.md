@@ -163,8 +163,11 @@ profile again.
 
 Switching to a profile that already has a calibration applies at once, to new
 jobs. Jobs already running finish on the old profile's classes and
-jobservers, which go away when their last job ends. Until then the box can be
-oversubscribed by at most the jobs that were running at the switch. Switching
+jobservers, which go away when their last job ends, and are lent no more
+tokens. The tokens they hold are on the same CPUs, so they come off the new
+profile's classes, slowest first, and go back to them, fastest first, as
+those jobs give them back: a switch never runs more than the box's tokens'
+worth of jobs. Switching
 to a profile with no calibration holds new jobs. Once every running job is
 done, the daemon calibrates, saves the result, and resumes. It doesn't try to
 guess whether other work on the box will distort the numbers. Calibrate each
