@@ -1283,11 +1283,11 @@ impl Sched {
         for &i in admissible.iter() {
             let w = &self.queue[i];
             let fits = !mem_blocked && (first_here || w.pred.mem_kb <= mem_free);
-            let full_here = held.iter().all(|&n| n == 0);
+            let waits_here = !fits || held.iter().all(|&n| n == 0);
             let away = w
                 .portable
                 .as_ref()
-                .filter(|_| !w.pred.known || full_here || time_us(w.pred.cost_mi, fastest) >= REMOTE_MIN_US);
+                .filter(|_| !w.pred.known || waits_here || time_us(w.pred.cost_mi, fastest) >= REMOTE_MIN_US);
             let picked = if light(&w.pred) {
                 let local = if fits { rates.len() } else { 0 };
                 cands.clear();
@@ -2156,6 +2156,20 @@ mod test {
         assert!(pending(&mut waits).await);
         drop(here);
         slot(waits).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn short_jobs_go_away_when_memory_here_is_full() -> Result<()> {
+        // A cpu is free here, but there is room for one job.
+        let h = Harness::start("short-mem", vec![class(1000, &[0, 1])], 1000, &[("small", 500_000, 600)], &[])?;
+        h.farm(remote_box(200, 4, 4, 1));
+        let here = slot(h.submit_with("small", want())).await?;
+        match admitted(h.submit_with("small", want())).await? {
+            Admission::Remote(r) => r.finish(RemoteOutcome::Busy { version: 2 }),
+            _ => bail!("ran here past its memory"),
+        }
+        drop(here);
         Ok(())
     }
 

@@ -110,7 +110,13 @@ than the swap behind it. Everything is counted as uncompressed data.
 
 The daemon measures the box rather than trusting its own bookkeeping, so other
 processes count. Use is what RAM holds (`MemTotal - MemAvailable`), less the
-RAM that compressed swap takes, plus all swapped data at its uncompressed size.
+RAM that compressed swap takes, plus the data in compressed swap at its
+uncompressed size. Swap on disk takes neither RAM nor compressed swap, so what
+it holds doesn't count. Shared pages in RAM (`Shmem`), mostly tmpfs files,
+count as free while swap on disk has room for them, since the kernel can move
+them there. A tmpfs that holds target directories would otherwise look like
+jobs' memory. Its pages already in zram do count: they hold RAM, and without a
+writeback device zram never moves them to disk.
 Each job's footprint is the RSS plus swap of its processes: the wrapper and
 everything under it, or bwrap and everything under it for another box's job.
 The daemon walks every thread's children, since rustc starts the linker from
@@ -325,8 +331,8 @@ jobs with time to spare on slow cores.
 
 A job that may go remote considers other boxes if it has no history (neither
 the unit nor its crate has run before), if it is predicted to take at least
-1 s on the fastest local class, or if no local class has a free slot left, so
-it would wait here. A job with history chooses among local classes
+1 s on the fastest local class, or if it would wait here: no local class has a
+free slot left, or its predicted memory doesn't fit. A job with history chooses among local classes
 as above, and goes to another box instead if it would finish there sooner,
 counting 200 ms for the trip. A job with no history has nothing to predict
 with, so it takes free capacity: the fastest local class with a token, else the
