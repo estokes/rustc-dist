@@ -21,14 +21,17 @@ pub struct Config {
     pub tokens_per_cpu: f64,
     /// How long the daemon runs the calibration load for a new profile.
     pub calibration_seconds: u64,
-    // CR claude for claude: [doc-drift/low] The farm's paths are under `BASE/vN` (farm::versioned),
+    // XCR claude for claude: [doc-drift/low] The farm's paths are under `BASE/vN` (farm::versioned),
     // not `BASE/status`, `BASE/api` and `BASE/units` as this says. And README's configuration
     // table, which says every key is optional and lists them, leaves out half_life_s and
     // copy_half_life_s. (config-01)
-    /// The netidx path the farm lives under, e.g. `/build`: a status table
-    /// with a row per box at `BASE/status`, the job listeners under
-    /// `BASE/api`, and each box's units under `BASE/units`. Without it this
-    /// box works alone.
+    // 2026-11-01 claude: Config::base's doc names BASE/vN/status, BASE/vN/api and BASE/vN/units,
+    // and README's configuration table lists half_life_s (86400) and copy_half_life_s (3600). Doc
+    // only, no test.
+    /// The netidx path the farm lives under, e.g. `/build`. Under its
+    /// protocol version `BASE/vN` are a status table with a row per box at
+    /// `BASE/vN/status`, the job listeners under `BASE/vN/api`, and each
+    /// box's units under `BASE/vN/units`. Without it this box works alone.
     pub base: Option<String>,
     /// This box's name under `base`. The host name without its domain by
     /// default.

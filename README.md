@@ -201,6 +201,8 @@ so start with a clean target directory.
 | `tokens_per_cpu` | 1.5 | jobserver tokens per CPU |
 | `compressed_swap_share` | 0.5 | share of compressed swap that predicted job memory may fill beyond RAM |
 | `calibration_seconds` | 60 | how long calibration runs |
+| `half_life_s` | 86400 | seconds after which old runs count half toward how fast each place runs and how big each unit is |
+| `copy_half_life_s` | 3600 | seconds after which old sent runs count half toward how long sending a job takes |
 
 A project can keep crates on the box that builds it, for example proc macros
 that read the network or the local environment. Put a `rustc-dist.toml` at
