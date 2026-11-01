@@ -320,8 +320,9 @@ pub struct UnitStatus {
     /// compiling, and inputs sent.
     pub copy_ms: Option<u64>,
     pub sent_kb: Option<u64>,
-    /// Its work plus the costliest chain of jobs that depend on it, if it
-    /// is in this box's build graph.
+    /// Its predicted time on this box idle, where it runs fastest, plus
+    /// the longest chain of jobs that depend on it, if it is in this box's
+    /// build graph.
     pub rank_ms: Option<u64>,
 }
 

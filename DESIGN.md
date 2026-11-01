@@ -389,10 +389,16 @@ directory. Checkouts share nodes and ranks, and each job reads only its own
 files. A proc macro under a `--target` build sits in the host directory, which
 the relative path reaches.
 
-A job's rank is its predicted cost plus the costliest chain of jobs that
-depend on it: the work that waits on this job before the build can finish.
-Ranks are cached and recomputed when the graph changes or each minute when
-costs change. On a clean build of this crate the top ranks were the
+A job's rank is its predicted time plus the longest chain of jobs that
+depend on it: how long the build runs on once this job starts. Each job's
+time is on this box idle, where it runs fastest: a light job on the fastest
+class, a heavy one on every CPU, its front end at the fastest class's rate
+and the rest over min(width, CPUs) threads (see Cost). Summing work instead
+counted a wide job as if it ran on one thread: on 2026-11-01
+`graphix_package_core` had 98.6 s of work at width 9.6, about 12 s on the
+fast class with its threads, and added 98.6 s to every chain through it.
+Ranks are cached and recomputed when the graph changes, the profile
+switches, or each minute when costs change. On a clean build of this crate the top ranks were the
 `proc_macro2` build script, `unicode_ident`, `proc_macro2`, `quote`, `syn`,
 and `regex_syntax`: several of them tiny, but everything waits on them.
 
@@ -412,7 +418,9 @@ jobs with time to spare on slow cores.
    the wrapper, so one agent's huge build doesn't push another's small one
    onto slow cores.
 3. A job's slack is its build's horizon less its own rank: how much later it
-   can finish without delaying the build.
+   can finish without delaying the build. Ranks are times on the box idle,
+   while the jobs after it run at the load now, so the slack grows by the
+   fastest class's factor at the load now over its factor idle.
 4. For each class the daemon predicts when the job would finish there: when a
    slot frees (now, or the earliest predicted end of a job running in that
    class) plus its predicted time there (see Cost). The job takes the
@@ -560,7 +568,8 @@ class shows its speed idle and at the load now, this box's jobs, other boxes'
 jobs and free tokens; heavy jobs, their threads and each one's speed now;
 each other box, its load, its classes' and threads' speeds as this box has
 learned them, the time jobs sent there spend moving files, for libraries and
-for jobs that link, the MB per second its sends moved at, and its free tokens. Every unit the box has run is listed with its rank and work in
+for jobs that link, the MB per second its sends moved at, and its free tokens. Every unit the box has run is listed with its rank in seconds
+(see Build graph) and its work in
 seconds on one thread of the fastest class idle, its front end's share, its
 width, its predicted time here now and its measured wall time, and runs split
 three ways: this box's builds run here, this box's builds run elsewhere, and

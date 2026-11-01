@@ -1,7 +1,4 @@
-use crate::{
-    protocol::{Dep, Unit},
-    stats::Stats,
-};
+use crate::protocol::{Dep, Unit};
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use bytes::{BufMut, BytesMut};
@@ -112,7 +109,7 @@ pub struct Graph {
     nodes: HashMap<ArcStr, Node>,
     /// For each id, the ids of the nodes whose deps include it.
     dependents: HashMap<ArcStr, Vec<ArcStr>>,
-    /// Ranks computed since the graph or the job stats last changed.
+    /// Ranks computed since the graph or the costs last changed.
     ranks: HashMap<ArcStr, u64>,
     pub dirty: bool,
 }
@@ -180,21 +177,21 @@ impl Graph {
         self.dirty = true;
     }
 
-    /// Forget computed ranks, because predicted costs changed.
+    /// Forget computed ranks, because predicted times changed.
     pub fn invalidate(&mut self) {
         self.ranks.clear();
     }
 
-    /// The predicted cost of `id` plus the costliest chain of jobs that
-    /// depend on it: the work that waits on this job, in millions of
-    /// instructions.
-    pub fn rank(&mut self, id: &ArcStr, stats: &Stats) -> u64 {
+    /// The predicted µs of `id` plus the longest chain of jobs that depend
+    /// on it: how long the build runs on once this job starts. `own_us`
+    /// predicts a job's µs from its exact and coarse keys.
+    pub fn rank<F: Fn(&ArcStr, &ArcStr) -> u64>(&mut self, id: &ArcStr, own_us: &F) -> u64 {
         if let Some(r) = self.ranks.get(id) {
             return *r;
         }
         // Marks `id` as in progress, so a cycle in stale data ends here.
         self.ranks.insert(id.clone(), 0);
-        // CR claude for claude: [bug/medium] A rank adds each job's work, front plus rest,
+        // XCR claude for claude: [bug/medium] A rank adds each job's work, front plus rest,
         // but Sched::dispatch turns rank differences into slack as time on one thread of
         // the fastest class (`time_us(horizon - rank_mi, fastest_rate)`), so a wide job
         // counts as if it ran on one thread. In `rustc-dist status` on washu-chan today,
@@ -210,13 +207,27 @@ impl Graph {
         // 2026-11-01 claude: Eric ruled (2026-11-01): rank by predicted duration on the
         // fastest place, front end at the fast rate plus the rest over min(width, CPUs)
         // (a).
+        // 2026-11-01 claude: Per the ruling: Graph::rank and Graph::ranked take each job's
+        // predicted µs as a closure, and Sched passes Layout::idle_us: the unit's
+        // prediction where it runs fastest here (Layout::fastest: the fastest class if
+        // light, else every CPU, via Stats::predict_at), timed by Stats::time_us at load 0
+        // with Spot's threads, so front end at the fast rate and the rest over min(width,
+        // CPUs). Ranks are µs now: Waiting and Running carry a Build { pid, rank_us,
+        // own_us } (None for another box's job, which has no rank), Running::rank_left_us
+        // counts down own_us, status shows rank_ms = rank/1000, and Sched::apply
+        // invalidates ranks. No Stats helper was needed. main.rs's status text and
+        // protocol.rs's rank_ms doc changed with it (text only, no message change);
+        // DESIGN.md (Build graph, Scheduling, status) updated. Tests:
+        // a_rank_counts_a_wide_job_at_the_threads_it_gets (gate 1 ms before wide's 8 ms of
+        // work on 4 cpus ranks 3 ms; 9000 with work summed); graph.rs tests now pass times
+        // directly.
         let own = match self.nodes.get(id) {
-            Some(n) => stats.predict(&n.exact, &n.coarse).cost_mi(),
+            Some(n) => own_us(&n.exact, &n.coarse),
             None => 0,
         };
         let mut dependents: LPooled<Vec<ArcStr>> = LPooled::take();
         dependents.extend(self.dependents.get(id).into_iter().flatten().cloned());
-        let down = dependents.iter().map(|d| self.rank(d, stats)).max().unwrap_or(0);
+        let down = dependents.iter().map(|d| self.rank(d, own_us)).max().unwrap_or(0);
         let rank = own + down;
         self.ranks.insert(id.clone(), rank);
         rank
@@ -255,11 +266,11 @@ impl Graph {
     }
 
     /// Every node with its rank and job key, for `status`.
-    pub fn ranked(&mut self, stats: &Stats) -> Vec<(ArcStr, u64)> {
+    pub fn ranked<F: Fn(&ArcStr, &ArcStr) -> u64>(&mut self, own_us: &F) -> Vec<(ArcStr, u64)> {
         let ids: Vec<ArcStr> = self.nodes.keys().cloned().collect();
         ids.into_iter()
             .map(|id| {
-                let rank = self.rank(&id, stats);
+                let rank = self.rank(&id, own_us);
                 (self.nodes[&id].exact.clone(), rank)
             })
             .collect()
@@ -321,7 +332,6 @@ impl Graph {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::stats::Decay;
 
     /// A unit in the target directory `/t`.
     fn unit(id: &str, deps: &[&str]) -> Unit {
@@ -345,12 +355,9 @@ mod test {
         }
     }
 
-    fn stats(costs: &[(&str, u64)]) -> Stats {
-        let mut s = Stats::new(Decay::default());
-        for &(id, cost_mi) in costs {
-            s.seed(&unit(id, &[]), 0, cost_mi, 100, 1);
-        }
-        s
+    /// Each job's predicted µs, by its exact key.
+    fn times<'a>(times: &'a [(&str, u64)]) -> impl Fn(&ArcStr, &ArcStr) -> u64 + 'a {
+        |exact, _| times.iter().find(|(id, _)| *id == exact.as_str()).map_or(0, |&(_, us)| us)
     }
 
     /// libc ← regex_syntax ← regex ← app, and libc ← itoa.
@@ -364,29 +371,27 @@ mod test {
         g
     }
 
-    /// Histograms keep two significant figures.
-    fn about(got: u64, want: u64) {
-        assert!(got.abs_diff(want) * 100 <= want, "{got} is not about {want}");
-    }
+    const TIMES: [(&str, u64); 5] =
+        [("libc", 100), ("itoa", 50), ("regex_syntax", 9000), ("regex", 4000), ("app", 2000)];
 
     #[test]
-    fn rank_is_cost_plus_the_costliest_chain_after() {
-        let s = stats(&[("libc", 100), ("itoa", 50), ("regex_syntax", 9000), ("regex", 4000), ("app", 2000)]);
+    fn rank_is_its_time_plus_the_longest_chain_after() {
+        let t = times(&TIMES);
         let mut g = build();
-        about(g.rank(&"app".into(), &s), 2000);
-        about(g.rank(&"itoa".into(), &s), 50 + 2000);
-        about(g.rank(&"regex_syntax".into(), &s), 9000 + 4000 + 2000);
-        // Small, but the whole build waits on it.
-        about(g.rank(&"libc".into(), &s), 100 + 15_000);
+        assert_eq!(g.rank(&"app".into(), &t), 2000);
+        assert_eq!(g.rank(&"itoa".into(), &t), 50 + 2000);
+        assert_eq!(g.rank(&"regex_syntax".into(), &t), 9000 + 4000 + 2000);
+        // Short, but the whole build waits on it.
+        assert_eq!(g.rank(&"libc".into(), &t), 100 + 15_000);
     }
 
     #[test]
     fn changed_deps_move_edges() {
-        let s = stats(&[("libc", 100), ("itoa", 50), ("regex_syntax", 9000), ("regex", 4000), ("app", 2000)]);
+        let t = times(&TIMES);
         let mut g = build();
         g.record(&unit("app", &["itoa"]));
-        about(g.rank(&"regex".into(), &s), 4000);
-        about(g.rank(&"itoa".into(), &s), 2050);
+        assert_eq!(g.rank(&"regex".into(), &t), 4000);
+        assert_eq!(g.rank(&"itoa".into(), &t), 2050);
     }
 
     #[test]
@@ -500,23 +505,22 @@ mod test {
 
     #[test]
     fn a_cycle_in_stale_data_terminates() {
-        let s = stats(&[("a", 10), ("b", 20)]);
         let mut g = Graph::new();
         g.record(&unit("a", &["b"]));
         g.record(&unit("b", &["a"]));
-        assert!(g.rank(&"a".into(), &s) >= 10);
+        assert!(g.rank(&"a".into(), &times(&[("a", 10), ("b", 20)])) >= 10);
     }
 
     #[test]
     fn save_and_load_round_trip() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("rustc-dist-graph-{}", std::process::id()));
         let path = dir.join("graph");
-        let s = stats(&[("libc", 100), ("itoa", 50), ("regex_syntax", 9000), ("regex", 4000), ("app", 2000)]);
+        let t = times(&TIMES);
         let mut g = build();
         g.save(&path)?;
         let mut h = Graph::load(&path)?;
         assert_eq!(h.len(), 5);
-        assert_eq!(h.rank(&"libc".into(), &s), g.rank(&"libc".into(), &s));
+        assert_eq!(h.rank(&"libc".into(), &t), g.rank(&"libc".into(), &t));
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

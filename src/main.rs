@@ -232,9 +232,10 @@ fn status() -> Result<()> {
     }
     writeln!(
         out,
-        "\n{} units run, by work waiting on them ({} in the build graph). Rank and work are seconds on \
-         one thread of class 0 idle; front is the single-threaded share, width the jobserver tokens \
-         held after it. Now is the predicted time here at this load, wall the measured median. Runs: \
+        "\n{} units run, by rank ({} in the build graph). Rank is the predicted seconds, idle, of the \
+         unit and the longest chain of units after it, each where it runs fastest here. Work is \
+         seconds on one thread of class 0 idle; front is the single-threaded share, width the jobserver \
+         tokens held after it. Now is the predicted time here at this load, wall the measured median. Runs: \
          here and sent for this box's builds, served for other boxes'. Copy is the time a sent run \
          spent on its files rather than compiling, and MB what it sent (medians).",
         st.units.len(),

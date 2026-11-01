@@ -607,6 +607,25 @@ impl Layout {
         self.leases.is_empty()
     }
 
+    fn cpus(&self) -> u64 {
+        self.classes.iter().map(|c| c.cpus.len() as u64).sum()
+    }
+
+    /// A unit's prediction where it runs fastest here, on the fastest
+    /// class if it is light, else on every CPU, and the spot it takes.
+    fn fastest(&self, stats: &Stats, exact: &ArcStr, coarse: &ArcStr) -> (Prediction, Spot) {
+        let pinned = light(&stats.predict(exact, coarse));
+        let at = if pinned { self.places.classes[self.by_speed()[0]] } else { self.places.all };
+        let (pred, _) = stats.predict_at(exact, coarse, at);
+        (pred, Spot::new(&pred, 1, at, pinned, self.cpus()))
+    }
+
+    /// A unit's predicted µs on this box idle, where it runs fastest.
+    fn idle_us(&self, stats: &Stats, exact: &ArcStr, coarse: &ArcStr) -> u64 {
+        let (pred, spot) = self.fastest(stats, exact, coarse);
+        stats.time_us(&pred, spot.at, 0, spot.threads)
+    }
+
     /// Tokens of `class` lent to heavy jobs.
     fn lent(&self, class: usize) -> u32 {
         self.leases.iter().filter(|l| l.pinned.is_none()).map(|l| l.lent[class]).sum()
@@ -803,11 +822,20 @@ impl Held {
     }
 }
 
+/// A job of one of this box's builds: the build, by cargo's pid, and the
+/// job's rank, the µs the build runs on once the job starts, `own_us` of
+/// them its own (see `Graph::rank`).
+#[derive(Clone, Copy)]
+struct Build {
+    pid: u32,
+    rank_us: u64,
+    own_us: u64,
+}
+
 struct Waiting {
     unit: Unit,
-    build: u32,
+    build: Build,
     pred: Prediction,
-    rank_mi: u64,
     /// Where it may go besides here, or why nowhere.
     portable: Result<Portable, CompactString>,
     since: Instant,
@@ -834,8 +862,8 @@ impl Place {
 
 struct Running {
     job: JobId,
-    /// The build it is part of, by cargo's pid; None for another box's job.
-    build: Option<u32>,
+    /// None for another box's job.
+    build: Option<Build>,
     place: Place,
     /// Where it runs, in the cost table.
     at: PlaceId,
@@ -843,8 +871,6 @@ struct Running {
     run_us: u64,
     /// Predicted peak memory; none for a job on another box.
     mem_kb: u64,
-    cost_mi: u64,
-    rank_mi: u64,
     start: Instant,
     /// The root of its processes, once it has started here.
     pid: Option<u32>,
@@ -861,11 +887,13 @@ impl Running {
         self.run_us.saturating_sub(elapsed).max(elapsed / 2)
     }
 
-    /// Its rank less the part of its own cost already done.
-    fn rank_left_mi(&self, now: Instant) -> u64 {
+    /// Its build, and its rank less the part of its own time already
+    /// done, if it is one of this box's builds' jobs.
+    fn rank_left_us(&self, now: Instant) -> Option<(u32, u64)> {
+        let b = self.build?;
         let elapsed = now.duration_since(self.start).as_micros() as u64;
-        let done = self.cost_mi * elapsed.min(self.run_us) / self.run_us.max(1);
-        self.rank_mi.saturating_sub(done)
+        let done = b.own_us * elapsed.min(self.run_us) / self.run_us.max(1);
+        Some((b.pid, b.rank_us.saturating_sub(done)))
     }
 
     fn here(&self) -> bool {
@@ -1018,11 +1046,6 @@ fn frees_in_moved(shown: Option<u32>, since_ms: u64, now: Option<u32>) -> bool {
         }
         (shown, now) => shown.is_some() != now.is_some(),
     }
-}
-
-/// Predicted µs for `mi` million instructions at `rate` per µs.
-fn time_us(mi: u64, rate: u64) -> u64 {
-    mi * 1_000_000 / rate.max(1)
 }
 
 /// From each class's rate and CPUs: the fastest rate, for a heavy job's
@@ -1326,9 +1349,11 @@ impl Sched {
         Ok(true)
     }
 
-    fn submit(&mut self, unit: Unit, build: u32, remote: Result<Want, &'static str>, reply: oneshot::Sender<Admission>) {
+    fn submit(&mut self, unit: Unit, pid: u32, remote: Result<Want, &'static str>, reply: oneshot::Sender<Admission>) {
         self.graph.record(&unit);
-        let rank_mi = self.graph.rank(&unit.id, &self.stats);
+        let (layout, stats) = (&self.layout, &self.stats);
+        let rank_us = self.graph.rank(&unit.id, &|exact, coarse| layout.idle_us(stats, exact, coarse));
+        let build = Build { pid, rank_us, own_us: layout.idle_us(stats, &unit.exact, &unit.coarse) };
         let pred = self.stats.predict(&unit.exact, &unit.coarse);
         let pinned = self.mismatches.get(&unit.exact).is_some_and(|n| *n >= PIN_AFTER);
         let portable = match remote {
@@ -1342,7 +1367,7 @@ impl Sched {
                 Err(id) => Err(format_compact!("{id}, a crate below it, was never seen compiling")),
             },
         };
-        self.queue.push(Waiting { unit, build, pred, rank_mi, portable, since: Instant::now(), reply });
+        self.queue.push(Waiting { unit, build, pred, portable, since: Instant::now(), reply });
     }
 
     fn finished(&mut self, job: JobId, unit: &Unit, ran: Option<(Ran, u64)>) {
@@ -1494,9 +1519,8 @@ impl Sched {
             return refuse("no token");
         }
         self.layout.pool[k] -= 1;
-        let rank_mi = pred.cost_mi();
         let Estimate { spot, run_us, .. } = self.estimate(&unit, self.local(place), self.load_c, false);
-        match self.admit(unit, None, pred, rank_mi, place, (spot.at, run_us), now) {
+        match self.admit(unit, None, pred, place, (spot.at, run_us), now) {
             Ok(slot) => Some(slot),
             Err(e) => {
                 error!("{e:#}");
@@ -1613,6 +1637,7 @@ impl Sched {
         }
         let held = self.retired.iter().flat_map(|l| &l.leases).map(|l| l.lent.iter().sum::<u32>()).sum();
         self.layout.owe(held);
+        self.graph.invalidate();
         if let Err(e) = classes::set_current(&self.setup.state_dir, &profile) {
             warn!("recording profile {profile}: {e:#}");
         }
@@ -1703,10 +1728,6 @@ impl Sched {
         self.mem.capacity_kb.saturating_sub(self.mem.used_kb + self.mem_growth_kb())
     }
 
-    fn local_cpus(&self) -> u64 {
-        self.layout.classes.iter().map(|c| c.cpus.len() as u64).sum()
-    }
-
     // XCR claude for claude: [doc-drift/low] The first two doc lines are left from an
     // older signature (there is no `codegen_units` here); the second sentence is the
     // doc. Delete the first. (sched-09)
@@ -1717,8 +1738,8 @@ impl Sched {
     fn local(&self, place: Place) -> (PlaceId, bool, u64) {
         let places = &self.layout.places;
         match place {
-            Place::Local { class, .. } => (places.classes[class], true, self.local_cpus()),
-            Place::Spread { .. } | Place::Remote { .. } => (places.all, false, self.local_cpus()),
+            Place::Local { class, .. } => (places.classes[class], true, self.layout.cpus()),
+            Place::Spread { .. } | Place::Remote { .. } => (places.all, false, self.layout.cpus()),
         }
     }
 
@@ -1750,7 +1771,7 @@ impl Sched {
         let young = |w: &Waiting| now.duration_since(w.since) < GATHER;
         self.gathering = self.queue.iter().filter(|w| young(w)).map(|w| w.since + GATHER).min();
         let prio = |w: &Waiting| {
-            w.rank_mi as f64 * (now.duration_since(w.since).as_secs_f64() / AGING_S).exp2()
+            w.build.rank_us as f64 * (now.duration_since(w.since).as_secs_f64() / AGING_S).exp2()
         };
         self.queue.sort_by(|a, b| prio(b).total_cmp(&prio(a)));
         let mut admissible: LPooled<Vec<usize>> = LPooled::take();
@@ -1759,14 +1780,14 @@ impl Sched {
             return;
         }
         self.measure_if_stale(now);
-        // The work left in each build: the largest rank among its jobs,
+        // How long each build runs on: the largest rank among its jobs,
         // counting the ones too young to place.
         let mut horizon: LPooled<HashMap<u32, u64>> = LPooled::take();
         for (build, rank) in self
             .queue
             .iter()
-            .map(|w| (w.build, w.rank_mi))
-            .chain(self.running.iter().filter_map(|r| Some((r.build?, r.rank_left_mi(now)))))
+            .map(|w| (w.build.pid, w.build.rank_us))
+            .chain(self.running.iter().filter_map(|r| r.rank_left_us(now)))
         {
             let h = horizon.entry(build).or_default();
             *h = (*h).max(rank);
@@ -1784,7 +1805,6 @@ impl Sched {
         placed_us.resize(held.len(), u64::MAX);
         self.count_available(now);
         let fastest = self.layout.by_speed()[0];
-        let fastest_rate = self.layout.classes[fastest].rate;
         let id = self.layout.id;
         // How much later than its state predicts each class of each box frees
         // a token, for the jobs this dispatch has set waiting for it.
@@ -1852,7 +1872,7 @@ impl Sched {
                     }
                 }
                 (!cands.is_empty()).then(|| {
-                    // CR claude for claude: [bug/medium] slack_us is the horizon's spare work in
+                    // XCR claude for claude: [bug/medium] slack_us is the horizon's spare work in
                     // calibrated µs on the fastest class idle, but every Cand's finish_us comes
                     // from Stats::time_us, which multiplies by the place's factor at the load
                     // now. choose compares the two, so under load the slack window shrinks by
@@ -1867,8 +1887,15 @@ impl Sched {
                     // Convert the slack at the fastest class's factor under load_here (e.g.
                     // Stats::time_us of a prediction holding the spare work), and add a loaded
                     // variant of work_that_gates_a_chain_gets_the_fast_class. (sched-01)
-                    let slack_us = time_us(horizon[&w.build].saturating_sub(w.rank_mi), fastest_rate);
-                    choose(&cands, local, slack_us)
+                    // 2026-11-01 claude: dispatch's slack is the build's spare rank (µs idle,
+                    // see (graph-01)) times the fastest class's factor at load_here over its
+                    // factor at 0. Test:
+                    // a_job_with_time_to_spare_takes_the_slow_class_under_load_too, the CR's
+                    // probe at 0 and 16 runnable on 4 cpus; leaf takes cpu 2 in both, and cpu 0
+                    // at load 400 without the factor.
+                    let idle_to_now = self.stats.factor(fastest_at, load_here) / self.stats.factor(fastest_at, 0);
+                    let spare_idle_us = horizon[&w.build.pid].saturating_sub(w.build.rank_us);
+                    choose(&cands, local, (spare_idle_us as f64 * idle_to_now) as u64)
                 })
             } else {
                 // Its front end runs first, on one thread, so the short jobs
@@ -1997,7 +2024,7 @@ impl Sched {
             // If the wrapper is gone a slot comes back through Drop.
             match place {
                 Place::Local { .. } | Place::Spread { .. } => {
-                    let admission = match self.admit(w.unit, Some(w.build), w.pred, w.rank_mi, place, (at, run_us), now) {
+                    let admission = match self.admit(w.unit, Some(w.build), w.pred, place, (at, run_us), now) {
                         Ok(slot) => Admission::Slot(slot),
                         Err(e) => {
                             error!("{e:#}");
@@ -2126,13 +2153,11 @@ impl Sched {
     /// Start a job here at `place`, a class or every CPU, holding a token
     /// already taken from the class `place` names. It runs at `at` in the
     /// cost table and is predicted to take `run_us`.
-    #[allow(clippy::too_many_arguments)]
     fn admit(
         &mut self,
         unit: Unit,
-        build: Option<u32>,
+        build: Option<Build>,
         pred: Prediction,
-        rank_mi: u64,
         place: Place,
         (at, run_us): (PlaceId, u64),
         now: Instant,
@@ -2168,8 +2193,6 @@ impl Sched {
             at,
             run_us,
             mem_kb: pred.mem_kb,
-            cost_mi: pred.cost_mi(),
-            rank_mi,
             start: now,
             pid: None,
             foot_kb: 0,
@@ -2191,8 +2214,6 @@ impl Sched {
             at,
             run_us,
             mem_kb: 0,
-            cost_mi: w.pred.cost_mi(),
-            rank_mi: w.rank_mi,
             start: now,
             pid: None,
             foot_kb: 0,
@@ -2276,7 +2297,8 @@ impl Sched {
     fn status(&mut self) -> Status {
         self.measure_if_stale(Instant::now());
         let mut ranks: LPooled<HashMap<ArcStr, u64>> = LPooled::take();
-        for (key, rank) in self.graph.ranked(&self.stats) {
+        let (layout, stats) = (&self.layout, &self.stats);
+        for (key, rank) in self.graph.ranked(&|exact, coarse| layout.idle_us(stats, exact, coarse)) {
             let r = ranks.entry(key).or_default();
             *r = (*r).max(rank);
         }
@@ -2295,13 +2317,7 @@ impl Sched {
             .units()
             .map(|(key, info)| {
                 let [here, sent, served] = info.runs;
-                let place = match light(&info.pred) {
-                    true => Place::Local { layout: id, class: fastest },
-                    false => Place::Spread { layout: id, class: fastest },
-                };
-                let (at, pinned, cpus) = self.local(place);
-                let (pred, _) = self.stats.predict_at(key, key, at);
-                let spot = Spot::new(&pred, 1, at, pinned, cpus);
+                let (pred, spot) = layout.fastest(&self.stats, key, key);
                 UnitStatus {
                     key: key.clone(),
                     here,
@@ -2315,7 +2331,7 @@ impl Sched {
                     mem_kb: info.pred.mem_kb,
                     copy_ms: info.copy_ms,
                     sent_kb: info.sent_kb,
-                    rank_ms: ranks.get(key).map(|&r| ms(r)),
+                    rank_ms: ranks.get(key).map(|&r| r / 1000),
                 }
             })
             .collect();
@@ -2392,7 +2408,7 @@ impl Sched {
                 SpreadStatus {
                     running: 0,
                     serving: 0,
-                    threads: self.local_cpus() as u32,
+                    threads: layout.cpus() as u32,
                     thread_speed_c: speed_c(mean, layout.places.all, self.load_c),
                 },
                 |n, r| match r.build {
@@ -2787,6 +2803,45 @@ mod test {
     }
 
     #[tokio::test]
+    async fn a_job_with_time_to_spare_takes_the_slow_class_under_load_too() -> Result<()> {
+        // big gates as much as it takes; leaf has 2 ms to spare at idle speed:
+        // enough for the slow class, which takes 1 ms longer idle and 4.5 ms
+        // longer at 4 tasks per cpu, when the build after leaf also takes 4.25
+        // times as long.
+        for runnable in [0, 16] {
+            let dir = scratch(&format!("slack-{runnable}"));
+            let room = Room { runnable: Box::new(move || Ok(runnable)), ..room(u64::MAX) };
+            let classes = vec![class(1000, &[0, 1]), class(2000, &[2, 3])];
+            let (mut s, _rx, _load) = sched(&dir, classes, room, &[("big", 3000, 1), ("leaf", 1000, 1)], &[])?;
+            let mut rx = place(&mut s, &["big", "leaf"], false);
+            let slots: Vec<Slot> = rx.iter_mut().map(granted).collect();
+            assert_eq!((cpu(&slots[0]), cpu(&slots[1])), (0, 2), "{runnable} tasks runnable");
+            drop((slots, s));
+            fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rank_counts_a_wide_job_at_the_threads_it_gets() -> Result<()> {
+        let dir = scratch("rank-wide");
+        let classes = vec![class(1000, &[0, 1, 2, 3])];
+        let (mut s, _rx, _load) = sched(&dir, classes, room(u64::MAX), &[], &[("wide", &["gate"])])?;
+        // gate takes 1 ms on a cpu; wide's 8 ms of work run on 4.
+        history(&mut s, "gate", 1000, 100);
+        history(&mut s, "wide", 8000, 400);
+        let (reply, _rx) = oneshot::channel();
+        s.submit(unit("gate", &[]), 1, Err("the wrapper keeps it here"), reply);
+        let Build { rank_us, own_us, .. } = s.queue[0].build;
+        assert_eq!((rank_us, own_us), (3000, 1000));
+        let st = s.status();
+        assert_eq!(st.units.iter().find(|u| u.key == "gate").and_then(|u| u.rank_ms), Some(3));
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_small_job_takes_a_free_fast_core_rather_than_wait_for_a_slow_one() -> Result<()> {
         // gate takes 1 s, the work after it 50 s, small 10 or 20 ms.
         let h = Harness::start(
@@ -3152,7 +3207,8 @@ mod test {
         let p = pred.mem_kb;
         s.layout.pool[0] -= 1;
         let place = Place::Local { layout: s.layout.id, class: 0 };
-        let slot = s.admit(u.clone(), Some(1), pred, 10, place, (s.layout.places.classes[0], 10), Instant::now())?;
+        let build = Build { pid: 1, rank_us: 10, own_us: 10 };
+        let slot = s.admit(u.clone(), Some(build), pred, place, (s.layout.places.classes[0], 10), Instant::now())?;
         assert_eq!(s.mem_free_kb(), 10_000 - p, "nothing sampled yet: all of it is to come");
         // The box's use includes what the job holds, so only the rest is to come.
         (s.running[0].foot_kb, s.mem.used_kb) = (p / 2, p / 2);
