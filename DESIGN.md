@@ -512,9 +512,13 @@ state, and unchanged columns aren't sent. Free tokens are the class's tokens
 no job holds, so they leave out the tokens lent to rustc's codegen threads.
 The prediction is the soonest predicted end of a job holding one of the
 class's tokens, this box's or another's: 0 with a token free, unknown while
-the box takes no offers. It changing alone doesn't republish; it goes out with
-the next change, and clients count it down from when the state arrived. The
-load changing republishes only once it has moved a quarter of a task per CPU.
+the box takes no offers. Clients count it down from when the state arrived,
+and the box republishes once its prediction is a quarter later or sooner than
+what they have counted down to, and at least 250 ms: a job past its predicted
+time is expected to run half again as long as it has, so its class's next
+token moves later while clients count toward 0. It becoming known or unknown
+republishes too. The load changing republishes only once it has moved a
+quarter of a task per CPU.
 A box publishes no free tokens while it switches profile or its own jobs wait.
 Until a switch applies, it publishes the profile and classes its jobs still
 run on, so no client pairs one profile's name with another's rates.

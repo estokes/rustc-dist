@@ -76,6 +76,11 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 /// A change in load this large, in hundredths of a task per CPU, is
 /// published even if nothing else changed.
 const LOAD_STEP_C: u32 = 25;
+/// A class's next token, once predicted to free this share of the time
+/// later or sooner than clients count down to, and at least
+/// `FREES_IN_STEP_MS`, is published even if nothing else changed.
+const FREES_IN_SHARE: f64 = 0.25;
+const FREES_IN_STEP_MS: u64 = 250;
 /// A sample of the box's runnable tasks counts `1/e` as much after this
 /// long: long enough that one sample doesn't swing placement, short
 /// enough to follow test runs starting and stopping.
@@ -856,7 +861,7 @@ struct RemoteBox {
 }
 
 impl RemoteBox {
-    // CR claude for claude: [bug/medium] Once the published frees_in_ms has passed, this
+    // XCR claude for claude: [bug/medium] Once the published frees_in_ms has passed, this
     // returns 0 and stays there until the box republishes, which a prediction changing
     // alone never causes (Sched::publish). Here an overdue job is expected to run half
     // again as long as it has (Running::left_us), so it can't strand jobs waiting for
@@ -873,6 +878,19 @@ impl RemoteBox {
     // 2026-11-01 claude: Eric ruled (2026-11-01): the server republishes when its
     // predicted frees-in moves by more than some share (b): easy, and the correct
     // long-term fix.
+    // 2026-11-01 claude: Per the ruling, the server side: Sched::publish republishes
+    // when a class's frees_in_ms differs from what clients have counted down to (the
+    // value shown less the time since Sched::published) by more than a quarter of the
+    // larger and at least 250 ms (frees_in_moved, FREES_IN_SHARE, FREES_IN_STEP_MS), or
+    // turns known/unknown; publish now keeps the shown classes until it sends a new
+    // version, so that baseline is what clients have. An overdue job here
+    // (Running::left_us) thus moves the published prediction later while clients count
+    // to 0. offers_are_refused_while_local_jobs_wait now expects a version when a local
+    // job starts waiting (frees_in_ms goes to None). Tests:
+    // a_box_republishes_when_its_next_token_moves_from_what_clients_count_down_to (fails
+    // if only rate, cpus and free republish) and
+    // a_prediction_is_republished_once_it_moves_a_share_and_a_step. DESIGN.md (Farm)
+    // updated. No message format changed.
     /// µs until a token of class `k`, which has none for jobs from here,
     /// is predicted to free: as its state says, or, if the tokens it shows
     /// free went to jobs from here it doesn't show yet, when the first of
@@ -949,6 +967,20 @@ fn set_aside(path: &Path) -> Result<PathBuf> {
         .context("no free name")?;
     fs::rename(path, &aside)?;
     Ok(aside)
+}
+
+/// Whether a class's next token, predicted to free in `now` ms, has moved
+/// far enough from `shown`, published `since_ms` ago and counted down by
+/// clients since, to publish it again.
+fn frees_in_moved(shown: Option<u32>, since_ms: u64, now: Option<u32>) -> bool {
+    match (shown, now) {
+        (Some(shown), Some(now)) => {
+            let (counted, now) = ((shown as u64).saturating_sub(since_ms), now as u64);
+            let moved = counted.abs_diff(now);
+            moved >= FREES_IN_STEP_MS && moved as f64 > FREES_IN_SHARE * counted.max(now) as f64
+        }
+        (shown, now) => shown.is_some() != now.is_some(),
+    }
 }
 
 /// Predicted µs for `mi` million instructions at `rate` per µs.
@@ -1065,6 +1097,9 @@ pub struct Sched {
     mismatches: HashMap<ArcStr, u8>,
     /// An offer was answered, so the next publish must send a new version.
     answered: bool,
+    /// When the last version was published, which clients count its
+    /// predictions down from.
+    published: Instant,
     stats: Stats,
     graph: Graph,
     load: watch::Sender<Load>,
@@ -1127,6 +1162,7 @@ impl Sched {
             remotes: Vec::new(),
             mismatches: HashMap::new(),
             answered: false,
+            published: Instant::now(),
             stats,
             graph,
             load,
@@ -2141,26 +2177,28 @@ impl Sched {
         // fails with the target name published. DESIGN.md (Farm) says so.
         let profile = self.profile.name();
         let load_c = self.load_c;
-        self.load.send_if_modified(|load| {
-            let mut changed = answered
-                || load.profile != *profile
-                || load.classes.len() != classes.len()
-                || load.load_c.abs_diff(load_c) >= LOAD_STEP_C;
-            load.classes.resize(classes.len(), ClassState { rate: 0, cpus: 0, free: 0, frees_in_ms: None });
-            // A prediction alone changing doesn't republish: it goes out
-            // with the next change, and clients age it.
+        let since_ms = now.saturating_duration_since(self.published).as_millis() as u64;
+        let changed = self.load.send_if_modified(|load| {
             let key = |c: &ClassState| (c.rate, c.cpus, c.free);
-            for (l, now) in load.classes.iter_mut().zip(classes.drain(..)) {
-                changed |= key(l) != key(&now);
-                *l = now;
-            }
+            let changed = answered
+                || load.profile != *profile
+                || load.load_c.abs_diff(load_c) >= LOAD_STEP_C
+                || load.classes.len() != classes.len()
+                || load.classes.iter().zip(classes.iter()).any(|(shown, c)| {
+                    key(shown) != key(c) || frees_in_moved(shown.frees_in_ms, since_ms, c.frees_in_ms)
+                });
             if changed {
                 load.profile = profile.clone();
                 load.load_c = load_c;
+                load.classes.clear();
+                load.classes.extend(classes.drain(..));
                 load.version += 1;
             }
             changed
         });
+        if changed {
+            self.published = now;
+        }
     }
 
     fn status(&mut self) -> Status {
@@ -2820,13 +2858,60 @@ mod test {
         assert!(shown.classes[0].frees_in_ms.is_some(), "it predicts when the served job ends");
         let mut local = h.submit("l");
         assert!(pending(&mut local).await);
+        let closed = h.load.borrow().clone();
+        assert_eq!(closed.classes[0].frees_in_ms, None, "its own waiting job comes first");
+        assert_eq!(closed.version, answer.version + 1, "and clients hear so at once");
         let refused = h.offer("r", Some(0)).await?;
         assert!(refused.slot.is_none(), "a local job is waiting");
-        assert_eq!(refused.version, answer.version + 1, "a refusal is published too");
-        assert_eq!(h.load.borrow().classes[0].frees_in_ms, None, "its own waiting job comes first");
+        assert_eq!(refused.version, closed.version + 1, "a refusal is published too");
         drop(served);
         slot(local).await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_box_republishes_when_its_next_token_moves_from_what_clients_count_down_to() -> Result<()> {
+        let dir = scratch("frees-in");
+        let (mut s, _rx, load) = sched(&dir, vec![class(1000, &[0])], room(u64::MAX), &[], &[])?;
+        history(&mut s, "a", 10_000_000, 100);
+        let slot = granted(&mut place(&mut s, &["a"], false)[0]);
+        s.publish();
+        let shown = || {
+            let l = load.borrow();
+            (l.version, l.classes[0].frees_in_ms.unwrap_or(u32::MAX))
+        };
+        let (version, ms) = shown();
+        assert!((9_900..=10_000).contains(&ms), "it takes 10 s: {ms}");
+        let later = |s: &mut Sched, by: Duration| {
+            s.running[0].start -= by;
+            s.published -= by;
+            s.publish();
+        };
+        later(&mut s, Duration::from_secs(2));
+        assert_eq!(shown(), (version, ms), "8 s left, as clients count down");
+        // It runs 20 s over, and is expected to run 15 s more, where clients
+        // count down to 0.
+        later(&mut s, Duration::from_secs(28));
+        let (republished, ms) = shown();
+        assert_eq!(republished, version + 1);
+        assert!((15_000..=15_100).contains(&ms), "half again as long as it has run: {ms}");
+        drop((slot, s));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_prediction_is_republished_once_it_moves_a_share_and_a_step() {
+        // Shown as 10 s, 2 s ago: clients count 8 s.
+        assert!(!frees_in_moved(Some(10_000), 2_000, Some(8_000)));
+        assert!(!frees_in_moved(Some(10_000), 2_000, Some(9_900)), "within a quarter");
+        assert!(frees_in_moved(Some(10_000), 2_000, Some(11_000)));
+        assert!(frees_in_moved(Some(10_000), 2_000, Some(5_000)));
+        // Clients count down to 0, the box says 200 ms: too small a step.
+        assert!(!frees_in_moved(Some(1_000), 5_000, Some(200)));
+        assert!(frees_in_moved(Some(1_000), 5_000, Some(300)));
+        assert!(frees_in_moved(None, 0, Some(0)), "it can say again");
+        assert!(frees_in_moved(Some(0), 0, None));
     }
 
     #[tokio::test]
