@@ -235,7 +235,8 @@ so test binaries and other work the daemon doesn't run count. The count swings
 from one moment to the next, so it is sampled every 250 ms into a moving
 average in which a sample counts `1/e` as much after 10 s, and placement,
 publishing and the samples a run takes all use the average. A run's load is
-the mean of the average while it ran. Boxes publish their load.
+the mean of the samples taken since its rustc started, or the latest sample
+for a run too short to be sampled. Boxes publish their load.
 
 A unit's size is the work it takes, in millions of the calibration load's
 instructions: its front end, the compile up to rustc's `.rmeta` line, which
@@ -347,7 +348,10 @@ where they ran and for whom. Admission uses the unit's p90 peak. Only
 successful compiles are recorded. A cell unrun for about 60 days, as long as
 the build graph keeps a node, is dropped. A table from before runs were timed
 loads as seed history: each unit's median instruction count, front end and
-width become one run at a place with factor 1.
+width become one run at a place with factor 1. A table the daemon can't read,
+such as one a later version wrote, is moved aside to `jobs.hdr.unreadable`
+(or `.unreadable.2`, and so on, never over one already there), with an error
+in the log, and the daemon starts with an empty table.
 
 ## Build graph
 
@@ -369,6 +373,8 @@ links them.
 
 The daemon records every admitted job's id and dependencies, persisted in
 `$XDG_STATE_HOME/rustc-dist/graph`. Nodes not seen for 60 days are dropped.
+A graph the daemon can't read is moved aside to `graph.unreadable`, as the
+cost table is.
 
 Cargo's hash doesn't depend on where the workspace is, so every checkout of a
 workspace builds its crates under the same file names, even checkouts of
@@ -415,8 +421,9 @@ jobs with time to spare on slow cores.
    finishes first, even if it must wait for it.
 5. A job that waits for a class adds its predicted time, divided by the class's
    CPUs, to that class's expected wait, so later jobs don't all count on the
-   same free slot. A class whose last token a pass hands out frees no sooner
-   than the quickest job that pass placed there.
+   same free slot. A class whose last token a pass hands out frees when its
+   first job ends: the quickest job that pass placed there, or the job
+   already holding one of its tokens that is predicted to end soonest.
 6. A job past its predicted time is expected to run at least half again as long
    as it has, so an overdue estimate can't strand jobs waiting for its class.
 7. A job is placed only after it has waited 20 ms. Cargo starts a wave of ready
@@ -509,6 +516,8 @@ the box takes no offers. It changing alone doesn't republish; it goes out with
 the next change, and clients count it down from when the state arrived. The
 load changing republishes only once it has moved a quarter of a task per CPU.
 A box publishes no free tokens while it switches profile or its own jobs wait.
+Until a switch applies, it publishes the profile and classes its jobs still
+run on, so no client pairs one profile's name with another's rates.
 The scheduler publishes after every event, which includes the 100 ms ticks
 that lend tokens while jobs run. A changed state is republished at most every
 100 ms. The daemon lists `BASE/vN/status` for other

@@ -210,7 +210,9 @@ or above the directory you run cargo in:
 local = ["sqlx-macros"]
 ```
 
-Calibrations and history live in `~/.local/state/rustc-dist`. The daemon logs
+Calibrations and history live in `~/.local/state/rustc-dist`. A history file
+the daemon can't read, for example after going back to an older version, is
+moved aside as `NAME.unreadable`, and the daemon starts without it. The daemon logs
 to the journal (`journalctl --user -u rustc-dist`), at the level set by
 `RUSTC_DIST_LOG` (`info` by default). `RUSTC_DIST_LOG=info,placement=debug`
 adds a line per job saying where it went: whether it ran before and its time

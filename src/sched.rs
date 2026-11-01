@@ -151,8 +151,11 @@ pub struct Meter {
     tokens_us: AtomicU64,
     held: AtomicU32,
     counted_us: AtomicU64,
+    /// The sum and count of load samples since its rustc started, and the
+    /// latest sample, which stands for a job too short to be sampled.
     load_c: AtomicU64,
     samples: AtomicU32,
+    last_c: AtomicU32,
 }
 
 impl Meter {
@@ -163,8 +166,9 @@ impl Meter {
             tokens_us: AtomicU64::new(0),
             held: AtomicU32::new(1),
             counted_us: AtomicU64::new(0),
-            load_c: AtomicU64::new(load_c as u64),
-            samples: AtomicU32::new(1),
+            load_c: AtomicU64::new(0),
+            samples: AtomicU32::new(0),
+            last_c: AtomicU32::new(load_c),
         }
     }
 
@@ -172,7 +176,7 @@ impl Meter {
         now.saturating_duration_since(self.start).as_micros() as u64
     }
 
-    // CR claude for claude: [bug/low] restart resets the token count but keeps every
+    // XCR claude for claude: [bug/low] restart resets the token count but keeps every
     // load sample taken since admission, not only the admission one the doc names:
     // Sched::measure samples every lease from Layout::lease on. A served job's slot
     // exists while its inputs arrive (sandbox.rs calls Slot::started only once bwrap
@@ -181,11 +185,20 @@ impl Meter {
     // teaches, under that bucket. DESIGN.md says the server reports token-µs and load
     // "counted from when rustc started". Count samples from restart on, keeping the
     // admission load only for a job no later sample reached. (sched-05)
-    /// Its rustc started: count tokens from now. The load sampled when the
-    /// job was admitted stays, for a job too short to be sampled again.
+    // 2026-11-01 claude: Meter::restart now clears the load sum and count as well;
+    // Meter keeps last_c, the latest sample (the admission load until one is taken),
+    // which measured() returns when no sample came after restart. I used the latest
+    // sample rather than the admission load for that case: for a served job whose
+    // inputs took 30 s it is the load nearest rustc's start, and for a local job,
+    // restarted at once, it is the admission load. DESIGN.md (Cost) says so. Test:
+    // a_job_is_measured_at_the_load_while_its_rustc_ran (fails if restart keeps the
+    // samples).
+    /// Its rustc started: count tokens and load from now.
     fn restart(&self, now: Instant) {
         self.counted_us.store(self.at_us(now), Ordering::Relaxed);
         self.tokens_us.store(0, Ordering::Relaxed);
+        self.load_c.store(0, Ordering::Relaxed);
+        self.samples.store(0, Ordering::Relaxed);
     }
 
     /// It holds `held` tokens from `now` on.
@@ -198,16 +211,17 @@ impl Meter {
     fn sample(&self, load_c: u32) {
         self.load_c.fetch_add(load_c as u64, Ordering::Relaxed);
         self.samples.fetch_add(1, Ordering::Relaxed);
+        self.last_c.store(load_c, Ordering::Relaxed);
     }
 
     fn measured(&self, now: Instant) -> Measured {
         let since = self.at_us(now).saturating_sub(self.counted_us.load(Ordering::Relaxed));
         let tail = self.held.load(Ordering::Relaxed) as u64 * since;
-        let samples = self.samples.load(Ordering::Relaxed).max(1) as u64;
-        Measured {
-            tokens_us: self.tokens_us.load(Ordering::Relaxed) + tail,
-            load_c: (self.load_c.load(Ordering::Relaxed) / samples) as u32,
-        }
+        let load_c = match self.samples.load(Ordering::Relaxed) {
+            0 => self.last_c.load(Ordering::Relaxed),
+            n => (self.load_c.load(Ordering::Relaxed) / n as u64) as u32,
+        };
+        Measured { tokens_us: self.tokens_us.load(Ordering::Relaxed) + tail, load_c }
     }
 }
 
@@ -901,6 +915,42 @@ fn timed(at: PlaceId, ran: &Ran, m: Measured, linker_waited_us: u64, mem_kb: u64
     }
 }
 
+/// What `load` reads from `path`, or, if the file is there but can't be
+/// read, `empty()` once the file is moved aside, so that saving doesn't
+/// overwrite what it holds.
+fn load_or_set_aside<T>(
+    path: &Path,
+    what: &str,
+    load: impl FnOnce(&Path) -> Result<T>,
+    empty: impl FnOnce() -> T,
+) -> Result<T> {
+    let e = match load(path) {
+        Ok(t) => return Ok(t),
+        Err(e) => e,
+    };
+    let aside = set_aside(path).with_context(|| format_compact!("moving unreadable {} aside: {e:#}", path.display()))?;
+    error!("starting with an empty {what}: {} is unreadable, moved to {}: {e:#}", path.display(), aside.display());
+    Ok(empty())
+}
+
+/// Rename `path` to the first of `PATH.unreadable`, `PATH.unreadable.2`,
+/// ... that doesn't exist.
+fn set_aside(path: &Path) -> Result<PathBuf> {
+    let aside = (1u32..)
+        .map(|n| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".unreadable");
+            if n > 1 {
+                name.push(format_compact!(".{n}").as_str());
+            }
+            PathBuf::from(name)
+        })
+        .find(|p| !p.exists())
+        .context("no free name")?;
+    fs::rename(path, &aside)?;
+    Ok(aside)
+}
+
 /// Predicted µs for `mi` million instructions at `rate` per µs.
 fn time_us(mi: u64, rate: u64) -> u64 {
     mi * 1_000_000 / rate.max(1)
@@ -1030,7 +1080,7 @@ impl Sched {
         load: watch::Sender<Load>,
         tx: mpsc::UnboundedSender<Msg>,
     ) -> Result<Self> {
-        // CR claude for claude: [risk/medium] A table or graph that exists but fails to load
+        // XCR claude for claude: [risk/medium] A table or graph that exists but fails to load
         // (a binary rolled back to before a format change, a reader bug) is logged,
         // replaced by an empty one, and overwritten by the next Sched::save within a
         // minute. A rollback, which is routine here, then loses every learned size, factor
@@ -1040,14 +1090,17 @@ impl Sched {
         // before starting empty, or refuse to start. (sched-04)
         // 2026-11-01 claude: Eric ruled (2026-11-01): move the unreadable file aside with
         // an error log and start empty (a).
-        let mut stats = Stats::load(&setup.state_dir.join("jobs.hdr"), setup.decay).unwrap_or_else(|e| {
-            warn!("starting with empty job stats: {e:#}");
-            Stats::new(setup.decay)
-        });
-        let graph = Graph::load(&setup.state_dir.join("graph")).unwrap_or_else(|e| {
-            warn!("starting with an empty build graph: {e:#}");
-            Graph::new()
-        });
+        // 2026-11-01 claude: Sched::new loads both files through load_or_set_aside: a file
+        // that exists but won't load is renamed to NAME.unreadable (NAME.unreadable.2 and on
+        // if that is taken, so a roll back and forth never overwrites one), with an error
+        // log, and the daemon starts empty; if the rename fails, Sched::new fails. DESIGN.md
+        // (Cost, Build graph) and README say so. Test:
+        // unreadable_state_is_moved_aside_before_starting_empty (fails with the rename
+        // skipped).
+        let decay = setup.decay;
+        let jobs = setup.state_dir.join("jobs.hdr");
+        let mut stats = load_or_set_aside(&jobs, "job stats", |p| Stats::load(p, decay), || Stats::new(decay))?;
+        let graph = load_or_set_aside(&setup.state_dir.join("graph"), "build graph", Graph::load, Graph::new)?;
         let (classes, switch) = match classes::load(&setup.state_dir, &profile, &setup.allowed) {
             Ok(Some(classes)) => (classes, Switch::No),
             Ok(None) => (classes::fallback(&setup.allowed), Switch::Draining(profile.clone())),
@@ -1374,7 +1427,8 @@ impl Sched {
         }
         self.layout.pool[k] -= 1;
         let rank_mi = pred.cost_mi();
-        match self.admit(unit, None, pred, rank_mi, place, now) {
+        let Estimate { spot, run_us, .. } = self.estimate(&unit, self.local(place), self.load_c, false);
+        match self.admit(unit, None, pred, rank_mi, place, (spot.at, run_us), now) {
             Ok(slot) => Some(slot),
             Err(e) => {
                 error!("{e:#}");
@@ -1545,11 +1599,11 @@ impl Sched {
         self.layout.classes.iter().map(|c| c.cpus.len() as u64).sum()
     }
 
-    // CR claude for claude: [doc-drift/low] The first two doc lines are left from an
+    // XCR claude for claude: [doc-drift/low] The first two doc lines are left from an
     // older signature (there is no `codegen_units` here); the second sentence is the
     // doc. Delete the first. (sched-09)
-    /// Where a job of `codegen_units` runs here at `place`, a class or
-    /// every CPU.
+    // 2026-11-01 claude: Deleted the stale first doc sentence of Sched::local;
+    // doc-only, no test.
     /// Where a place on this box is in the cost table, whether a job there
     /// is pinned to a class, and the box's CPUs.
     fn local(&self, place: Place) -> (PlaceId, bool, u64) {
@@ -1806,12 +1860,16 @@ impl Sched {
                     placed_us[class] = placed_us[class].min(run_us);
                     held[class] -= 1;
                     if held[class] == 0 {
-                        // CR claude for claude: [doc-drift/low] DESIGN.md (Scheduling, step 5)
+                        // XCR claude for claude: [doc-drift/low] DESIGN.md (Scheduling, step 5)
                         // says a class whose last token a pass hands out "frees no sooner than
                         // the quickest job that pass placed there", but this takes the minimum
                         // of that and the soonest end of the jobs already holding its tokens:
                         // it frees at whichever ends first. Reword DESIGN.md to match.
                         // (sched-10)
+                        // 2026-11-01 claude: DESIGN.md Scheduling step 5 now says the class
+                        // frees when its first job ends: the quickest one the pass placed
+                        // there or the soonest of those already holding its tokens. Doc-only,
+                        // no test.
                         let placed = placed_us[class];
                         frees_in[class] = self.frees_in_us(class, now).map_or(placed, |t| t.min(placed));
                     }
@@ -1831,7 +1889,7 @@ impl Sched {
             // If the wrapper is gone a slot comes back through Drop.
             match place {
                 Place::Local { .. } | Place::Spread { .. } => {
-                    let admission = match self.admit(w.unit, Some(w.build), w.pred, w.rank_mi, place, now) {
+                    let admission = match self.admit(w.unit, Some(w.build), w.pred, w.rank_mi, place, (at, run_us), now) {
                         Ok(slot) => Admission::Slot(slot),
                         Err(e) => {
                             error!("{e:#}");
@@ -1958,7 +2016,9 @@ impl Sched {
     }
 
     /// Start a job here at `place`, a class or every CPU, holding a token
-    /// already taken from the class `place` names.
+    /// already taken from the class `place` names. It runs at `at` in the
+    /// cost table and is predicted to take `run_us`.
+    #[allow(clippy::too_many_arguments)]
     fn admit(
         &mut self,
         unit: Unit,
@@ -1966,6 +2026,7 @@ impl Sched {
         pred: Prediction,
         rank_mi: u64,
         place: Place,
+        (at, run_us): (PlaceId, u64),
         now: Instant,
     ) -> Result<Slot> {
         let job = JobId::new();
@@ -1980,15 +2041,18 @@ impl Sched {
             .layout
             .lease(job, pinned, first, unit.codegen_units, fifo_dir, &cpus, meter.clone())
             .with_context(|| format_compact!("starting {}", unit.exact))?;
-        // CR claude for claude: [structure/low] dispatch already estimated this job's
+        // XCR claude for claude: [structure/low] dispatch already estimated this job's
         // place and run time, at load_here with the wave's earlier jobs counted, and
         // carries both in `granted`, but admit estimates again at self.load_c, so a later
         // job of a wave is recorded faster than dispatch judged it. That run_us is what
         // Running::left_us, Sched::frees_in_us and the published frees_in_ms use. Pass
         // dispatch's (run_us, at) in; only Sched::offer needs admit to estimate.
         // (sched-08)
-        let Estimate { spot, run_us, .. } = self.estimate(&unit, self.local(place), self.load_c, false);
-        let at = spot.at;
+        // 2026-11-01 claude: admit takes (at, run_us); dispatch passes the estimate it
+        // placed by (carried in granted), and only Sched::offer estimates, at
+        // self.load_c, before admitting. Test: a_wave_is_timed_as_dispatch_placed_it
+        // (four jobs in one wave at 2.25 to 3 tasks per cpu; fails with every run_us 2.25
+        // s if admit re-estimates).
         self.running.push(Running {
             job,
             build,
@@ -2059,7 +2123,7 @@ impl Sched {
             };
             ClassState { rate: c.rate, cpus: c.cpus.len() as u32, free, frees_in_ms }
         }));
-        // CR claude for claude: [risk/low] While switching, the state pairs the target
+        // XCR claude for claude: [risk/low] While switching, the state pairs the target
         // profile's name with the current layout's classes and rates. Every client's
         // Sched::farm registers places under that name with those rates, and Stats::place
         // takes a changed rate for a recalibration and starts the place over. Harmless
@@ -2068,17 +2132,14 @@ impl Sched {
         // learned of this box's `to` places, and again when the box applies `to`'s real
         // rates. Publish a name and classes that belong together, or have Sched::farm
         // skip registering places while a box takes no offers. (sched-07)
-        // A box switching shows the profile it is switching to: it takes no
-        // offers meanwhile, and its status says how far along it is.
         // 2026-11-01 claude: Eric ruled (2026-11-01): publish a name and classes that
         // belong together: the current profile until the switch applies (a).
-        let profile = match &self.switch {
-            Switch::No => &self.profile,
-            Switch::Draining(to)
-            | Switch::Calibrating { next: Some((to, _)), .. }
-            | Switch::Calibrating { profile: to, next: None } => to,
-        }
-        .name();
+        // 2026-11-01 claude: Sched::publish always publishes self.profile, the profile
+        // whose classes it publishes, until a switch applies.
+        // an_uncalibrated_profile_holds_new_jobs_until_running_ones_finish now asserts
+        // the published profile is still default while draining (and no free tokens); it
+        // fails with the target name published. DESIGN.md (Farm) says so.
+        let profile = self.profile.name();
         let load_c = self.load_c;
         self.load.send_if_modified(|load| {
             let mut changed = answered
@@ -2722,16 +2783,22 @@ mod test {
         Ok(())
     }
 
-    // CR claude for claude: [test-gap/low] The "and a free slot" half can't fail: both
+    // XCR claude for claude: [test-gap/low] The "and a free slot" half can't fail: both
     // submissions also miss the toolchain on "full" (one asks for key "other h", the
     // other for target wasm32, and "full" has the same toolchains as "b"), so "full"
     // is never judged by its tokens. Add a job "full" can build, on a harness where
     // "full" (free 0, frees_in_ms None) is the only other box, and assert it runs
     // here. (sched-06)
+    // 2026-11-01 claude: The test now first submits a job "full" can build, with
+    // "full" (free 0, frees_in_ms None) the only other box, and asserts it runs here;
+    // checked by making RemoteBox::frees_in_us read None as 0, which fails it.
     #[tokio::test]
     async fn remote_needs_a_matching_toolchain_and_a_free_slot() -> Result<()> {
         let h = Harness::start("nomatch", vec![class(1000, &[0, 1])], u64::MAX, &[("big", 5_000_000, 1)], &[])?;
+        // "full" builds it in a fifth of the time, but has no token free and
+        // says none will free.
         h.tx.send(Msg::Farm { name: "full".into(), state: Some(remote_box(200, 4, 0, 1)) })?;
+        assert!(matches!(admitted(h.submit_with("big", want())).await?, Admission::Slot(_)));
         let other = Ok(Want { key: "other h".into(), target: None, reads: Reads::Metadata, cwd: "/".into() });
         h.farm(remote_box(200, 4, 4, 1));
         assert!(matches!(admitted(h.submit_with("big", other)).await?, Admission::Slot(_)));
@@ -2821,6 +2888,34 @@ mod test {
     }
 
     #[tokio::test]
+    async fn unreadable_state_is_moved_aside_before_starting_empty() -> Result<()> {
+        let dir = scratch("unreadable");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        classes::save(&dir, &Profile::DEFAULT, &[class(1000, &[0])])?;
+        for name in ["jobs.hdr", "graph"] {
+            fs::write(dir.join(name), b"from a later version")?;
+        }
+        let (s, _rx, _load) = open(&dir, room(u64::MAX))?;
+        assert_eq!((s.stats.units().count(), s.graph.len()), (0, 0));
+        drop(s);
+        for name in ["jobs.hdr", "graph"] {
+            assert!(!dir.join(name).exists(), "{name} is still there to be saved over");
+            assert_eq!(fs::read(dir.join(format!("{name}.unreadable")))?, b"from a later version");
+        }
+        // One set aside before is kept.
+        fs::write(dir.join("graph"), b"another")?;
+        drop(open(&dir, room(u64::MAX))?);
+        assert_eq!(fs::read(dir.join("graph.unreadable"))?, b"from a later version");
+        assert_eq!(fs::read(dir.join("graph.unreadable.2"))?, b"another");
+        // A missing file is only empty.
+        drop(open(&dir, room(u64::MAX))?);
+        assert!(!dir.join("graph.unreadable.3").exists());
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn status_measures_memory_before_any_job_runs() -> Result<()> {
         let h = Harness::start("status-mem", vec![class(1000, &[0])], 1000, &[], &[])?;
         assert_eq!(h.status().await.mem_capacity_kb, 1000);
@@ -2899,7 +2994,8 @@ mod test {
         let pred = s.stats.predict(&u.exact, &u.coarse);
         let p = pred.mem_kb;
         s.layout.pool[0] -= 1;
-        let slot = s.admit(u.clone(), Some(1), pred, 10, Place::Local { layout: s.layout.id, class: 0 }, Instant::now())?;
+        let place = Place::Local { layout: s.layout.id, class: 0 };
+        let slot = s.admit(u.clone(), Some(1), pred, 10, place, (s.layout.places.classes[0], 10), Instant::now())?;
         assert_eq!(s.mem_free_kb(), 10_000 - p, "nothing sampled yet: all of it is to come");
         // The box's use includes what the job holds, so only the rest is to come.
         (s.running[0].foot_kb, s.mem.used_kb) = (p / 2, p / 2);
@@ -2913,6 +3009,21 @@ mod test {
         drop((slot, s));
         fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn a_job_is_measured_at_the_load_while_its_rustc_ran() {
+        let t0 = Instant::now();
+        let m = Meter::new(100, t0);
+        assert_eq!(m.measured(t0).load_c, 100, "not sampled yet: the load it was admitted at");
+        // Its inputs arrive while the box gets busy.
+        m.sample(900);
+        m.sample(900);
+        m.restart(t0 + Duration::from_secs(30));
+        assert_eq!(m.measured(t0).load_c, 900, "too short to be sampled: the latest sample");
+        m.sample(300);
+        m.sample(500);
+        assert_eq!(m.measured(t0).load_c, 400, "only what it saw once rustc started");
     }
 
     #[tokio::test]
@@ -3476,6 +3587,23 @@ mod test {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_wave_is_timed_as_dispatch_placed_it() -> Result<()> {
+        let dir = scratch("wave-timed");
+        // 2 tasks per cpu runnable; each job placed adds a quarter of one.
+        let room = Room { runnable: Box::new(|| Ok(8)), ..room(u64::MAX) };
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
+        history(&mut s, "narrow", 1_000_000, 100);
+        let mut rx = place(&mut s, &["narrow"; 4], false);
+        let slots: Vec<Slot> = rx.iter_mut().map(granted).collect();
+        let mut run_us: Vec<u64> = s.running.iter().map(|r| r.run_us).collect();
+        run_us.sort_unstable();
+        assert_eq!(run_us, [2_250_000, 2_500_000, 2_750_000, 3_000_000], "1 s calibrated, counting the jobs before it");
+        drop((slots, s));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
     /// A box `b` with one class, `free` tokens, and one predicted to free in
     /// `frees_in_ms`.
     fn busy_box(calib_us: u64, cpus: u32, free: u32, frees_in_ms: u32, version: u64) -> (NPath, BoxState) {
@@ -3619,7 +3747,9 @@ mod test {
         let mut waiting = h.submit("a");
         assert!(pending(&mut waiting).await, "a free token exists but the switch holds it");
         assert!(matches!(h.status().await.switching, Switching::Draining(_)));
-        assert_eq!(h.load.borrow().profile.as_str(), "never-seen", "it shows the profile it is switching to");
+        let shown = h.load.borrow().clone();
+        assert_eq!(shown.profile.as_str(), "default", "the classes it shows are still default's");
+        assert_eq!(shown.classes[0].free, 0, "it takes no offers meanwhile");
         // Stop before the calibration itself would start.
         drop(h);
         drop(running);
