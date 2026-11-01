@@ -2348,8 +2348,8 @@ impl Sched {
         }
     }
 
-    /// Save the job stats and the build graph, and start saving the file
-    /// hashes on a blocking thread, which the returned task finishes.
+    /// Save the job stats and the build graph here, and the file hashes on
+    /// a blocking thread, whose task it returns.
     fn save(&mut self) -> task::JoinHandle<()> {
         if self.stats.dirty {
             self.stats.rebuild_global();
