@@ -16,8 +16,8 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use arcstr::ArcStr;
-use netidx::{path::Path as NPath, InternalOnly};
-use netidx_protocols::pack_channel::{client::Connection, server::Listener};
+use netidx::{InternalOnly, path::Path as NPath, subscriber::Value};
+use netidx_protocols::pack_channel::client::Connection;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -64,17 +64,7 @@ async fn server(dir: &Path) -> Result<ServerBox> {
     let store = Store::open(store_dir.clone(), 1 << 30)?;
     let server = Arc::new(Server::new(store, dir.join("jobs"), toolchain::installed(), tx.clone())?);
     let jobs = NPath::from("/test/rustc-dist/b/jobs");
-    let mut listener = Listener::new(net.publisher(), None, jobs.clone()).await?;
-    tokio::spawn(async move {
-        while let Ok(con) = listener.accept().await {
-            let server = server.clone();
-            tokio::spawn(async move {
-                if let Err(e) = sandbox::serve(server, con).await {
-                    eprintln!("serve: {e:#}");
-                }
-            });
-        }
-    });
+    tokio::spawn(sandbox::listen(net.publisher().clone(), jobs.clone(), server).await?);
     Ok(ServerBox { subscriber: net.subscriber().clone(), _net: net, jobs, tx, store_dir })
 }
 
@@ -290,6 +280,35 @@ async fn a_compile_error_ends_a_job_whose_rlibs_are_still_coming() -> Result<()>
         early += usize::from(moved.bytes < rlib);
     }
     assert!(early > 0, "the rlib always came before rustc failed");
+    drop(b);
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_fails_to_connect_holds_up_no_other() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-connect-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    let lib = project(&dir.join("ws"))?;
+    let crates: Vec<ArcStr> = lib.1.deps.iter().filter_map(|d| d.file.clone()).collect();
+    let jobs = b.subscriber.subscribe(b.jobs.clone());
+    time::timeout(Duration::from_secs(10), async {
+        jobs.wait_subscribed().await?;
+        // One client asks for a channel and never takes it.
+        jobs.write_with_recipt(Value::from("connect")).await?;
+        // Another takes one and botches the handshake.
+        let session = jobs.write_with_recipt(Value::from("connect")).await?.cast_to::<NPath>()?;
+        let botched = b.subscriber.subscribe_nondurable_one(session, Some(Duration::from_secs(5))).await?;
+        botched.write(Value::from("nonsense"));
+        let (outcome, events) = send(&b, &lib, &crates, &Hashes::default(), None).await?;
+        let Outcome::Exit { code: 0, .. } = outcome else { bail!("failed: {:?}", stderr(&events)) };
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("a job waited behind the clients that failed to connect")??;
     drop(b);
     let _ = fs::remove_dir_all(&dir);
     Ok(())

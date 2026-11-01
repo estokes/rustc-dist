@@ -354,33 +354,35 @@ pub async fn run(
     hashes: &Hashes,
     mut sink: impl FnMut(Event) -> Result<()>,
 ) -> Result<Outcome> {
-    let con = time::timeout(Duration::from_secs(10), Connection::connect(subscriber, jobs.clone()))
-        .await
-        .with_context(|| format_compact!("connecting to {jobs}"))??;
-    con.send_one(&offer)?;
-    con.flush().await?;
-    match con.recv_one::<FromServer>().await? {
+    let con = match time::timeout(Duration::from_secs(10), Connection::connect(subscriber, jobs.clone())).await {
+        Ok(con) => con.context("connecting")?,
+        Err(_) => bail!("connecting timed out"),
+    };
+    let ask = async |m: &ToServer| {
+        con.send_one(m)?;
+        con.flush().await?;
+        con.recv_one::<FromServer>().await
+    };
+    match ask(&offer).await.context("offering the job")? {
         FromServer::Accepted { version } => sink(Event::Accepted { version })?,
         FromServer::Busy { version } => return Ok(Outcome::Busy { version }),
-        FromServer::Failed(why) => bail!("{jobs}: {why}"),
-        m => bail!("{jobs}: unexpected {m:?}"),
+        FromServer::Failed(why) => bail!("{why}"),
+        m => bail!("unexpected {m:?}"),
     }
     let manifest =
         ToServer::Manifest { files: staged.files.clone(), dirs: staged.dirs.clone(), late: staged.late.clone() };
-    con.send_one(&manifest)?;
-    con.flush().await?;
-    let (now, later) = match con.recv_one::<FromServer>().await? {
+    let (now, later) = match ask(&manifest).await.context("sending the manifest")? {
         FromServer::Need { now, later } => (now, later),
-        FromServer::Failed(why) => bail!("{jobs}: {why}"),
-        m => bail!("{jobs}: unexpected {m:?}"),
+        FromServer::Failed(why) => bail!("{why}"),
+        m => bail!("unexpected {m:?}"),
     };
     let sent = AtomicU64::new(0);
     let mut buf = vec![0u8; CHUNK];
     for hash in now {
-        send_blob(&con, staged, hash, &mut buf, &sent).await?;
+        send_blob(&con, staged, hash, &mut buf, &sent).await.context("sending inputs")?;
     }
     con.send_one(&ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
-    con.flush().await?;
+    con.flush().await.context("starting rustc")?;
     let mut sending = pin!(async {
         for hash in later {
             send_blob(&con, staged, hash, &mut buf, &sent).await?;
@@ -391,7 +393,7 @@ pub async fn run(
     let mut sending_done = false;
     let (code, ran, linker_waited_us) = loop {
         tokio::select! {
-            exit = &mut receiving => break exit?,
+            exit = &mut receiving => break exit.context("receiving outputs")?,
             r = &mut sending, if !sending_done => {
                 // A rustc that fails before linking exits without the late
                 // rlibs, and the server closes the channel after its exit,
@@ -399,7 +401,7 @@ pub async fn run(
                 if let Err(e) = r
                     && !con.is_dead()
                 {
-                    return Err(e);
+                    return Err(e.context("sending late rlibs"));
                 }
                 sending_done = true;
             }
@@ -432,6 +434,16 @@ struct Writing {
     hasher: blake3::Hasher,
 }
 
+/// The server's next message. A send that finds the channel closed marks
+/// it dead, and `recv_one` then fails without reading what the server sent
+/// before closing it, which `try_recv_one` still returns.
+async fn next(con: &Connection) -> Result<FromServer> {
+    match con.recv_one().await {
+        Err(e) if con.is_dead() => con.try_recv_one().await?.ok_or(e),
+        r => r,
+    }
+}
+
 /// rustc's output until it exits: its code, the server's measurement and
 /// how long its linker waited.
 async fn receive(
@@ -443,7 +455,7 @@ async fn receive(
 ) -> Result<(i32, Ran, u64)> {
     let mut writing: Option<Writing> = None;
     loop {
-        match con.recv_one::<FromServer>().await? {
+        match next(con).await? {
             FromServer::Output { path, mode, data, last } => {
                 if writing.is_none() {
                     let dest = PathBuf::from(path.as_str());

@@ -370,7 +370,9 @@ netidx namespace:
 - `BASE/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
   a table.
 - `BASE/api/NAME/jobs`: where the box takes jobs, a netidx pack channel
-  listener. Each job is one connection.
+  listener. Each job is one connection. Each client's handshake runs on its
+  own with 30 s to finish, so a client that dies or stalls while connecting
+  holds up no other.
 - `BASE/units/NAME/UNIT/COLUMN`: the units the box has run (see below).
 
 A box's state is eight columns of its status row, each its own value:

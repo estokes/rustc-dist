@@ -23,7 +23,6 @@ use netidx::{
     publisher::{Publisher, PublisherBuilder},
     subscriber::{Subscriber, SubscriberBuilder},
 };
-use netidx_protocols::pack_channel::server::Listener;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind},
@@ -165,25 +164,7 @@ async fn join(
     config::make_private_dir(&cfg.cache_dir)?;
     let store = Store::open(cfg.cache_dir.join("blobs"), cfg.cache_gb << 30)?;
     let server = Arc::new(Server::new(store, cfg.cache_dir.join("jobs"), installed, tx.clone())?);
-    let mut jobs = Listener::new(&publisher, None, farm::jobs_path(&base, &name)).await?;
-    tokio::spawn(async move {
-        loop {
-            match jobs.accept().await {
-                Ok(con) => {
-                    let server = server.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = sandbox::serve(server, con).await {
-                            warn!("remote job: {e:#}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("no longer taking remote jobs: {e:#}");
-                    break;
-                }
-            }
-        }
-    });
+    tokio::spawn(sandbox::listen(publisher.clone(), farm::jobs_path(&base, &name), server).await?);
     let status = browser::run(
         publisher.clone(),
         farm::status_path(&base, &name),
@@ -470,7 +451,7 @@ async fn run_remote(
             Ok(Remote::Failed { forwarded_metadata })
         }
         Err(e) => {
-            warn!("{} failed remotely, building it here: {e:#}", r.unit().exact);
+            warn!("{} failed on {}, building it here: {e:#}", r.unit().exact, r.jobs);
             r.finish(RemoteOutcome::Failed);
             Ok(Remote::Failed { forwarded_metadata })
         }

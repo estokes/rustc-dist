@@ -12,9 +12,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use bytes::Bytes;
 use compact_str::format_compact;
-use futures::future::OptionFuture;
-use log::debug;
-use netidx_protocols::pack_channel::server::Connection;
+use futures::{StreamExt, future::OptionFuture};
+use log::{debug, warn};
+use netidx::{
+    path::Path as NPath,
+    publisher::{PublishFlags, Publisher, Value},
+};
+use netidx_protocols::{
+    channel::server::session,
+    pack_channel::server::{Connection, singleton_with_flags},
+};
 use serde::Deserialize;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
@@ -37,9 +44,12 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time,
+};
 
 /// Environment the sandbox sets or clears itself.
 const DROPPED_ENV: &[&str] =
@@ -64,6 +74,47 @@ impl Server {
         link::write_stand_in_linker(&stand_in)?;
         Ok(Self { store, jobs_dir, toolchains, tx, stand_in, next_job: AtomicU64::new(0) })
     }
+}
+
+/// How long a client has to take the channel it asked for.
+const CONNECT: Duration = Duration::from_secs(30);
+
+/// Publish the place other boxes send jobs, at `path`, and return what
+/// takes them until the publisher stops. Each client connects on its own,
+/// so one that stalls or botches its handshake holds up no other.
+pub async fn listen(publisher: Publisher, path: NPath, server: Arc<Server>) -> Result<impl Future<Output = ()>> {
+    let (tx, mut asks) = futures::channel::mpsc::channel(50);
+    let listener =
+        publisher.publish_with_flags_and_writes(PublishFlags::empty(), path.clone(), Value::from("channel"), Some(tx))?;
+    publisher.flushed().await;
+    Ok(async move {
+        let _listener = listener;
+        while let Some(mut batch) = asks.next().await {
+            for ask in batch.drain(..) {
+                let Some(reply) = ask.send_result else { continue };
+                if !matches!(&ask.value, Value::String(s) if &**s == "connect") {
+                    continue;
+                }
+                let (publisher, server, at) = (publisher.clone(), server.clone(), session(&path));
+                tokio::spawn(async move {
+                    let connected = time::timeout(CONNECT, async {
+                        let mut channel = singleton_with_flags(&publisher, PublishFlags::empty(), None, at.clone()).await?;
+                        reply.send(Value::from(at));
+                        channel.wait_connected().await
+                    });
+                    match connected.await {
+                        Ok(Ok(con)) => {
+                            if let Err(e) = serve(server, con).await {
+                                warn!("remote job: {e:#}");
+                            }
+                        }
+                        Ok(Err(e)) => warn!("a client failed to connect: {e:#}"),
+                        Err(_) => warn!("a client didn't connect within {} s", CONNECT.as_secs()),
+                    }
+                });
+            }
+        }
+    })
 }
 
 /// Serve one remote job on `con`.
