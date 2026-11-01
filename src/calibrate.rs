@@ -17,9 +17,14 @@ use std::{
 /// this ratio are in different classes.
 const CLASS_GAP: f64 = 1.08;
 const KEYS: usize = 1 << 15;
-/// Instructions one calibration run retires in a release build, for boxes
-/// that can't count them.
-pub const RUN_INSTRUCTIONS: u64 = 697_000_000;
+/// Instructions one calibration run retires, for boxes that can't count
+/// them: what a release build's run retired on washu-chan (Core Ultra X7
+/// 358H) with rustc 1.99.1 on 2026-11-01, with or without `-C
+/// target-cpu=x86-64-v3`. The count can move with the compiler, the C
+/// library and the CPU, whose features choose the C library's `memcmp`, so
+/// check it with `cargo test --release a_run_retires_about_the_fallback_count`
+/// on the box at hand.
+pub const RUN_INSTRUCTIONS: u64 = 633_000_000;
 const BATCH: usize = 64;
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -113,17 +118,17 @@ fn worker(cpu: u32, t0: Instant, warm: Duration, stop: &AtomicBool) -> Result<Sp
     sys::pin(&[cpu])?;
     let keys = keys();
     let counter = perf::Counter::start();
-    let count = || counter.as_ref().map_or(0, |c| c.read());
+    let count = || counter.as_ref().map_or(Ok(0), |c| c.read());
     let mut warming = Vec::new();
     let mut measured = Vec::new();
     loop {
         let start = Instant::now();
         let cpu_start = sys::thread_cpu_us();
-        let instr_start = count();
+        let instr_start = count()?;
         let interruptible = !(warming.is_empty() && measured.is_empty());
         let Some(sum) = run_once(&keys, interruptible.then_some(stop)) else { break };
         black_box(sum);
-        let run = (sys::thread_cpu_us() - cpu_start, count() - instr_start);
+        let run = (sys::thread_cpu_us() - cpu_start, count()? - instr_start);
         if start.duration_since(t0) >= warm { measured.push(run) } else { warming.push(run) }
         if stop.load(Ordering::Relaxed) {
             break;
@@ -275,7 +280,7 @@ mod test {
         assert_eq!(group(speeds(&[(0, 1000), (1, 1050)])).len(), 1);
     }
 
-    // CR claude for claude: [test-gap/low] In the usual debug `cargo test` this checks
+    // XCR claude for claude: [test-gap/low] In the usual debug `cargo test` this checks
     // only ratio > 0.95, which a debug build always passes, so nothing notices
     // RUN_INSTRUCTIONS going stale for the binary a box actually runs (a release build,
     // here with `-C target-cpu=x86-64-v3` from ~/.cargo/config.toml). A box without
@@ -283,18 +288,33 @@ mod test {
     // matters because calibrations are compared across the farm. Run the upper bound
     // under `--release` somewhere routine, or say in RUN_INSTRUCTIONS's doc which
     // build and flags 697 M was measured with. (calibrate-01)
+    // 2026-11-01 claude: Measured: a release `cargo test` here (washu-chan, Core Ultra
+    // X7 358H, rustc 1.99.1, ~/.cargo/config.toml flags) gives a run 632.87 M
+    // instructions, stable to 100 instructions over three runs, ratio 0.908 against 697
+    // M. So this release check failed, and nothing had noticed. A baseline x86-64 build
+    // (no target-cpu) gives 632.70 M, so the flags do not explain it. Neither the load
+    // nor immutable-chunkmap or arcstr changed since b8c6d96 set 697 M on 2026-10-30; a
+    // glibc update or another CPU (glibc picks memcmp by CPU features) is likelier.
+    // RUN_INSTRUCTIONS is now 633_000_000, and its doc names where and with what it was
+    // measured, says the count can move with the compiler, C library and CPU, and gives
+    // the release command that checks it. The release test passes again. DESIGN.md says
+    // 633 M. The test still only bounds above under --release, which nothing routine
+    // runs; the doc gives the command, the CR's second option. Eric: this changes the
+    // published rates of boxes without counters (and classes::fallback) by -9% on their
+    // next calibration.
     #[test]
-    fn a_run_retires_about_the_fallback_count() {
-        let Some(c) = perf::Counter::start() else { return };
+    fn a_run_retires_about_the_fallback_count() -> Result<()> {
+        let Some(c) = perf::Counter::start() else { return Ok(()) };
         let keys = keys();
-        let before = c.read();
+        let before = c.read()?;
         black_box(run_once(&keys, None));
-        let ratio = (c.read() - before) as f64 / RUN_INSTRUCTIONS as f64;
+        let ratio = (c.read()? - before) as f64 / RUN_INSTRUCTIONS as f64;
         // Debug builds retire many more; the fallback is for release builds.
         assert!(ratio > 0.95, "{ratio}");
         if !cfg!(debug_assertions) {
             assert!(ratio < 1.05, "{ratio}");
         }
+        Ok(())
     }
 
     #[test]

@@ -204,8 +204,12 @@ The classes come from those times. Sort the CPUs by time and start a new class
 wherever two neighbours differ by more than about 8%. Two core types that
 measure the same land in one class, which is right for scheduling. Each run
 also counts its instructions, and a class's rate is its members' mean
-instructions per CPU-µs. Without counters a run is taken to retire 697 M
-instructions, what a release build's run retires.
+instructions per CPU-µs. Counters that ran for less of the time than they
+were enabled were shared with another perf user and count low, so the
+calibration fails rather than use them. Without counters a run is taken to
+retire 633 M instructions, what a release build's run retired on washu-chan
+on 2026-11-01; the count can move with the compiler, the C library and the
+CPU.
 
 `rustc-dist calibrate` measures and prints without saving. Each profile's
 classes go in `~/.local/state/rustc-dist/profiles/NAME.toml`, and boxes publish
