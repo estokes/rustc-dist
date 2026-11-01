@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 18;
+pub const PROTOCOL: u32 = 19;
 /// Sent in place of PROTOCOL, it asks a daemon of any version to exit.
 pub const STOP: u32 = u32::MAX;
 /// What a daemon sends a client of another PROTOCOL in place of a reply's

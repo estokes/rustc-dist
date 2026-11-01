@@ -543,7 +543,7 @@ work, so build times say nothing yet; placement is all that was checked.
 A daemon whose config has `base` (say `/build`) joins the farm. It answers
 wrappers while it joins, which takes 15 s or more when the resolver is out of
 reach, and keeps their jobs here until it has joined. The farm's netidx
-namespace is under the protocol version, `BASE/vN` (`/build/v18`), so boxes
+namespace is under the protocol version, `BASE/vN` (`/build/v19`), so boxes
 of different versions never see each other:
 
 - `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
