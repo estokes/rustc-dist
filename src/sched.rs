@@ -2253,9 +2253,12 @@ impl Sched {
         {
             warn!("saving the build graph: {e:#}");
         }
-        if let Err(e) = self.setup.hashes.save(&self.setup.state_dir.join("hashes")) {
-            warn!("saving file hashes: {e:#}");
-        }
+        let (hashes, path) = (self.setup.hashes.clone(), self.setup.state_dir.join("hashes"));
+        task::spawn_blocking(move || {
+            if let Err(e) = hashes.save(&path) {
+                warn!("saving file hashes: {e:#}");
+            }
+        });
     }
 }
 
