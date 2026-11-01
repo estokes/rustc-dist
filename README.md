@@ -228,11 +228,18 @@ A job runs only on the box that started it if it:
 - uses `-C target-cpu=native`;
 - splits debug info into separate files (`-C split-debuginfo` other than `off`);
 - is run by something other than rustc, such as `clippy-driver`;
+- reads arguments from an `@file`, prints something (`--print`), or has no
+  `--out-dir`;
+- has an argument, compiler path or working directory that isn't UTF-8;
 - links, and `remote_links` is off;
 - is named in a project's `local` list, or failed remotely and then built
   locally twice;
+- is in a project whose `rustc-dist.toml` doesn't parse (the wrapper prints
+  why);
 - depends on a crate the daemon never saw compile, so it can't tell what to
   send;
+- is in a package directory holding more than 256 MB, not counting build
+  output, other packages and hidden directories;
 - needs a toolchain no other box has.
 
 The placement log (see above) says which, and a job that fails on another box
