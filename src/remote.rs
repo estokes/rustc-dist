@@ -492,9 +492,10 @@ impl<'a> Collect<'a> {
         self.dirs.insert(path);
     }
 
-    /// Every file under `root`, skipping hidden directories and cargo's
-    /// output directories, which cargo marks with `CACHEDIR.TAG`. A module
-    /// directory may well be named `target`.
+    /// Every file under `root`, skipping hidden directories, cargo's output
+    /// directories, which cargo marks with `CACHEDIR.TAG`, and other
+    /// packages, which have their own `Cargo.toml`. A module directory may
+    /// well be named `target`.
     fn walk(&mut self, root: &Path, recursive: bool) -> Result<()> {
         if system(root) {
             return Ok(());
@@ -509,7 +510,9 @@ impl<'a> Collect<'a> {
                 let Ok(ft) = e.file_type() else { continue };
                 if ft.is_dir() {
                     let path = e.path();
-                    let skip = name.to_string_lossy().starts_with('.') || path.join("CACHEDIR.TAG").exists();
+                    let skip = name.to_string_lossy().starts_with('.')
+                        || path.join("CACHEDIR.TAG").exists()
+                        || path.join("Cargo.toml").exists();
                     if recursive && !skip {
                         stack.push(path);
                     }
@@ -526,45 +529,28 @@ impl<'a> Collect<'a> {
     }
 }
 
-/// What a job reads: its sources (the files its last dep-info lists, and
-/// everything in the directories they came from, so a new module is
-/// found), its package's `Cargo.toml`, which proc macros read without
-/// dep-info listing it, its build script's output, native library
-/// directories, and `crates`, the crate files below it.
+/// What a job reads: the files its last dep-info lists, everything in its
+/// package, since a new module may be among it and proc macros read what
+/// they like there (its `Cargo.toml`, its `build.rs`) without dep-info
+/// listing it, its build script's output, native library directories, and
+/// `crates`, the crate files below it.
 pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
     let cwd = PathBuf::from(job.cwd.as_str());
     let at = |p: &str| absolute(&cwd, p);
     let mut c = Collect::new(hashes);
     c.dir(cwd.clone());
     let manifest = env(job, "CARGO_MANIFEST_DIR").map(at);
-    match fs::read_to_string(at(&job.paths.dep_info)) {
-        Ok(text) => {
-            let mut source_dirs: LPooled<HashSet<PathBuf>> = LPooled::take();
-            for dep in dep_info(&text) {
-                let path = at(&dep);
-                // The last compile read it; this one can't if it is gone.
-                if fs::metadata(&path).is_err_and(|e| e.kind() == ErrorKind::NotFound) {
-                    continue;
-                }
-                if let Some(dir) = path.parent()
-                    && manifest.as_ref().is_some_and(|m| dir.starts_with(m))
-                {
-                    source_dirs.insert(dir.to_path_buf());
-                }
-                c.file(path)?;
+    if let Ok(text) = fs::read_to_string(at(&job.paths.dep_info)) {
+        for dep in dep_info(&text) {
+            let path = at(&dep);
+            // The last compile read it; this one can't if it is gone.
+            if fs::metadata(&path).is_err_and(|e| e.kind() == ErrorKind::NotFound) {
+                continue;
             }
-            for dir in source_dirs.iter() {
-                c.walk(dir, true)?;
-            }
-        }
-        Err(_) => {
-            let root = manifest.clone().context("no CARGO_MANIFEST_DIR")?;
-            c.walk(&root, true)?;
+            c.file(path)?;
         }
     }
-    if let Some(toml) = manifest.as_ref().map(|m| m.join("Cargo.toml")).filter(|t| t.is_file()) {
-        c.file(toml)?;
-    }
+    c.walk(manifest.as_ref().context("no CARGO_MANIFEST_DIR")?, true)?;
     for src in &job.paths.sources {
         c.file(at(src))?;
     }
@@ -877,13 +863,17 @@ mod test {
     }
 
     #[test]
-    fn walks_module_dirs_named_target_but_not_cargo_output() -> Result<()> {
+    fn walks_module_dirs_named_target_but_not_cargo_output_or_other_packages() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("rustc-dist-walk-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        for d in ["src/target", "target/release", ".git"] {
+        for d in ["src/target", "target/release", ".git", "member/src"] {
             fs::create_dir_all(dir.join(d))?;
         }
-        for f in ["src/lib.rs", "src/target/apple.rs", "target/CACHEDIR.TAG", "target/release/big", ".git/HEAD"] {
+        let files = [
+            "src/lib.rs", "src/target/apple.rs", "target/CACHEDIR.TAG", "target/release/big", ".git/HEAD",
+            "member/Cargo.toml", "member/src/lib.rs",
+        ];
+        for f in files {
             fs::write(dir.join(f), "x")?;
         }
         let hashes = Hashes::default();
@@ -962,13 +952,14 @@ mod test {
     }
 
     #[test]
-    fn a_packages_manifest_is_sent_since_proc_macros_read_it() -> Result<()> {
+    fn a_whole_package_is_sent_since_proc_macros_read_what_they_like_there() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("rustc-dist-manifest-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("a/src"))?;
         fs::create_dir_all(dir.join("target/deps"))?;
         fs::write(dir.join("a/src/lib.rs"), "pub fn f() {}\n")?;
         fs::write(dir.join("a/Cargo.toml"), "[package]\nname = \"a\"\n")?;
+        fs::write(dir.join("a/build.rs"), "fn main() {}\n")?;
         let deps = dir.join("target/deps");
         fs::write(deps.join("a-x1.d"), format!("{0}/liba-x1.rmeta: a/src/lib.rs\n", deps.display()))?;
         let args = [
@@ -989,7 +980,7 @@ mod test {
         let staged = stage(&job, &[], &Hashes::default())?;
         let mut names: Vec<&str> = staged.files.iter().filter_map(|f| f.path.rsplit_once('/')).map(|(_, n)| n).collect();
         names.sort();
-        assert_eq!(names, ["Cargo.toml", "lib.rs"]);
+        assert_eq!(names, ["Cargo.toml", "build.rs", "lib.rs"]);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

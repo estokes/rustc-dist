@@ -578,10 +578,11 @@ chance collisions vanishingly rare. The client daemon caches
 
 - Sources: every file the unit's previous dep-info
   (`<out-dir>/<crate><extra>.d`) lists, which includes files outside the
-  package, plus everything in the package directories those files came from,
-  so a newly added module is found. Without dep-info the package directory is
-  walked whole, skipping `target` and hidden directories. A walk past 256 MB
-  keeps the job local.
+  package, plus the whole package directory, so a newly added module is found
+  and proc macros find what they read there without dep-info listing it. The
+  walk skips cargo's output directories (`CACHEDIR.TAG`), hidden directories,
+  and directories with a `Cargo.toml` of their own, which are other packages.
+  A walk past 256 MB keeps the job local.
 - The `OUT_DIR` tree and `-L` directories other than dependency ones. Static
   libraries get bundled into rlibs.
 - Crates: the `--extern` files plus, through the build graph, those of every
@@ -717,12 +718,14 @@ that as the reason it can't go. Typical causes are proc macros that read the
 network or the environment (sqlx), or an include of a file the client never
 sent. Real compile errors get compiled twice. They usually fail fast.
 
-Staging sends the package's `Cargo.toml`, which dep-info never lists, since
-proc macros read it. On 2026-11-01 every graphix_package crate failed this
-way on ryouko: graphix-derive's `defpackage!` reads the package manifest to
-find its dependencies, panicked without it, and the crates were kept local
-within minutes of each restart, as several lanes built each. The failure was
-logged only at debug, so nothing showed why.
+Staging sends the whole package directory, since proc macros read what they
+like there and dep-info lists none of it. On 2026-11-01 every graphix_package
+crate failed on ryouko: graphix-derive's `defpackage!` reads the package's
+`Cargo.toml` and checks that it has a `build.rs` and a `src/graphix`
+directory, and panicked without them. Several lanes built each crate, so each
+was kept local within minutes of every restart. The failure was logged only
+at debug, so nothing showed why; sending `Cargo.toml` alone got past the
+first check and the new warning named the second.
 
 ## Config
 
