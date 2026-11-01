@@ -393,6 +393,7 @@ impl Record {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct Prediction {
     /// Millions of the calibration load's instructions: its front end's,
     /// on one thread, and the rest's, spread over its width.
@@ -416,15 +417,22 @@ impl Prediction {
 pub struct UnitInfo {
     /// Runs by `Origin`.
     pub runs: [u64; 3],
-    pub cost_mi: u64,
-    /// None if no run printed an `.rmeta` line.
-    pub front_mi: Option<u64>,
-    pub width_c: u64,
+    pub pred: Prediction,
     pub wall_ms: u64,
-    pub mem_kb: u64,
     /// Medians of sent runs.
     pub copy_ms: Option<u64>,
     pub sent_kb: Option<u64>,
+}
+
+/// The prediction for a unit whose record `r` has size `s`.
+fn known(r: &Record, s: &Size) -> Prediction {
+    Prediction {
+        front_mi: s.front_mi() as u64,
+        rest_mi: s.rest_mi() as u64,
+        width_c: Some((s.width() * 100.) as u64),
+        mem_kb: r.mem_kb.value_at_quantile(0.9),
+        known: true,
+    }
 }
 
 fn median(h: &Histogram<u32>) -> Option<u64> {
@@ -518,12 +526,15 @@ impl Stats {
             sent += c.sent * k;
             copy_us += c.copy_us * k;
         }
-        if sent <= 0. {
-            let c = &self.places[place.0 as usize].copies;
-            let k = keep(c.at, now, half_life_s);
-            (sent, copy_us) = (c.runs * k, c.copy_us * k);
-        }
-        (sent > 0.).then(|| (copy_us / sent) as u64)
+        if sent > 0. { Some((copy_us / sent) as u64) } else { self.place_copy_us(place) }
+    }
+
+    /// Predicted µs a run sent to `place` spends other than compiling, from
+    /// every unit's sends there, if any.
+    pub fn place_copy_us(&self, place: PlaceId) -> Option<u64> {
+        let c = &self.places[place.0 as usize].copies;
+        let k = keep(c.at, self.now, self.decay.copy_half_life_s);
+        (c.runs * k > 0.).then(|| (c.copy_us / c.runs) as u64)
     }
 
     pub fn predict(&self, exact: &ArcStr, coarse: &ArcStr) -> Prediction {
@@ -533,13 +544,7 @@ impl Stats {
             (s.runs > 0.).then_some((r, s))
         });
         match own {
-            Some((r, s)) => Prediction {
-                front_mi: s.front_mi() as u64,
-                rest_mi: s.rest_mi() as u64,
-                width_c: Some((s.width() * 100.) as u64),
-                mem_kb: r.mem_kb.value_at_quantile(0.9),
-                known: true,
-            },
+            Some((r, s)) => known(r, &s),
             None => Prediction {
                 front_mi: 0,
                 rest_mi: median(&self.global_cost).unwrap_or(UNKNOWN_COST_MI),
@@ -555,14 +560,10 @@ impl Stats {
         self.exact.iter().filter_map(|(key, r)| {
             let s = r.size(&self.places, self.now, self.decay.half_life_s, None);
             (s.runs > 0.).then(|| {
-                let front_mi = s.front_mi() as u64;
                 let info = UnitInfo {
                     runs: r.runs,
-                    cost_mi: front_mi + s.rest_mi() as u64,
-                    front_mi: (front_mi > 0).then_some(front_mi),
-                    width_c: (s.width() * 100.) as u64,
+                    pred: known(r, &s),
                     wall_ms: median(&r.wall_ms).unwrap_or(0),
-                    mem_kb: r.mem_kb.value_at_quantile(0.9),
                     copy_ms: median(&r.copy_ms),
                     sent_kb: median(&r.sent_kb),
                 };
@@ -1070,7 +1071,7 @@ mod test {
         }
         let (_, a1) = t.units().find(|(k, _)| k.as_str() == "a:1").unwrap();
         assert_eq!(a1.runs, [1, 0, 1]);
-        assert_eq!((a1.copy_ms, a1.front_mi), (None, None));
+        assert_eq!((a1.copy_ms, a1.pred.front_mi), (None, 0));
         let (_, b1) = t.units().find(|(k, _)| k.as_str() == "b:1").unwrap();
         assert_eq!(b1.runs, [0, 1, 0]);
         assert_eq!(b1.copy_ms, Some(70));

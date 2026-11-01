@@ -466,23 +466,33 @@ fresh state. Versions start from zero when a box restarts, which clients see
 as a version going down. Memory isn't published, so a box can still refuse
 for memory.
 
-`status` lists every unit the box has run, with runs split three ways: this
-box's builds run here, this box's builds run elsewhere, and other boxes'
-builds run here. Units outside this box's build graph have no rank. Units sent
-elsewhere also show the median time their sent runs spent on files and the MB
-they sent. Each class shows this box's jobs, other boxes' jobs and free tokens.
+`status` shows the cost model. Speeds are relative to this box's fastest class
+idle: its calibrated rate over the factor it has learned with no load. Each
+class shows its speed idle and at the load now, this box's jobs, other boxes'
+jobs and free tokens; heavy jobs, their threads and each one's speed now;
+each other box, its load, its classes' and threads' speeds as this box has
+learned them, the time jobs sent there spend moving files, and its free
+tokens. Every unit the box has run is listed with its rank and work in
+seconds on one thread of the fastest class idle, its front end's share, its
+width, its predicted time here now and its measured wall time, and runs split
+three ways: this box's builds run here, this box's builds run elsewhere, and
+other boxes' builds run here. Units outside this box's build graph have no
+rank. Units sent elsewhere also show the median time their sent runs spent on
+files and the MB they sent.
 
 In a farm each box also publishes what `status` shows, for the netidx browser.
 Beside its state columns, its status row has figures for people: jobs
-`waiting`, `running` and `serving`, total `GIPS`, per class `class running`,
-`class serving` and tokens `lent`, `finishing` under the last profile, memory
+`waiting`, `running` and `serving`, `load`, per class `class speed` now and
+`class idle speed`, `heavy threads` and `heavy thread speed`, per class
+`class running`, `class serving` and tokens `lent`, `finishing` under the last
+profile, memory
 (`mem GiB`, `mem growth GiB` predicted from running jobs, `mem cap GiB`) and
 `graph units`. So `BASE/status` shows the
 whole farm at a glance. Its units go in a table of their own at
 `BASE/units/NAME`, with `status`'s columns. Values are typed numbers, so the
 browser sorts them. These refresh every 2 s and send only cells that
-changed. Building a status takes the scheduler a few ms, which is why it
-isn't faster.
+changed. Building a status takes the scheduler some tens of ms with
+thousands of units, which is why it isn't faster.
 
 ### Inputs
 

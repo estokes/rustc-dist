@@ -1,4 +1,3 @@
-use crate::farm::ClassState;
 use anyhow::{Result, anyhow, bail};
 use arcstr::ArcStr;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -150,6 +149,9 @@ pub fn is_metadata_line(line: &[u8]) -> bool {
     is_artifact_line(line) && contains(line, br#""emit":"metadata""#)
 }
 
+/// What `status` shows. Speeds are in hundredths of this box's fastest
+/// class's, idle: what it calibrated at, over what it has learned it runs
+/// at with no load. Work and times are in ms.
 #[derive(Debug, Pack)]
 pub struct Status {
     pub profile: ArcStr,
@@ -178,16 +180,27 @@ pub struct Status {
 pub struct BoxStatus {
     pub name: ArcStr,
     pub profile: ArcStr,
-    pub classes: Vec<ClassState>,
     /// Runnable tasks per CPU there, in hundredths, as it last published.
     pub load_c: u32,
-    /// What its calibrated time is multiplied by for a heavy job now, in
-    /// hundredths, as this box has learned from jobs it sent there.
-    pub factor_c: u32,
+    /// Speed now of each class, for a light job.
+    pub classes: Vec<BoxClass>,
+    /// A heavy job's threads there, and each one's speed now.
+    pub threads: u32,
+    pub thread_speed_c: u32,
+    /// What a job sent there spends moving files, on average.
+    pub copy_ms: Option<u64>,
     /// Jobs this box has running there.
     pub sent: u32,
     /// It speaks this protocol version.
     pub compatible: bool,
+}
+
+#[derive(Debug, Pack)]
+pub struct BoxClass {
+    pub cpus: u32,
+    pub speed_c: u32,
+    /// Tokens it publishes free.
+    pub free: u32,
 }
 
 /// A switch to a profile with no calibration yet. New jobs wait until it
@@ -202,19 +215,17 @@ pub enum Switching {
 
 #[derive(Debug, Pack)]
 pub struct ClassStatus {
-    /// Calibrated instructions per CPU-µs.
-    pub rate: u64,
-    /// What its calibrated time is multiplied by for a light job now, in
-    /// hundredths.
-    pub factor_c: u32,
     pub cpus: u32,
+    /// Its speed for a light job with no load, and at the load now.
+    pub idle_speed_c: u32,
+    pub speed_c: u32,
     /// Jobs of this box's builds.
     pub running: u32,
     /// Other boxes' jobs.
     pub serving: u32,
     /// Tokens lent to heavy jobs.
     pub lent: u32,
-    /// Tokens in its jobserver.
+    /// Tokens no job holds.
     pub free: u32,
 }
 
@@ -223,9 +234,9 @@ pub struct ClassStatus {
 pub struct SpreadStatus {
     pub running: u32,
     pub serving: u32,
-    /// What the calibrated time of a heavy job here is multiplied by now,
-    /// in hundredths.
-    pub factor_c: u32,
+    /// The threads a heavy job gets, and each one's speed now.
+    pub threads: u32,
+    pub thread_speed_c: u32,
 }
 
 #[derive(Debug, Pack)]
@@ -236,54 +247,66 @@ pub struct UnitStatus {
     pub sent: u64,
     /// Runs here for other boxes' builds.
     pub served: u64,
-    /// Millions of the calibration load's instructions.
-    pub cost_mi: u64,
-    pub front_mi: Option<u64>,
+    /// Its work on one thread of this box's fastest class, idle, and its
+    /// front end's, if it printed an `.rmeta` line.
+    pub work_ms: u64,
+    pub front_ms: Option<u64>,
     /// Hundredths of the jobserver tokens held after the front end.
     pub width_c: u64,
+    /// Predicted wall time here now: on the fastest class for a light job,
+    /// on every CPU for a heavy one.
+    pub now_ms: u64,
+    /// Median measured wall time.
     pub wall_ms: u64,
     pub mem_kb: u64,
     /// Medians of sent runs: time spent moving files rather than
     /// compiling, and inputs sent.
     pub copy_ms: Option<u64>,
     pub sent_kb: Option<u64>,
-    /// Its cost plus the costliest chain of jobs that depend on it, if it
+    /// Its work plus the costliest chain of jobs that depend on it, if it
     /// is in this box's build graph.
-    pub rank_mi: Option<u64>,
-}
-
-/// Millions as billions, or instructions per µs as G per second.
-fn g(n: u64) -> f64 {
-    n as f64 / 1000.
+    pub rank_ms: Option<u64>,
 }
 
 pub fn gib(kb: u64) -> f64 {
     kb as f64 / (1024. * 1024.)
 }
 
+/// Hundredths as a number.
+pub fn hundredths(c: u32) -> f64 {
+    c as f64 / 100.
+}
+
+fn secs(ms: u64) -> f64 {
+    ms as f64 / 1000.
+}
+
 /// The figures `status` and the netidx browser show.
 impl UnitStatus {
-    /// G instructions waiting on it, if it is in this box's build graph.
-    pub fn rank_g(&self) -> Option<f64> {
-        self.rank_mi.map(g)
+    pub fn rank_s(&self) -> Option<f64> {
+        self.rank_ms.map(secs)
     }
 
-    pub fn work_g(&self) -> f64 {
-        g(self.cost_mi)
+    pub fn work_s(&self) -> f64 {
+        secs(self.work_ms)
     }
 
     /// The single-threaded front end's share of its work, in percent.
     pub fn front_pct(&self) -> Option<u64> {
-        self.front_mi.map(|f| f * 100 / self.cost_mi.max(1))
+        self.front_ms.map(|f| f * 100 / self.work_ms.max(1))
     }
 
-    /// Threads busy after the front end.
+    /// Tokens held after the front end.
     pub fn width(&self) -> f64 {
         self.width_c as f64 / 100.
     }
 
+    pub fn now_s(&self) -> f64 {
+        secs(self.now_ms)
+    }
+
     pub fn wall_s(&self) -> f64 {
-        self.wall_ms as f64 / 1000.
+        secs(self.wall_ms)
     }
 
     pub fn mem_mb(&self) -> u64 {
@@ -292,19 +315,8 @@ impl UnitStatus {
 
     /// Medians of its sent runs: seconds spent on files, and MB sent.
     pub fn copy(&self) -> Option<(f64, f64)> {
-        Some((self.copy_ms? as f64 / 1000., self.sent_kb? as f64 / 1024.))
+        Some((secs(self.copy_ms?), self.sent_kb? as f64 / 1024.))
     }
-}
-
-impl ClassStatus {
-    pub fn rate_g(&self) -> f64 {
-        g(self.rate)
-    }
-}
-
-/// Hundredths as a number.
-pub fn hundredths(c: u32) -> f64 {
-    c as f64 / 100.
 }
 
 impl BoxStatus {
@@ -316,9 +328,8 @@ impl BoxStatus {
         self.classes.iter().map(|c| c.free).sum()
     }
 
-    /// G instructions per second over all its CPUs.
-    pub fn capacity_g(&self) -> f64 {
-        g(self.classes.iter().map(|c| c.rate * c.cpus as u64).sum())
+    pub fn copy_s(&self) -> Option<f64> {
+        self.copy_ms.map(secs)
     }
 }
 

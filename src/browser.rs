@@ -4,7 +4,7 @@
 
 use crate::{
     farm::Cell,
-    protocol::{ClassStatus, Status, Switching, gib},
+    protocol::{ClassStatus, Status, Switching, gib, hundredths},
     sched::Msg,
 };
 use anyhow::Result;
@@ -23,8 +23,8 @@ use tokio::{
 /// Building a status costs the scheduler a few ms.
 const REFRESH: Duration = Duration::from_secs(2);
 
-const UNIT_COLUMNS: [&str; 11] =
-    ["rank", "work", "front %", "width", "wall s", "mem MB", "here", "sent", "served", "copy s", "sent MB"];
+const UNIT_COLUMNS: [&str; 12] =
+    ["rank s", "work s", "front %", "width", "now s", "wall s", "mem MB", "here", "sent", "served", "copy s", "sent MB"];
 
 /// Publish this box's figures in its status row at `row` and its units
 /// under `units` every couple of seconds, until the scheduler stops.
@@ -59,10 +59,11 @@ impl Units {
         for u in &st.units {
             let copy = u.copy();
             let values: [Value; UNIT_COLUMNS.len()] = [
-                u.rank_g().map_or_else(none, |r| round(r, 2).into()),
-                round(u.work_g(), 2).into(),
+                u.rank_s().map_or_else(none, |r| round(r, 2).into()),
+                round(u.work_s(), 2).into(),
                 u.front_pct().map_or_else(none, Value::from),
                 round(u.width(), 1).into(),
+                round(u.now_s(), 1).into(),
                 round(u.wall_s(), 1).into(),
                 u.mem_mb().into(),
                 u.here.into(),
@@ -116,13 +117,19 @@ impl Board {
         };
         let per_class =
             |f: fn(&ClassStatus) -> u32| Value::from(st.classes.iter().map(|c| i64::from(f(c))).collect::<Vec<_>>());
+        let speeds =
+            |f: fn(&ClassStatus) -> u32| Value::from(st.classes.iter().map(|c| hundredths(f(c))).collect::<Vec<_>>());
         let sum = |f: fn(&ClassStatus) -> u32| st.classes.iter().map(f).sum::<u32>();
-        let figures: [(&'static str, Value); 13] = [
+        let figures: [(&'static str, Value); 17] = [
             ("switching", switching),
             ("waiting", st.waiting.into()),
             ("running", (sum(|c| c.running) + st.spread.running).into()),
             ("serving", (sum(|c| c.serving) + st.spread.serving).into()),
-            ("GIPS", round(st.classes.iter().map(|c| c.rate_g() * c.cpus as f64).sum(), 0).into()),
+            ("load", hundredths(st.load_c).into()),
+            ("class speed", speeds(|c| c.speed_c)),
+            ("class idle speed", speeds(|c| c.idle_speed_c)),
+            ("heavy threads", st.spread.threads.into()),
+            ("heavy thread speed", hundredths(st.spread.thread_speed_c).into()),
             ("class running", per_class(|c| c.running)),
             ("class serving", per_class(|c| c.serving)),
             ("lent", per_class(|c| c.lent)),
@@ -156,20 +163,21 @@ mod test {
     use anyhow::bail;
     use netidx::{InternalOnly, subscriber::Event};
 
-    fn unit(key: &str, cost_mi: u64, copy: Option<(u64, u64)>) -> UnitStatus {
+    fn unit(key: &str, work_ms: u64, copy: Option<(u64, u64)>) -> UnitStatus {
         UnitStatus {
             key: key.into(),
             here: 3,
             sent: 1,
             served: 0,
-            cost_mi,
-            front_mi: Some(cost_mi / 4),
+            work_ms,
+            front_ms: Some(work_ms / 4),
             width_c: 250,
+            now_ms: 1500,
             wall_ms: 1234,
             mem_kb: 2048,
             copy_ms: copy.map(|c| c.0),
             sent_kb: copy.map(|c| c.1),
-            rank_mi: None,
+            rank_ms: None,
         }
     }
 
@@ -179,10 +187,10 @@ mod test {
             switching: Switching::No,
             load_c: 75,
             classes: vec![
-                ClassStatus { rate: 5512, factor_c: 100, cpus: 4, running: 1, serving: 0, lent: 0, free: 5 },
-                ClassStatus { rate: 2000, factor_c: 130, cpus: 8, running: 0, serving: 2, lent: 1, free: 9 },
+                ClassStatus { cpus: 4, idle_speed_c: 100, speed_c: 90, running: 1, serving: 0, lent: 0, free: 5 },
+                ClassStatus { cpus: 8, idle_speed_c: 40, speed_c: 35, running: 0, serving: 2, lent: 1, free: 9 },
             ],
-            spread: SpreadStatus { running: 1, serving: 0, factor_c: 110 },
+            spread: SpreadStatus { running: 1, serving: 0, threads: 12, thread_speed_c: 55 },
             finishing: 0,
             waiting: 7,
             mem_capacity_kb: 1 << 20,
@@ -221,20 +229,22 @@ mod test {
         show(&mut board, &publisher, &status(both)).await?;
         assert_eq!(value(&net, "/farm/status/a/waiting").await?, Value::from(7u32));
         assert_eq!(value(&net, "/farm/status/a/running").await?, Value::from(2u32));
-        assert_eq!(value(&net, "/farm/status/a/GIPS").await?, Value::from(38.0));
+        assert_eq!(value(&net, "/farm/status/a/load").await?, Value::from(0.75));
+        assert_eq!(value(&net, "/farm/status/a/class speed").await?, Value::from(vec![0.9, 0.35]));
         for column in net.subscriber().resolver().list(Path::from("/farm/status/a")).await?.iter() {
             let below = net.subscriber().resolver().list(column.clone()).await?;
             assert!(below.is_empty(), "{column} is a directory, not a column");
         }
         assert_eq!(value(&net, "/farm/status/a/class serving").await?, Value::from(vec![0i64, 2]));
-        assert_eq!(value(&net, &format!("{serde}/work")).await?, Value::from(2.5));
+        assert_eq!(value(&net, &format!("{serde}/work s")).await?, Value::from(2.5));
+        assert_eq!(value(&net, &format!("{serde}/now s")).await?, Value::from(1.5));
         assert_eq!(value(&net, &format!("{serde}/front %")).await?, Value::from(25u64));
         assert_eq!(value(&net, &format!("{serde}/copy s")).await?, Value::from(1.5));
         assert_eq!(value(&net, &format!("{serde}/sent MB")).await?, Value::from(3.0));
         assert_eq!(value(&net, "/farm/units/a/rustc:syn:2:link/copy s").await?, Value::Null);
         // A changed unit is updated, and one gone from the status is unpublished.
         show(&mut board, &publisher, &status(vec![unit("rustc:serde:1:link", 3000, Some((1500, 3072)))])).await?;
-        assert_eq!(value(&net, &format!("{serde}/work")).await?, Value::from(3.0));
+        assert_eq!(value(&net, &format!("{serde}/work s")).await?, Value::from(3.0));
         for _ in 0..50 {
             let rows = net.subscriber().resolver().list(Path::from("/farm/units/a")).await?;
             if rows.len() == 1 {

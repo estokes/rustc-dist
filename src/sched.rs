@@ -4,8 +4,8 @@ use crate::{
     farm::{BoxState, ClassState, Load},
     graph::Graph,
     protocol::{
-        BoxStatus, ClassStatus, Measured, PROTOCOL, Ran, Reply, SpreadStatus, Status, Switching, Unit,
-        UnitStatus, frame,
+        BoxClass, BoxStatus, ClassStatus, Measured, PROTOCOL, Ran, Reply, SpreadStatus, Status, Switching,
+        Unit, UnitStatus, frame,
     },
     stats::{self, Decay, Origin, PlaceId, Prediction, Run, Stats, Transfer},
     sys::{self, BoxMemory},
@@ -794,9 +794,9 @@ fn light(pred: &Prediction) -> bool {
 }
 
 /// Threads a job keeps busy after its front end: as measured, or its
-/// codegen units if never measured.
-fn width(pred: &Prediction, unit: &Unit) -> f64 {
-    pred.width_c.map_or(unit.codegen_units as f64, |w| w as f64 / 100.).max(1.)
+/// `codegen_units` if never measured.
+fn width(pred: &Prediction, codegen_units: u32) -> f64 {
+    pred.width_c.map_or(codegen_units as f64, |w| w as f64 / 100.).max(1.)
 }
 
 /// Hundredths of a task per CPU that `threads` add on `cpus` CPUs.
@@ -838,9 +838,10 @@ struct Spot {
 }
 
 impl Spot {
-    /// At `at`, pinned to a class or on every one of a box's `cpus`.
-    fn new(pred: &Prediction, unit: &Unit, at: PlaceId, pinned: bool, cpus: u64) -> Self {
-        let width = width(pred, unit);
+    /// At `at`, pinned to a class or on every one of a box's `cpus`, for a
+    /// job of `codegen_units`.
+    fn new(pred: &Prediction, codegen_units: u32, at: PlaceId, pinned: bool, cpus: u64) -> Self {
+        let width = width(pred, codegen_units);
         let threads = if pinned { width } else { width.min(cpus as f64) };
         Self { at, threads, adds: adds_c(if pinned { 1. } else { threads }, cpus) }
     }
@@ -1357,12 +1358,13 @@ impl Sched {
         self.layout.classes.iter().map(|c| c.cpus.len() as u64).sum()
     }
 
-    /// Where a job runs here at `place`, a class or every CPU.
-    fn spot(&self, pred: &Prediction, unit: &Unit, place: Place) -> Spot {
-        let cpus = self.local_cpus();
+    /// Where a job of `codegen_units` runs here at `place`, a class or
+    /// every CPU.
+    fn spot(&self, pred: &Prediction, codegen_units: u32, place: Place) -> Spot {
+        let (cpus, places) = (self.local_cpus(), &self.layout.places);
         match place {
-            Place::Local { class, .. } => Spot::new(pred, unit, self.layout.places.classes[class], true, cpus),
-            Place::Spread { .. } | Place::Remote { .. } => Spot::new(pred, unit, self.layout.places.all, false, cpus),
+            Place::Local { class, .. } => Spot::new(pred, codegen_units, places.classes[class], true, cpus),
+            Place::Spread { .. } | Place::Remote { .. } => Spot::new(pred, codegen_units, places.all, false, cpus),
         }
     }
 
@@ -1455,7 +1457,7 @@ impl Sched {
                 cands.clear();
                 for k in 0..local {
                     let place = Place::Local { layout: id, class: k };
-                    let spot = self.spot(&w.pred, &w.unit, place);
+                    let spot = self.spot(&w.pred, w.unit.codegen_units, place);
                     let waits = held[k] == 0;
                     let run_us = self.run_us(&w.pred, &spot, if waits { self.load_c } else { load_here }, waits);
                     cands.push(Cand { run_us, frees_in_us: frees_in[k], copy_us: 0, spot, place });
@@ -1475,7 +1477,7 @@ impl Sched {
                             },
                         };
                         let place = Place::Remote { remote: r, class: Some(k), shown_in: None };
-                        let spot = Spot::new(&w.pred, &w.unit, at, true, cpus);
+                        let spot = Spot::new(&w.pred, w.unit.codegen_units, at, true, cpus);
                         let load_c = if waits { state.load_c } else { load_there[r] };
                         let run_us = self.run_us(&w.pred, &spot, load_c, waits);
                         let copy_us = self.stats.copy_us(&w.unit, at).unwrap_or(REMOTE_OVERHEAD_US);
@@ -1501,7 +1503,7 @@ impl Sched {
                         None => first_free.unwrap_or((0, 0)),
                     };
                     let place = Place::Spread { layout: id, class };
-                    let spot = self.spot(&w.pred, &w.unit, place);
+                    let spot = self.spot(&w.pred, w.unit.codegen_units, place);
                     let waits = held[class] == 0;
                     let run_us = self.run_us(&w.pred, &spot, if waits { self.load_c } else { load_here }, waits);
                     wide.push(Wide { start_us, run_us, spot, queue: None, place });
@@ -1510,7 +1512,7 @@ impl Sched {
                     let Some((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
                     let cpus = state.classes.iter().map(|c| c.cpus as u64).sum();
                     let place = Place::Remote { remote: r, class: None, shown_in: None };
-                    let spot = Spot::new(&w.pred, &w.unit, places.all, false, cpus);
+                    let spot = Spot::new(&w.pred, w.unit.codegen_units, places.all, false, cpus);
                     let waits = rb.avail.iter().all(|&n| n == 0);
                     let load_c = if waits { state.load_c } else { load_there[r] };
                     let run_us = self.run_us(&w.pred, &spot, load_c, waits);
@@ -1667,7 +1669,7 @@ impl Sched {
             .layout
             .lease(job, pinned, first, unit.codegen_units, fifo_dir, &cpus, meter.clone())
             .with_context(|| format_compact!("starting {}", unit.exact))?;
-        let spot = self.spot(&pred, &unit, place);
+        let spot = self.spot(&pred, unit.codegen_units, place);
         let (at, run_us) = (spot.at, self.run_us(&pred, &spot, self.load_c, false));
         self.running.push(Running {
             job,
@@ -1778,29 +1780,44 @@ impl Sched {
             let r = ranks.entry(key).or_default();
             *r = (*r).max(rank);
         }
+        let layout = &self.layout;
+        let fastest = layout.by_speed()[0];
+        // This box's fastest class, idle, in instructions per µs: speeds are
+        // in hundredths of it, and work in ms on it.
+        let base = layout.classes[fastest].rate as f64 / self.stats.factor(layout.places.classes[fastest], 0);
+        let speed_c = |rate: u64, at: PlaceId, load_c: u32| {
+            (rate as f64 / self.stats.factor(at, load_c) / base * 100.).round() as u32
+        };
+        let ms = |mi: u64| (mi as f64 * 1000. / base).round() as u64;
+        let id = layout.id;
         let mut units: Vec<UnitStatus> = self
             .stats
             .units()
             .map(|(key, info)| {
                 let [here, sent, served] = info.runs;
+                let place = match light(&info.pred) {
+                    true => Place::Local { layout: id, class: fastest },
+                    false => Place::Spread { layout: id, class: fastest },
+                };
+                let spot = self.spot(&info.pred, 1, place);
                 UnitStatus {
                     key: key.clone(),
                     here,
                     sent,
                     served,
-                    cost_mi: info.cost_mi,
-                    front_mi: info.front_mi,
-                    width_c: info.width_c,
+                    work_ms: ms(info.pred.cost_mi()),
+                    front_ms: (info.pred.front_mi > 0).then(|| ms(info.pred.front_mi)),
+                    width_c: info.pred.width_c.unwrap_or(100),
+                    now_ms: self.run_us(&info.pred, &spot, self.load_c, false) / 1000,
                     wall_ms: info.wall_ms,
-                    mem_kb: info.mem_kb,
+                    mem_kb: info.pred.mem_kb,
                     copy_ms: info.copy_ms,
                     sent_kb: info.sent_kb,
-                    rank_mi: ranks.get(key).copied(),
+                    rank_ms: ranks.get(key).map(|&r| ms(r)),
                 }
             })
             .collect();
-        units.sort_unstable_by(|a, b| b.rank_mi.cmp(&a.rank_mi).then(b.cost_mi.cmp(&a.cost_mi)));
-        let factor_c = |stats: &Stats, at: PlaceId, load_c: u32| (stats.factor(at, load_c) * 100.).round() as u32;
+        units.sort_unstable_by(|a, b| b.rank_ms.cmp(&a.rank_ms).then(b.work_ms.cmp(&a.work_ms)));
         let boxes = self
             .remotes
             .iter()
@@ -1808,18 +1825,30 @@ impl Sched {
             .filter_map(|(i, rb)| {
                 let (state, places) = rb.state.as_ref()?;
                 let there = |r: &&Running| matches!(r.place, Place::Remote { remote, .. } if remote == i);
+                let classes = state
+                    .classes
+                    .iter()
+                    .zip(&places.classes)
+                    .map(|(c, &at)| BoxClass { cpus: c.cpus, speed_c: speed_c(c.rate, at, state.load_c), free: c.free })
+                    .collect();
+                let (_, mean) = spread_rates(state.classes.iter().map(|c| (c.rate, c.cpus as u64)));
+                let copy_us = self.stats.place_copy_us(places.all).or_else(|| {
+                    places.classes.iter().find_map(|&at| self.stats.place_copy_us(at))
+                });
                 Some(BoxStatus {
                     name: rb.name.clone(),
                     profile: state.profile.clone(),
-                    classes: state.classes.clone(),
                     load_c: state.load_c,
-                    factor_c: factor_c(&self.stats, places.all, state.load_c),
+                    classes,
+                    threads: state.classes.iter().map(|c| c.cpus).sum(),
+                    thread_speed_c: speed_c(mean, places.all, state.load_c),
+                    copy_ms: copy_us.map(|us| us / 1000),
                     sent: self.running.iter().filter(there).count() as u32,
                     compatible: state.protocol == PROTOCOL,
                 })
             })
             .collect();
-        let layout = &self.layout;
+        let (_, mean) = spread_rates(layout.classes.iter().map(|c| (c.rate, c.cpus.len() as u64)));
         Status {
             profile: self.profile.name().clone(),
             switching: match &self.switch {
@@ -1833,7 +1862,7 @@ impl Sched {
                 .iter()
                 .enumerate()
                 .map(|(k, c)| {
-                    let here = Place::Local { layout: layout.id, class: k };
+                    let here = Place::Local { layout: id, class: k };
                     let (mut running, mut serving) = (0, 0);
                     for r in self.running.iter().filter(|r| r.place == here) {
                         match r.build {
@@ -1841,10 +1870,11 @@ impl Sched {
                             None => serving += 1,
                         }
                     }
+                    let at = layout.places.classes[k];
                     ClassStatus {
-                        rate: c.rate,
-                        factor_c: factor_c(&self.stats, layout.places.classes[k], self.load_c),
                         cpus: c.cpus.len() as u32,
+                        idle_speed_c: speed_c(c.rate, at, 0),
+                        speed_c: speed_c(c.rate, at, self.load_c),
                         running,
                         serving,
                         lent: layout.lent(k),
@@ -1853,7 +1883,12 @@ impl Sched {
                 })
                 .collect(),
             spread: self.running.iter().filter(|r| matches!(r.place, Place::Spread { .. })).fold(
-                SpreadStatus { running: 0, serving: 0, factor_c: factor_c(&self.stats, layout.places.all, self.load_c) },
+                SpreadStatus {
+                    running: 0,
+                    serving: 0,
+                    threads: self.local_cpus() as u32,
+                    thread_speed_c: speed_c(mean, layout.places.all, self.load_c),
+                },
                 |n, r| match r.build {
                     Some(_) => SpreadStatus { running: n.running + 1, ..n },
                     None => SpreadStatus { serving: n.serving + 1, ..n },
@@ -2396,6 +2431,29 @@ mod test {
             s.measure(t0 + MEASURE * i);
         }
         assert!((6000..6700).contains(&s.load_c), "{}", s.load_c);
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_shows_speeds_against_the_fastest_class_idle_and_work_in_seconds() -> Result<()> {
+        let dir = scratch("status-speeds");
+        // 4 tasks per cpu runnable; the second class is calibrated at half
+        // speed, and b at five times.
+        let room = Room { runnable: Box::new(|| Ok(16)), ..room(u64::MAX) };
+        let classes = vec![class(1000, &[0, 1]), class(2000, &[2, 3])];
+        let (mut s, _rx, _load) = sched(&dir, classes, room, &[("a", 3_000_000, 1)], &[])?;
+        s.farm("b".into(), Some(remote_box(200, 4, 4, 1)));
+        let st = s.status();
+        assert_eq!(st.load_c, 400);
+        let speeds = |c: &ClassStatus| (c.idle_speed_c, c.speed_c);
+        assert_eq!((speeds(&st.classes[0]), speeds(&st.classes[1])), ((100, 25), (50, 13)));
+        assert_eq!(st.boxes[0].classes[0].speed_c, 500);
+        // 3 s of work on class 0 idle; now 4.25 times as long, with the
+        // load its own thread adds.
+        let a = st.units.iter().find(|u| u.key == "a").unwrap();
+        assert_eq!((a.work_ms, a.now_ms), (3000, 12_750));
         drop(s);
         fs::remove_dir_all(&dir)?;
         Ok(())
@@ -2972,7 +3030,7 @@ mod test {
         let unit = |key: &str| st.units.iter().find(|u| u.key == key).unwrap();
         let runs = |key: &str| {
             let u = unit(key);
-            (u.here, u.sent, u.served, u.rank_mi.is_some())
+            (u.here, u.sent, u.served, u.rank_ms.is_some())
         };
         assert_eq!(runs("theirs"), (0, 0, 1, false), "not in this box's graph");
         assert_eq!(runs("mine"), (1, 0, 0, true));
