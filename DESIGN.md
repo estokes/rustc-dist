@@ -22,13 +22,16 @@ is at once:
 - the box's admission controller: every rustc on the box, whether its job came
   from a local cargo or from another box, holds one of its slots;
 - a farm member: publishes toolchains, slot classes, free counts and
-  calibration in its row of `BASE/status`;
+  calibration in its row of `BASE/vN/status`;
 - a farm client: sends its users' jobs to other boxes;
 - a remote executor: runs other boxes' jobs in a sandbox.
 
 Local and remote work draw from one slot pool, so nothing can oversubscribe the
 box. It runs as a systemd user service and does not exit when idle, because it
-serves remote jobs. The wrapper starts it if it is missing.
+serves remote jobs. A wrapper that finds no daemon starts one: through
+systemd if its user service is installed, so a wrapper can't start a second
+daemon while systemd restarts its own and leave the service failing to take
+the lock; on its own otherwise.
 
 The wrapper never runs rustc without a grant. If it cannot reach or start the
 daemon it fails the compile with a clear message. `RUSTC_DIST=off` is the only
@@ -413,18 +416,24 @@ work, so build times say nothing yet; placement is all that was checked.
 ### Farm
 
 A daemon whose config has `base` (say `/build`) joins the farm. The farm's
-netidx namespace:
+netidx namespace is under the protocol version, `BASE/vN` (`/build/v12`), so
+boxes of different versions never see each other:
 
-- `BASE/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
+- `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
   a table.
-- `BASE/api/NAME/jobs`: where the box takes jobs, a netidx pack channel
+- `BASE/vN/api/NAME/jobs`: where the box takes jobs, a netidx pack channel
   listener. Each job is one connection. Each client's handshake runs on its
   own with 30 s to finish, so a client that dies or stalls while connecting
   holds up no other.
-- `BASE/units/NAME/UNIT/COLUMN`: the units the box has run (see below).
+- `BASE/vN/units/NAME/UNIT/COLUMN`: the units the box has run (see below).
 
-A box's state is nine columns of its status row, each its own value:
-`protocol`, `profile`, `version` (a counter), `toolchains`, `load` (runnable
+`PROTOCOL` counts versions of every message between boxes and between a
+daemon and its clients: changing any of them bumps it. A daemon that a client
+of another version connects to exits, so systemd starts the binary that
+client came from.
+
+A box's state is eight columns of its status row, each its own value:
+`profile`, `version` (a counter), `toolchains`, `load` (runnable
 tasks per CPU), and per class (as arrays) `cpus`, `class GIPS` (calibrated G
 instructions/s), `free` tokens, and `frees in ms`, until its next token is
 predicted to free. A change updates the columns it touches in
@@ -439,7 +448,7 @@ load changing republishes only once it has moved a quarter of a task per CPU.
 A box publishes no free tokens while it switches profile or its own jobs wait.
 The scheduler publishes after every event, which includes the 100 ms ticks
 that lend tokens while jobs run. A changed state is republished at most every
-100 ms. The daemon lists `BASE/status` for other
+100 ms. The daemon lists `BASE/vN/status` for other
 boxes and subscribes to each one's state columns.
 
 Toolchains are rustup's (`~/.rustup/toolchains/*`). A compiler is matched by
@@ -487,9 +496,9 @@ Beside its state columns, its status row has figures for people: jobs
 `class running`, `class serving` and tokens `lent`, `finishing` under the last
 profile, memory
 (`mem GiB`, `mem growth GiB` predicted from running jobs, `mem cap GiB`) and
-`graph units`. So `BASE/status` shows the
+`graph units`. So `BASE/vN/status` shows the
 whole farm at a glance. Its units go in a table of their own at
-`BASE/units/NAME`, with `status`'s columns. Values are typed numbers, so the
+`BASE/vN/units/NAME`, with `status`'s columns. Values are typed numbers, so the
 browser sorts them. These refresh every 2 s and send only cells that
 changed. Building a status takes the scheduler some tens of ms with
 thousands of units, which is why it isn't faster.

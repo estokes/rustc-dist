@@ -4,7 +4,7 @@ use crate::{
     farm::{BoxState, ClassState, Load},
     graph::Graph,
     protocol::{
-        BoxClass, BoxStatus, ClassStatus, Measured, PROTOCOL, Ran, Reply, SpreadStatus, Status, Switching,
+        BoxClass, BoxStatus, ClassStatus, Measured, Ran, Reply, SpreadStatus, Status, Switching,
         Unit, UnitStatus, frame,
     },
     stats::{self, Decay, Origin, PlaceId, Prediction, Run, Stats, Transfer},
@@ -750,8 +750,7 @@ impl RemoteBox {
     fn usable(&self, p: &Portable) -> Option<&(BoxState, Places)> {
         let known = self.state.as_ref()?;
         let state = &known.0;
-        let ready = state.protocol == PROTOCOL
-            && self.busy_until.is_none_or(|v| state.version >= v)
+        let ready = self.busy_until.is_none_or(|v| state.version >= v)
             && state.toolchains.iter().any(|t| t.builds(&p.key, p.target.as_deref()));
         ready.then_some(known)
     }
@@ -1844,7 +1843,6 @@ impl Sched {
                     thread_speed_c: speed_c(mean, places.all, state.load_c),
                     copy_ms: copy_us.map(|us| us / 1000),
                     sent: self.running.iter().filter(there).count() as u32,
-                    compatible: state.protocol == PROTOCOL,
                 })
             })
             .collect();
@@ -2302,7 +2300,7 @@ mod test {
     fn remote_box(calib_us: u64, cpus: u32, free: u32, version: u64) -> (NPath, BoxState) {
         let toolchains = vec![Toolchain { key: "c h".into(), targets: vec!["h".into()] }];
         let classes = vec![ClassState { rate: rate(calib_us), cpus, free, frees_in_ms: (free > 0).then_some(0) }];
-        let state = BoxState { protocol: PROTOCOL, profile: "default".into(), version, toolchains, load_c: 0, classes };
+        let state = BoxState { profile: "default".into(), version, toolchains, load_c: 0, classes };
         (NPath::from("/farm/b/jobs"), state)
     }
 

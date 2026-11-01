@@ -190,7 +190,6 @@ fn status() -> Result<()> {
         gib(st.mem_capacity_kb)
     )?;
     for b in &st.boxes {
-        let note = if b.compatible { "" } else { ", other version" };
         let mut classes = CompactString::const_new("");
         for c in &b.classes {
             let sep = if classes.is_empty() { "" } else { ", " };
@@ -203,14 +202,13 @@ fn status() -> Result<()> {
         writeln!(
             out,
             "box {}: profile {}, load {:.2}; light jobs on {classes}; heavy {} threads at {:.2} each; \
-             {copy}; {} of {} tokens free, {} from here{note}",
+             {copy}; {} tokens free, {} from here",
             b.name,
             b.profile,
             hundredths(b.load_c),
             b.threads,
             hundredths(b.thread_speed_c),
             b.free(),
-            b.cpus(),
             b.sent
         )?;
     }

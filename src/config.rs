@@ -149,8 +149,9 @@ fn xdg(var: &str, home_rel: &str) -> PathBuf {
     }
 }
 
-pub fn systemd_unit_dir() -> PathBuf {
-    xdg("XDG_CONFIG_HOME", ".config").join("systemd/user")
+/// The systemd user service `rustc-dist install` writes.
+pub fn systemd_unit() -> PathBuf {
+    xdg("XDG_CONFIG_HOME", ".config").join("systemd/user/rustc-dist.service")
 }
 
 /// Calibration results and job history.

@@ -20,6 +20,19 @@ pub fn pin(cpus: &[u32]) -> Result<()> {
     Ok(())
 }
 
+/// Run `systemctl --user` with `args`.
+pub fn systemctl(args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .context("running systemctl")?;
+    if !status.success() {
+        bail!("systemctl --user {args:?} failed");
+    }
+    Ok(())
+}
+
 pub fn running_as_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }

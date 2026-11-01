@@ -1,5 +1,5 @@
 use crate::{classes::Class, client, config, perf, sys};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use arcstr::ArcStr;
 use compact_str::format_compact;
 use immutable_chunkmap::map::MapM;
@@ -8,7 +8,6 @@ use std::{
     hint::black_box,
     io::{self, Write},
     ops::Bound,
-    process::Command,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -231,9 +230,10 @@ pub fn install() -> Result<()> {
         eprintln!("stopped the running daemon so systemd can own it");
     }
     let exe = env::current_exe()?.canonicalize().context("finding rustc-dist")?;
-    let dir = config::systemd_unit_dir();
-    fs::create_dir_all(&dir)?;
-    let unit = dir.join("rustc-dist.service");
+    let unit = config::systemd_unit();
+    if let Some(dir) = unit.parent() {
+        fs::create_dir_all(dir)?;
+    }
     let text = format_compact!(
         "[Unit]\nDescription=rustc-dist build scheduler\n\n\
          [Service]\nExecStart=\"{}\" daemon\nRestart=always\nRestartSec=1\n\n\
@@ -242,21 +242,9 @@ pub fn install() -> Result<()> {
     );
     fs::write(&unit, text.as_str())
         .with_context(|| format_compact!("writing {}", unit.display()))?;
-    systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", "--now", "rustc-dist.service"])?;
+    sys::systemctl(&["daemon-reload"])?;
+    sys::systemctl(&["enable", "--now", "rustc-dist.service"])?;
     eprintln!("installed {}", unit.display());
-    Ok(())
-}
-
-fn systemctl(args: &[&str]) -> Result<()> {
-    let status = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .status()
-        .context("running systemctl")?;
-    if !status.success() {
-        bail!("systemctl --user {args:?} failed");
-    }
     Ok(())
 }
 

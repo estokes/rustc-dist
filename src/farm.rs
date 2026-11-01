@@ -1,13 +1,15 @@
-//! A farm in netidx, under the config's `base`:
+//! A farm in netidx, under the config's `base` and the protocol version,
+//! so boxes of different versions never see each other:
 //!
-//! - `BASE/status/NAME/COLUMN`: a row per box, which the netidx browser
+//! - `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser
 //!   draws as a table. The columns in [`STATE`] are what other boxes read;
 //!   the rest are for people (see `browser`).
-//! - `BASE/api/NAME/jobs`: where a box takes remote jobs.
-//! - `BASE/units/NAME/UNIT/COLUMN`: the units a box has run.
+//! - `BASE/vN/api/NAME/jobs`: where a box takes remote jobs.
+//! - `BASE/vN/units/NAME/UNIT/COLUMN`: the units a box has run.
 
 use crate::{protocol::PROTOCOL, sched::Msg, toolchain::Toolchain};
 use anyhow::{Result, bail};
+use compact_str::format_compact;
 use arcstr::ArcStr;
 use futures::{StreamExt, channel::mpsc as fmpsc};
 use log::{info, warn};
@@ -34,8 +36,8 @@ const LIST_EVERY: Duration = Duration::from_secs(1);
 /// The status columns a box's state is published in. A change updates the
 /// columns it touches in one batch, which subscribers get whole, so a box
 /// never sees half of another's state.
-pub const STATE: [&str; 9] =
-    ["protocol", "profile", "version", "toolchains", "load", "cpus", "class GIPS", "free", "frees in ms"];
+pub const STATE: [&str; 8] =
+    ["profile", "version", "toolchains", "load", "cpus", "class GIPS", "free", "frees in ms"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pack)]
 pub struct ClassState {
@@ -54,7 +56,6 @@ pub struct ClassState {
 /// What a box publishes for other boxes, in its [`STATE`] columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoxState {
-    pub protocol: u32,
     pub profile: ArcStr,
     /// Counts the states the box has published since it started. Its
     /// answer to an offer names the first version that reflects it.
@@ -66,10 +67,9 @@ pub struct BoxState {
 }
 
 impl BoxState {
-    fn columns(&self) -> [Value; 9] {
+    fn columns(&self) -> [Value; STATE.len()] {
         let per_class = |f: fn(&ClassState) -> Value| Value::from(self.classes.iter().map(f).collect::<Vec<_>>());
         [
-            self.protocol.into(),
             self.profile.clone().into(),
             self.version.into(),
             self.toolchains.iter().map(|t| (t.key.clone(), t.targets.clone())).collect::<Vec<_>>().into(),
@@ -82,7 +82,7 @@ impl BoxState {
     }
 
     fn from_columns(columns: &[Value]) -> Result<Self> {
-        let [protocol, profile, version, toolchains, load, cpus, rates, free, frees_in] = columns else {
+        let [profile, version, toolchains, load, cpus, rates, free, frees_in] = columns else {
             bail!("{} state columns", columns.len());
         };
         fn cast<T: FromValue>(v: &Value) -> Result<T> {
@@ -113,7 +113,6 @@ impl BoxState {
             })
             .collect::<Result<_>>()?;
         Ok(Self {
-            protocol: cast(protocol)?,
             profile: cast(profile)?,
             version: cast(version)?,
             toolchains: toolchains.into_iter().map(|(key, targets)| Toolchain { key, targets }).collect(),
@@ -133,19 +132,29 @@ pub struct Load {
     pub classes: Vec<ClassState>,
 }
 
+/// The farm's namespace for this protocol version.
+fn versioned(base: &Path) -> Path {
+    base.append(format_compact!("v{PROTOCOL}").as_str())
+}
+
 /// Where a box takes remote jobs.
 pub fn jobs_path(base: &Path, name: &str) -> Path {
-    base.append("api").append(name).append("jobs")
+    versioned(base).append("api").append(name).append("jobs")
+}
+
+/// The status table, a row per box.
+fn status_table(base: &Path) -> Path {
+    versioned(base).append("status")
 }
 
 /// A box's row in the status table.
 pub fn status_path(base: &Path, name: &str) -> Path {
-    base.append("status").append(name)
+    status_table(base).append(name)
 }
 
 /// The table of units a box has run.
 pub fn units_path(base: &Path, name: &str) -> Path {
-    base.append("units").append(name)
+    versioned(base).append("units").append(name)
 }
 
 /// A published value and what it last showed, so only changes are sent.
@@ -193,7 +202,6 @@ impl Watched {
 /// box's.
 pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::UnboundedSender<Msg>) -> Result<()> {
     let state = |load: &Load| BoxState {
-        protocol: PROTOCOL,
         profile: load.profile.clone(),
         version: load.version,
         toolchains: m.toolchains.clone(),
@@ -207,7 +215,7 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
         .map(|(col, v)| Cell::publish(&m.publisher, row.append(col), v))
         .collect::<Result<Vec<_>>>()?;
     info!("publishing {row}");
-    let table = m.base.append("status");
+    let table = status_table(&m.base);
     let (updates_tx, mut updates): (UpdateChan, _) = fmpsc::channel(64);
     let mut boxes: HashMap<ArcStr, Watched> = HashMap::new();
     let mut columns: HashMap<SubId, (ArcStr, usize)> = HashMap::new();
@@ -308,7 +316,6 @@ mod test {
 
     fn state(version: u64, free: u32) -> BoxState {
         BoxState {
-            protocol: PROTOCOL,
             profile: "default".into(),
             version,
             toolchains: vec![Toolchain { key: "c h".into(), targets: vec!["h".into(), "wasm32".into()] }],
@@ -335,7 +342,7 @@ mod test {
         let s = state(7, 0);
         assert_eq!(BoxState::from_columns(&s.columns()).unwrap(), s);
         let mut short = s.columns();
-        short[7] = Value::from(vec![1i64]);
+        short[6] = Value::from(vec![1i64]);
         assert!(BoxState::from_columns(&short).is_err());
     }
 
@@ -361,7 +368,7 @@ mod test {
         let (b_tx, mut b_msgs) = mpsc::unbounded_channel();
         tokio::spawn(run(member("b"), b_rx, b_tx));
         let (jobs, s) = state_of_a(&mut b_msgs).await?;
-        assert_eq!(jobs, Path::from("/farm/api/a/jobs"));
+        assert_eq!(jobs, Path::from(format!("/farm/v{PROTOCOL}/api/a/jobs")));
         assert_eq!(s, state(1, 0));
         a_load.send(load(2, 5))?;
         let (_, s) = state_of_a(&mut b_msgs).await?;

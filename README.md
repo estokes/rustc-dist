@@ -152,12 +152,13 @@ cargo install rustc-dist
 
 2. **A base path.** Pick a path for the farm, such as `/build`, and give every
    box's identity permission to publish, subscribe, list and write under it.
-   rustc-dist uses:
+   rustc-dist uses, under its protocol version `vN` so boxes of different
+   versions never meet:
 
-   - `BASE/status/NAME/...`: one row per box. The browser shows it as a table
-     of the whole farm.
-   - `BASE/api/NAME/jobs`: where the box takes jobs.
-   - `BASE/units/NAME/...`: the units the box has run.
+   - `BASE/vN/status/NAME/...`: one row per box. The browser shows it as a
+     table of the whole farm.
+   - `BASE/vN/api/NAME/jobs`: where the box takes jobs.
+   - `BASE/vN/units/NAME/...`: the units the box has run.
 
 3. **Configure each box** in `~/.config/rustc-dist.toml`:
 

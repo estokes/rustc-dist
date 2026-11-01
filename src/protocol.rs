@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 11;
+pub const PROTOCOL: u32 = 12;
 const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under
@@ -191,8 +191,6 @@ pub struct BoxStatus {
     pub copy_ms: Option<u64>,
     /// Jobs this box has running there.
     pub sent: u32,
-    /// It speaks this protocol version.
-    pub compatible: bool,
 }
 
 #[derive(Debug, Pack)]
@@ -320,10 +318,6 @@ impl UnitStatus {
 }
 
 impl BoxStatus {
-    pub fn cpus(&self) -> u32 {
-        self.classes.iter().map(|c| c.cpus).sum()
-    }
-
     pub fn free(&self) -> u32 {
         self.classes.iter().map(|c| c.free).sum()
     }

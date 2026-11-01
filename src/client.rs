@@ -1,5 +1,5 @@
 use crate::{
-    config,
+    config, sys,
     protocol::{self, Ask, PROTOCOL, Reply},
 };
 use anyhow::{Context, Result, bail};
@@ -82,7 +82,13 @@ fn connect(spawn: bool) -> Result<Option<UnixStream>> {
     bail!("the rustc-dist daemon did not start, see {}", config::log_path().display())
 }
 
+/// Start the daemon: through systemd if its user service is installed, so a
+/// wrapper can't start a second daemon while systemd restarts its own, and
+/// leave the service failing to take the lock; else on its own.
 fn spawn_daemon() -> Result<()> {
+    if config::systemd_unit().exists() {
+        return sys::systemctl(&["start", "rustc-dist.service"]);
+    }
     config::make_private_dir(&config::runtime_dir())?;
     let log = OpenOptions::new()
         .create(true)
