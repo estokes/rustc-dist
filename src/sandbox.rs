@@ -1,5 +1,5 @@
 use crate::{
-    blobs::{self, Hash, Store, Upload},
+    blobs::{self, Claim, Coming, Hash, Store, Upload},
     link::{self, Gate},
     protocol::{self, Front, Ran},
     remote::{self, CHUNK, FileEntry, FromServer, Late, Rlib, SYSTEM, ToServer},
@@ -161,25 +161,46 @@ async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> 
     }
     let store = &server.store;
     let _pins = store.pin(files.iter().map(|f| f.hash).chain(rlibs.iter().flat_map(|r| [r.hash, r.meta])));
-    let mut now: HashSet<Hash> = files.iter().map(|f| f.hash).filter(|h| !store.has(h)).collect();
-    let mut later = HashSet::new();
-    for r in rlibs.iter().filter(|r| !store.has(&r.hash)) {
-        later.insert(r.hash);
-        if !store.has(&r.meta) {
-            now.insert(r.meta);
+    // What the job needs before rustc starts, and late rlibs: those its
+    // client sends, and those another job's client is already sending.
+    let (mut send_now, mut send_later) = (HashMap::new(), HashMap::new());
+    let (mut coming_now, mut coming_later) = (Vec::new(), Vec::new());
+    let mut claimed = HashSet::new();
+    let mut claim = |hash: Hash, send: &mut HashMap<Hash, _>, coming: &mut Vec<Coming>| {
+        if claimed.insert(hash) {
+            match store.claim(&hash) {
+                Claim::Have => (),
+                Claim::Send(s) => drop(send.insert(hash, s)),
+                Claim::Coming(c) => coming.push(c),
+            }
         }
+    };
+    for f in &files {
+        claim(f.hash, &mut send_now, &mut coming_now);
     }
-    later.retain(|h| !now.contains(h));
-    let need = FromServer::Need { now: now.iter().copied().collect(), later: later.iter().copied().collect() };
+    for r in rlibs.iter().filter(|r| !store.has(&r.hash)) {
+        claim(r.meta, &mut send_now, &mut coming_now);
+        claim(r.hash, &mut send_later, &mut coming_later);
+    }
+    let need = FromServer::Need { now: send_now.keys().copied().collect(), later: send_later.keys().copied().collect() };
     con.send_one(&need).await?;
-    receive(con, store, now, |_| Ok(())).await?;
+    let now = send_now.keys().copied().collect();
+    receive(con, store, now, |hash| {
+        send_now.remove(&hash);
+        Ok(())
+    })
+    .await?;
     let ToServer::Run { args, env, cwd } = con.recv_one().await? else {
         bail!("expected run");
     };
     check(&cwd)?;
+    for c in coming_now {
+        c.arrived(store).await?;
+    }
     store.evict();
     let n = server.next_job.fetch_add(1, Ordering::Relaxed);
     let root = JobDir(server.jobs_dir.join(format_compact!("{n}").as_str()));
+    let later: HashSet<Hash> = send_later.keys().copied().chain(coming_later.iter().map(Coming::hash)).collect();
     root.build(store, &files, rlibs, &later, &dirs, &cwd)?;
     let tops: BTreeSet<&str> = files
         .iter()
@@ -197,16 +218,29 @@ async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> 
         cmd.args(["--setenv", "PATH", path.as_str()]);
     }
     cmd.arg("--").arg(tc.rustc()).args(args.iter().map(|a| a.as_str()));
+    let place = |hash: Hash| {
+        for r in rlibs.iter().filter(|r| r.hash == hash) {
+            blobs::replace(store, &hash, &root.at(&r.path))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
     let late = match linker {
         None => None,
         Some(_) => {
-            let arrive = receive(con, store, later, |hash| {
-                for r in rlibs.iter().filter(|r| r.hash == hash) {
-                    blobs::replace(store, &hash, &root.at(&r.path))?;
+            let sent = send_later.keys().copied().collect();
+            let sent = receive(con, store, sent, |hash| {
+                send_later.remove(&hash);
+                place(hash)
+            });
+            let others = async {
+                for c in coming_later {
+                    let hash = c.hash();
+                    c.arrived(store).await?;
+                    place(hash)?;
                 }
                 Ok(())
-            });
-            Some((Gate::new()?, arrive))
+            };
+            Some((Gate::new()?, async { futures::try_join!(sent, others).map(|_| ()) }))
         }
     };
     run(con, store, cmd, &root.0, slot, late).await

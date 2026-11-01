@@ -347,6 +347,36 @@ fn blob_count(dir: &Path) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jobs_sent_together_send_a_blob_they_share_once() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-shared-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    // Two checkouts, as two lanes, each with the same 64 MB beside its
+    // sources, which both jobs send.
+    let big = 64 << 20;
+    let data: Vec<u8> = (0..big).map(|i| (i % 251) as u8).collect();
+    let (ws1, ws2) = (project(&dir.join("ws1"))?, project(&dir.join("ws2"))?);
+    for ws in ["ws1", "ws2"] {
+        fs::write(dir.join(ws).join("app/src/big.bin"), &data)?;
+    }
+    let crates = |lib: &(Job, Unit)| lib.1.deps.iter().filter_map(|d| d.file.clone()).collect::<Vec<ArcStr>>();
+    let (c1, c2) = (crates(&ws1), crates(&ws2));
+    let hashes = Hashes::default();
+    let (one, two) = tokio::join!(send(&b, &ws1, &c1, &hashes, None), send(&b, &ws2, &c2, &hashes, None));
+    let bytes = |o: Result<(Outcome, Vec<Event>)>| match o? {
+        (Outcome::Exit { code: 0, moved, .. }, _) => Ok(moved.bytes),
+        _ => bail!("failed"),
+    };
+    let (one, two) = (bytes(one)?, bytes(two)?);
+    assert!(one.max(two) >= big, "{one} {two}");
+    assert!(one + two < big * 3 / 2, "both sent it: {one} {two}");
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crate_builds_on_another_box() -> Result<()> {
     let _ = env_logger::try_init();
     let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-{}", std::process::id()));

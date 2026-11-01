@@ -554,7 +554,12 @@ by default; a tmpfs keeps it in memory), evicting the least recently used past
 `cache_gb` down to 90% of it, except blobs a running job reads, which are
 pinned from its manifest until it ends. The client sends a manifest of paths and hashes; the server
 answers with the hashes it lacks; the client sends those in 1 MB chunks and
-the server checks each blob's hash before storing it. Once a server is warm a
+the server checks each blob's hash before storing it. A blob another job's
+client is already sending isn't asked for again: the job waits for it, before
+rustc starts if it needs it then, or behind a stand-in if it is a late rlib.
+If that upload fails, so does the job, and its client builds it. On
+2026-11-01, fifteen graphix tests sent to ryouko at once each sent the same
+520 MB of rlibs, 7.8 GB over wifi, and each linker waited over two minutes. Once a server is warm a
 job sends a manifest and whatever sources changed.
 
 ### Sandbox

@@ -14,6 +14,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
 };
+use tokio::sync::watch;
 
 /// A file's blake3 hash, the name of its content on every box.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -122,6 +123,56 @@ pub struct Store {
     next_tmp: AtomicU64,
     /// Blobs running jobs read, with how many jobs read each.
     pinned: Mutex<HashMap<Hash, u32>>,
+    /// Blobs a job's client is sending, which other jobs wait for rather
+    /// than ask their own clients for: each one's receiver, whose sender
+    /// goes when the upload ends, stored or not.
+    arriving: Mutex<HashMap<Hash, watch::Receiver<()>>>,
+}
+
+/// Where a job gets a blob it reads.
+pub enum Claim<'a> {
+    /// The store has it.
+    Have,
+    /// No job is sending it: the job's own client must, and other jobs wait
+    /// for it until the guard drops.
+    Send(Sending<'a>),
+    /// Another job's client is sending it.
+    Coming(Coming),
+}
+
+/// A blob this job's client sends, which other jobs wait for.
+pub struct Sending<'a> {
+    store: &'a Store,
+    hash: Hash,
+    _done: watch::Sender<()>,
+}
+
+impl Drop for Sending<'_> {
+    fn drop(&mut self) {
+        self.store.arriving.lock().remove(&self.hash);
+    }
+}
+
+/// A blob another job's client is sending.
+pub struct Coming {
+    hash: Hash,
+    done: watch::Receiver<()>,
+}
+
+impl Coming {
+    pub fn hash(&self) -> Hash {
+        self.hash
+    }
+
+    /// Wait until the other job's upload ends; it failed if it didn't store
+    /// the blob.
+    pub async fn arrived(mut self, store: &Store) -> Result<()> {
+        while self.done.changed().await.is_ok() {}
+        if !store.has(&self.hash) {
+            bail!("blob {}, which another job was sending, never arrived", self.hash);
+        }
+        Ok(())
+    }
 }
 
 impl Store {
@@ -136,6 +187,7 @@ impl Store {
             used: AtomicU64::new(used),
             next_tmp: AtomicU64::new(0),
             pinned: Mutex::new(HashMap::new()),
+            arriving: Mutex::new(HashMap::new()),
         })
     }
 
@@ -156,6 +208,24 @@ impl Store {
     }
 
     /// Whether the blob is present, marking it used.
+    /// Where a job gets the blob `h`: see `Claim`.
+    pub fn claim(&self, h: &Hash) -> Claim<'_> {
+        if self.has(h) {
+            return Claim::Have;
+        }
+        let mut arriving = self.arriving.lock();
+        if let Some(done) = arriving.get(h) {
+            return Claim::Coming(Coming { hash: *h, done: done.clone() });
+        }
+        // An upload may have ended between the two looks.
+        if self.has(h) {
+            return Claim::Have;
+        }
+        let (tx, rx) = watch::channel(());
+        arriving.insert(*h, rx);
+        Claim::Send(Sending { store: self, hash: *h, _done: tx })
+    }
+
     pub fn has(&self, h: &Hash) -> bool {
         match File::open(self.path(h)) {
             Ok(f) => {
