@@ -10,6 +10,7 @@ use crate::{
     remote::{self, CHUNK, Event, FromServer, Moved, Outcome, ToServer},
     sandbox::{self, Server},
     sched::{Msg, Sched, Setup},
+    stats::Decay,
     sys,
     toolchain,
 };
@@ -56,6 +57,7 @@ async fn server(dir: &Path) -> Result<ServerBox> {
         runnable: Box::new(sys::runnable),
         tokens_per_cpu: 1.5,
         calibration_seconds: 4,
+        decay: Decay::default(),
     };
     let (tx, rx) = mpsc::unbounded_channel();
     let (load, _) = watch::channel(Load::default());

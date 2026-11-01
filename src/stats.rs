@@ -20,8 +20,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// Weights halve every this many seconds.
-const HALF_LIFE_S: f64 = 86_400.;
 /// A place's calibration counts as this many µs of runs in each load
 /// bucket, and never decays.
 const PRIOR_US: f64 = 30_000_000.;
@@ -30,14 +28,16 @@ const BUCKETS: [u32; 11] = [0, 25, 50, 75, 100, 150, 200, 300, 400, 600, 800];
 /// A unit's histograms are halved once it has this many runs, so its
 /// peaks follow the crate as it grows.
 const HALVE_AT: u64 = 256;
-/// A cell whose runs have decayed below this, about 60 days after its last
-/// run, as long as the build graph keeps a node, is dropped when the table
-/// is saved.
-const FORGET: f64 = 1e-18;
+/// A cell unrun for this long, as long as the build graph keeps a node, is
+/// dropped when the table is saved.
+const KEEP_S: f64 = 60. * 86_400.;
 /// Predicted size, in millions of instructions, of a job when nothing at
 /// all has been recorded.
 const UNKNOWN_COST_MI: u64 = 1000;
-const MAGIC: &[u8; 8] = b"rdstats5";
+const MAGIC: &[u8; 8] = b"rdstats6";
+/// A table from before copy times decayed on their own, whose cells count
+/// no sent runs.
+const UNSENT_MAGIC: &[u8; 8] = b"rdstats5";
 /// A table from before runs were timed, read as seed history.
 const OLD_MAGIC: &[u8; 8] = b"rdstats4";
 /// Where seed history ran: calibrated at one instruction per µs, so its
@@ -49,9 +49,26 @@ pub fn now_s() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0., |d| d.as_secs_f64())
 }
 
-/// What a weight set at `at` is worth at `now`.
-fn keep(at: f64, now: f64) -> f64 {
-    0.5f64.powf((now - at).max(0.) / HALF_LIFE_S)
+/// What a weight set at `at` is worth at `now`, halving every
+/// `half_life_s`.
+fn keep(at: f64, now: f64, half_life_s: f64) -> f64 {
+    0.5f64.powf((now - at).max(0.) / half_life_s)
+}
+
+/// How fast old runs stop counting. Their weight halves every
+/// `half_life_s` for how fast places run and how big units are, and every
+/// `copy_half_life_s` for how long sent runs spent moving files, which
+/// follows the network a laptop is on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Decay {
+    pub half_life_s: f64,
+    pub copy_half_life_s: f64,
+}
+
+impl Default for Decay {
+    fn default() -> Self {
+        Self { half_life_s: 86_400., copy_half_life_s: 3_600. }
+    }
 }
 
 /// The factor a place starts from: its calibrated speed up to one task per
@@ -135,13 +152,13 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn factor(&self, prior: f64, now: f64) -> f64 {
-        let k = keep(self.at, now);
+    fn factor(&self, prior: f64, now: f64, half_life_s: f64) -> f64 {
+        let k = keep(self.at, now, half_life_s);
         (PRIOR_US * prior + self.time_us * k) / (PRIOR_US + self.calibrated_us * k)
     }
 
-    fn add(&mut self, w: f64, time_us: f64, calibrated_us: f64, now: f64) {
-        let k = keep(self.at, now);
+    fn add(&mut self, w: f64, time_us: f64, calibrated_us: f64, now: f64, half_life_s: f64) {
+        let k = keep(self.at, now, half_life_s);
         self.time_us = self.time_us * k + w * time_us;
         self.calibrated_us = self.calibrated_us * k + w * calibrated_us;
         self.at = now;
@@ -181,7 +198,7 @@ impl Place {
             copies: Copies::default(),
             factors: [1.; BUCKETS.len()],
         };
-        p.refresh(0.);
+        p.refresh(0., 1.);
         p
     }
 
@@ -189,16 +206,16 @@ impl Place {
     /// starts from the starting curve at the level the place has run at
     /// over every load, so one nothing has run at follows the ones that
     /// have.
-    fn refresh(&mut self, now: f64) {
+    fn refresh(&mut self, now: f64, half_life_s: f64) {
         let (mut time_us, mut calibrated_us) = (PRIOR_US, PRIOR_US);
         for (b, &load_c) in self.curve.iter().zip(&BUCKETS) {
-            let k = keep(b.at, now);
+            let k = keep(b.at, now, half_life_s);
             time_us += b.time_us * k / prior(load_c);
             calibrated_us += b.calibrated_us * k;
         }
         let level = time_us / calibrated_us;
         for ((f, b), &load_c) in self.factors.iter_mut().zip(&self.curve).zip(&BUCKETS) {
-            *f = b.factor(prior(load_c) * level, now);
+            *f = b.factor(prior(load_c) * level, now, half_life_s);
         }
     }
 
@@ -213,19 +230,19 @@ impl Place {
 
     /// A run under `load_c` took `time_us` where its calibrated time was
     /// `calibrated_us`, and weighs `w`.
-    fn learn(&mut self, load_c: u32, w: f64, time_us: f64, calibrated_us: f64, now: f64) {
+    fn learn(&mut self, load_c: u32, w: f64, time_us: f64, calibrated_us: f64, now: f64, half_life_s: f64) {
         let last = BUCKETS.len() - 1;
         match between(load_c) {
             (i, _) if i == last => {
                 let at_last = time_us * BUCKETS[last] as f64 / load_c as f64;
-                self.curve[last].add(w, at_last, calibrated_us, now);
+                self.curve[last].add(w, at_last, calibrated_us, now, half_life_s);
             }
             (i, a) => {
-                self.curve[i].add(w * (1. - a), time_us, calibrated_us, now);
-                self.curve[i + 1].add(w * a, time_us, calibrated_us, now);
+                self.curve[i].add(w * (1. - a), time_us, calibrated_us, now, half_life_s);
+                self.curve[i + 1].add(w * a, time_us, calibrated_us, now, half_life_s);
             }
         }
-        self.refresh(now);
+        self.refresh(now, half_life_s);
     }
 }
 
@@ -243,26 +260,29 @@ struct Cell {
     rest_mi: f64,
     rest_us: f64,
     tokens_us: f64,
+    /// Sent runs and the µs they spent other than compiling, which decay at
+    /// the copy half-life.
+    sent: f64,
     copy_us: f64,
 }
 
 impl Cell {
-    fn sums(&mut self) -> [&mut f64; 7] {
-        [
-            &mut self.runs,
-            &mut self.load_c,
-            &mut self.front_mi,
-            &mut self.rest_mi,
-            &mut self.rest_us,
-            &mut self.tokens_us,
-            &mut self.copy_us,
-        ]
+    /// The sums that decay at the half-life for speed and size.
+    fn speed(&mut self) -> [&mut f64; 6] {
+        [&mut self.runs, &mut self.load_c, &mut self.front_mi, &mut self.rest_mi, &mut self.rest_us, &mut self.tokens_us]
     }
 
-    fn add(&mut self, mut other: Cell, now: f64) {
-        let k = keep(self.at, now);
-        for (s, o) in self.sums().into_iter().zip(other.sums()) {
+    fn copies(&mut self) -> [&mut f64; 2] {
+        [&mut self.sent, &mut self.copy_us]
+    }
+
+    fn add(&mut self, mut other: Cell, now: f64, decay: Decay) {
+        let (k, kc) = (keep(self.at, now, decay.half_life_s), keep(self.at, now, decay.copy_half_life_s));
+        for (s, o) in self.speed().into_iter().zip(other.speed()) {
             *s = *s * k + *o;
+        }
+        for (s, o) in self.copies().into_iter().zip(other.copies()) {
+            *s = *s * kc + *o;
         }
         self.at = now;
     }
@@ -328,9 +348,9 @@ impl Record {
         [&mut self.mem_kb, &mut self.wall_ms, &mut self.copy_ms, &mut self.sent_kb]
     }
 
-    fn add(&mut self, cell: Cell, now: f64) {
+    fn add(&mut self, cell: Cell, now: f64, decay: Decay) {
         match self.cells.iter_mut().find(|c| (c.place, c.bucket) == (cell.place, cell.bucket)) {
-            Some(c) => c.add(cell, now),
+            Some(c) => c.add(cell, now, decay),
             None => self.cells.push(cell),
         }
     }
@@ -358,10 +378,10 @@ impl Record {
     }
 
     /// Its size from every cell but `skip`'s.
-    fn size(&self, places: &[Place], now: f64, skip: Option<(PlaceId, u8)>) -> Size {
+    fn size(&self, places: &[Place], now: f64, half_life_s: f64, skip: Option<(PlaceId, u8)>) -> Size {
         let mut s = Size::default();
         for c in self.cells.iter().filter(|c| Some((c.place, c.bucket)) != skip && c.runs > 0.) {
-            let k = keep(c.at, now);
+            let k = keep(c.at, now, half_life_s);
             let m = places[c.place.0 as usize].factor((c.load_c / c.runs) as u32);
             s.runs += c.runs * k;
             s.front_mi += c.front_mi * k / m;
@@ -425,11 +445,12 @@ pub struct Stats {
     global_mem: Histogram<u32>,
     /// Seconds since the epoch, which weights decay to: see `set_now`.
     now: f64,
+    decay: Decay,
     pub dirty: bool,
 }
 
 impl Stats {
-    pub fn new() -> Self {
+    pub fn new(decay: Decay) -> Self {
         let mut stats = Self {
             places: Vec::new(),
             by_key: HashMap::new(),
@@ -438,6 +459,7 @@ impl Stats {
             global_cost: histogram(1_000_000_000),
             global_mem: histogram(1 << 30),
             now: now_s(),
+            decay,
             dirty: false,
         };
         stats.place(SEED, 1, 1);
@@ -448,7 +470,7 @@ impl Stats {
     pub fn set_now(&mut self, now: f64) {
         self.now = now;
         for p in &mut self.places {
-            p.refresh(now);
+            p.refresh(now, self.decay.half_life_s);
         }
     }
 
@@ -489,25 +511,25 @@ impl Stats {
     /// Predicted µs a run of `unit` sent to `place` spends other than
     /// compiling: from its own sends there, else every unit's, if any.
     pub fn copy_us(&self, unit: &Unit, place: PlaceId) -> Option<u64> {
-        let now = self.now;
-        let (mut runs, mut copy_us) = (0., 0.);
+        let (now, half_life_s) = (self.now, self.decay.copy_half_life_s);
+        let (mut sent, mut copy_us) = (0., 0.);
         for c in self.exact.get(&unit.exact).iter().flat_map(|r| &r.cells).filter(|c| c.place == place) {
-            let k = keep(c.at, now);
-            runs += c.runs * k;
+            let k = keep(c.at, now, half_life_s);
+            sent += c.sent * k;
             copy_us += c.copy_us * k;
         }
-        if runs <= 0. {
+        if sent <= 0. {
             let c = &self.places[place.0 as usize].copies;
-            let k = keep(c.at, now);
-            (runs, copy_us) = (c.runs * k, c.copy_us * k);
+            let k = keep(c.at, now, half_life_s);
+            (sent, copy_us) = (c.runs * k, c.copy_us * k);
         }
-        (runs > 0.).then(|| (copy_us / runs) as u64)
+        (sent > 0.).then(|| (copy_us / sent) as u64)
     }
 
     pub fn predict(&self, exact: &ArcStr, coarse: &ArcStr) -> Prediction {
         let own = [(&self.exact, exact), (&self.coarse, coarse)].into_iter().find_map(|(map, key)| {
             let r = map.get(key)?;
-            let s = r.size(&self.places, self.now, None);
+            let s = r.size(&self.places, self.now, self.decay.half_life_s, None);
             (s.runs > 0.).then_some((r, s))
         });
         match own {
@@ -531,7 +553,7 @@ impl Stats {
     /// Every unit with runs.
     pub fn units(&self) -> impl Iterator<Item = (&ArcStr, UnitInfo)> {
         self.exact.iter().filter_map(|(key, r)| {
-            let s = r.size(&self.places, self.now, None);
+            let s = r.size(&self.places, self.now, self.decay.half_life_s, None);
             (s.runs > 0.).then(|| {
                 let front_mi = s.front_mi() as u64;
                 let info = UnitInfo {
@@ -562,17 +584,18 @@ impl Stats {
         let tokens_us = (run.tokens_us as f64 - front_us).max(rest_us);
         let bucket = nearest(run.load_c);
         if let Some(r) = self.exact.get(&unit.exact) {
-            let other = r.size(&self.places, now, Some((run.place, bucket)));
+            let other = r.size(&self.places, now, self.decay.half_life_s, Some((run.place, bucket)));
             if other.runs > 0. {
                 let threads = if rest_us > 0. { tokens_us / rest_us } else { 1. };
                 let calibrated_us = other.front_mi() * 1e6 / fast + other.rest_mi() * 1e6 / (rate * threads);
                 let w = other.runs / (other.runs + 1.);
-                self.places[run.place.0 as usize].learn(run.load_c, w, wall_us, calibrated_us, now);
+                let half_life_s = self.decay.half_life_s;
+                self.places[run.place.0 as usize].learn(run.load_c, w, wall_us, calibrated_us, now, half_life_s);
             }
         }
-        let copy_us = match run.origin {
-            Origin::Sent(t) => t.copy_ms as f64 * 1000.,
-            Origin::Here | Origin::Served => 0.,
+        let (sent, copy_us) = match run.origin {
+            Origin::Sent(t) => (1., t.copy_ms as f64 * 1000.),
+            Origin::Here | Origin::Served => (0., 0.),
         };
         let cell = Cell {
             place: run.place,
@@ -584,17 +607,19 @@ impl Stats {
             rest_mi: tokens_us * rate / 1e6,
             rest_us,
             tokens_us,
+            sent,
             copy_us,
         };
+        let decay = self.decay;
         for (map, key) in [(&mut self.exact, &unit.exact), (&mut self.coarse, &unit.coarse)] {
             let r = map.entry(key.clone()).or_insert_with(Record::new);
-            r.add(cell, now);
+            r.add(cell, now, decay);
             r.count(run.mem_kb, run.wall_us / 1000, run.origin);
         }
         let place = &mut self.places[run.place.0 as usize];
         if let Origin::Sent(_) = run.origin {
             let c = &mut place.copies;
-            let k = keep(c.at, now);
+            let k = keep(c.at, now, decay.copy_half_life_s);
             (c.runs, c.copy_us, c.at) = (c.runs * k + 1., c.copy_us * k + copy_us, now);
         }
         let m = place.factor(run.load_c);
@@ -610,7 +635,7 @@ impl Stats {
         let cell = seed_cell(front_mi, rest_mi, width_c, self.now);
         for (map, key) in [(&mut self.exact, &unit.exact), (&mut self.coarse, &unit.coarse)] {
             let r = map.entry(key.clone()).or_insert_with(Record::new);
-            r.add(cell, self.now);
+            r.add(cell, self.now, self.decay);
             r.mem_kb.saturating_record(mem_kb.max(1));
         }
         self.global_cost.saturating_record((front_mi + rest_mi).max(1));
@@ -624,10 +649,10 @@ impl Stats {
         let now = self.now;
         let (mut cost, mut mem) = (histogram(1_000_000_000), histogram(1 << 30));
         for r in self.exact.values_mut().chain(self.coarse.values_mut()) {
-            r.cells.retain(|c| c.runs * keep(c.at, now) >= FORGET);
+            r.cells.retain(|c| now - c.at <= KEEP_S);
         }
         for r in self.exact.values() {
-            let s = r.size(&self.places, now, None);
+            let s = r.size(&self.places, now, self.decay.half_life_s, None);
             if s.runs > 0. {
                 cost.saturating_record(((s.front_mi + s.rest_mi) / s.runs).max(1.) as u64);
                 mem.saturating_record(r.mem_kb.value_at_quantile(0.9).max(1));
@@ -637,18 +662,19 @@ impl Stats {
     }
 
     /// A missing file is an empty table.
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path, decay: Decay) -> Result<Self> {
         let file = match File::open(path) {
             Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Self::new()),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Self::new(decay)),
             Err(e) => return Err(e).with_context(|| format_compact!("opening {}", path.display())),
         };
         let mut r = BufReader::new(file);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         let mut stats = match &magic {
-            MAGIC => Self::read(&mut r)?,
-            OLD_MAGIC => Self::read_old(&mut r)?,
+            MAGIC => Self::read(&mut r, decay, true)?,
+            UNSENT_MAGIC => Self::read(&mut r, decay, false)?,
+            OLD_MAGIC => Self::read_old(&mut r, decay)?,
             _ => bail!("{} is not a stats file", path.display()),
         };
         stats.set_now(now_s());
@@ -656,8 +682,10 @@ impl Stats {
         Ok(stats)
     }
 
-    fn read(r: &mut impl Read) -> Result<Self> {
-        let mut stats = Self::new();
+    /// Without `sent`, a cell's runs count as sent if they spent time
+    /// moving files.
+    fn read(r: &mut impl Read, decay: Decay, sent: bool) -> Result<Self> {
+        let mut stats = Self::new(decay);
         stats.places.clear();
         stats.by_key.clear();
         for i in 0..read_u32(r)? {
@@ -697,10 +725,18 @@ impl Stats {
                         rest_mi: 0.,
                         rest_us: 0.,
                         tokens_us: 0.,
+                        sent: 0.,
                         copy_us: 0.,
                     };
-                    for s in cell.sums() {
+                    for s in cell.speed() {
                         *s = read_f64(r)?;
+                    }
+                    if sent {
+                        cell.sent = read_f64(r)?;
+                    }
+                    cell.copy_us = read_f64(r)?;
+                    if !sent && cell.copy_us > 0. {
+                        cell.sent = cell.runs;
                     }
                     rec.cells.push(cell);
                 }
@@ -718,8 +754,8 @@ impl Stats {
 
     /// A table of instruction counts: each unit's medians become a seed
     /// cell, and its other histograms carry over.
-    fn read_old(r: &mut impl Read) -> Result<Self> {
-        let mut stats = Self::new();
+    fn read_old(r: &mut impl Read, decay: Decay) -> Result<Self> {
+        let mut stats = Self::new(decay);
         let mut de = Deserializer::new();
         let now = stats.now;
         for map in [&mut stats.exact, &mut stats.coarse] {
@@ -779,7 +815,10 @@ impl Stats {
                     w.write_all(&cell.place.0.to_be_bytes())?;
                     w.write_all(&[cell.bucket])?;
                     w.write_all(&cell.at.to_be_bytes())?;
-                    for s in cell.sums() {
+                    for s in cell.speed() {
+                        w.write_all(&s.to_be_bytes())?;
+                    }
+                    for s in cell.copies() {
                         w.write_all(&s.to_be_bytes())?;
                     }
                 }
@@ -810,6 +849,7 @@ fn seed_cell(front_mi: u64, rest_mi: u64, width_c: u64, now: f64) -> Cell {
         rest_mi: rest_mi as f64,
         rest_us,
         tokens_us: rest_us * width_c as f64 / 100.,
+        sent: 0.,
         copy_us: 0.,
     }
 }
@@ -868,7 +908,7 @@ mod test {
 
     #[test]
     fn predicts_from_exact_then_coarse_then_global() {
-        let mut s = Stats::new();
+        let mut s = Stats::new(Decay::default());
         assert_eq!(predict(&s, &unit("a:1", "a")).cost_mi(), UNKNOWN_COST_MI);
         assert!(!predict(&s, &unit("a:1", "a")).known);
         // 1000 instructions per µs: a second is 1000 M.
@@ -889,7 +929,7 @@ mod test {
 
     #[test]
     fn the_rest_is_work_spread_over_the_tokens_it_held() {
-        let mut s = Stats::new();
+        let mut s = Stats::new(Decay::default());
         let here = s.place("here/all", 2000, 1000);
         // 1 s: the front end 0.4 s, the rest 0.6 s holding 4 tokens.
         let r = Run { front_us: Some(400_000), tokens_us: 400_000 + 2_400_000, ..run(here, 0, 1000) };
@@ -902,7 +942,7 @@ mod test {
 
     #[test]
     fn a_place_slower_on_the_same_units_learns_a_larger_factor() {
-        let mut s = Stats::new();
+        let mut s = Stats::new(Decay::default());
         let (a, b, c) = (s.place("a/0", 1000, 1000), s.place("b/0", 1000, 1000), s.place("c/0", 1000, 1000));
         // b takes twice as long as a on the same unit; c only ever runs
         // its own unit, which says nothing about it.
@@ -926,7 +966,7 @@ mod test {
 
     #[test]
     fn the_same_unit_under_more_load_teaches_the_curve() {
-        let mut s = Stats::new();
+        let mut s = Stats::new(Decay::default());
         let a = s.place("a/0", 1000, 1000);
         // Three times as long at 3/4 of a task per CPU as idle.
         for _ in 0..200 {
@@ -943,7 +983,7 @@ mod test {
 
     #[test]
     fn weights_halve_every_half_life() {
-        let mut s = Stats::new();
+        let mut s = Stats::new(Decay::default());
         let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/0", 1000, 1000));
         s.set_now(0.);
         // 60 s at b against 30 at a: b's bucket holds 60 s of time for
@@ -951,16 +991,37 @@ mod test {
         s.record(&unit("u:1", "u"), &run(a, 0, 30_000));
         s.record(&unit("u:1", "u"), &run(b, 0, 60_000));
         let fresh = s.factor(b, 0);
-        s.set_now(HALF_LIFE_S);
+        s.set_now(Decay::default().half_life_s);
         let old = s.factor(b, 0);
         assert!(fresh > old && old > 1., "{fresh} {old}");
-        s.set_now(HALF_LIFE_S * 30.);
+        s.set_now(Decay::default().half_life_s * 30.);
         assert!(near(s.factor(b, 0), 1.), "back to its calibration");
     }
 
     #[test]
+    fn copy_times_follow_their_own_shorter_half_life() {
+        let mut s = Stats::new(Decay::default());
+        let there = s.place("b/all", 1000, 1000);
+        let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms }), ..run(there, 0, 100) };
+        // 10 s to move its files on a slow link, then 1 s two hours later:
+        // the old one counts a quarter.
+        s.set_now(0.);
+        s.record(&unit("a:1", "a"), &sent(10_000));
+        s.set_now(2. * 3600.);
+        s.record(&unit("a:1", "a"), &sent(1000));
+        let want = (10. * 0.25 + 1.) / 1.25 * 1e6;
+        let got = s.copy_us(&unit("a:1", "a"), there).unwrap() as f64;
+        assert!((got - want).abs() < want * 0.01, "{got} {want}");
+        let every = s.copy_us(&unit("b:1", "b"), there).unwrap() as f64;
+        assert!((every - want).abs() < want * 0.01, "every unit's too: {every}");
+        // Its size counts both runs nearly alike.
+        let p = predict(&s, &unit("a:1", "a"));
+        assert!((99..=100).contains(&p.rest_mi), "{}", p.rest_mi);
+    }
+
+    #[test]
     fn a_new_calibration_starts_the_place_over() {
-        let mut s = Stats::new();
+        let mut s = Stats::new(Decay::default());
         let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/0", 1000, 1000));
         for _ in 0..100 {
             s.record(&unit("u:1", "u"), &run(a, 0, 1000));
@@ -976,7 +1037,7 @@ mod test {
 
     #[test]
     fn copies_come_from_the_units_own_sends_then_every_units() {
-        let mut s = Stats::new();
+        let mut s = Stats::new(Decay::default());
         let there = s.place("b/all", 1000, 1000);
         let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms }), ..run(there, 0, 100) };
         assert_eq!(s.copy_us(&unit("a:1", "a"), there), None);
@@ -990,7 +1051,7 @@ mod test {
     fn save_and_load_round_trip() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("rustc-dist-stats-{}", std::process::id()));
         let path = dir.join("jobs.hdr");
-        let mut s = Stats::new();
+        let mut s = Stats::new(Decay::default());
         let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/all", 3000, 2000));
         s.record(&unit("a:1", "a"), &run(a, 0, 1234));
         s.record(&unit("a:1", "a"), &Run { origin: Origin::Served, ..run(b, 0, 2000) });
@@ -998,7 +1059,7 @@ mod test {
         s.record(&unit("b:1", "b"), &Run { front_us: Some(30_000), tokens_us: 230_000, origin: sent, ..run(b, 100, 99) });
         s.save(&path)?;
         assert!(!s.dirty);
-        let mut t = Stats::load(&path)?;
+        let mut t = Stats::load(&path, Decay::default())?;
         t.set_now(s.now);
         assert_eq!(t.place("b/all", 3000, 2000), b);
         assert_eq!(t.factor(a, 0), s.factor(a, 0));
@@ -1044,7 +1105,7 @@ mod test {
             }
         }
         drop(w);
-        let s = Stats::load(&path)?;
+        let s = Stats::load(&path, Decay::default())?;
         let p = predict(&s, &unit("a:1", "a:1"));
         assert!(p.known);
         // Histograms keep two significant figures.

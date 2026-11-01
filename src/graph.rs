@@ -305,6 +305,7 @@ impl Graph {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::stats::Decay;
 
     /// A unit in the target directory `/t`.
     fn unit(id: &str, deps: &[&str]) -> Unit {
@@ -329,7 +330,7 @@ mod test {
     }
 
     fn stats(costs: &[(&str, u64)]) -> Stats {
-        let mut s = Stats::new();
+        let mut s = Stats::new(Decay::default());
         for &(id, cost_mi) in costs {
             s.seed(&unit(id, &[]), 0, cost_mi, 100, 1);
         }

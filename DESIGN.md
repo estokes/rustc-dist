@@ -254,7 +254,9 @@ What a run teaches:
   against the others. Long runs weigh the most, since the factor is total time
   over total calibrated time.
 
-Weights halve every day of wall-clock time. Each bucket starts from the
+Weights halve every `half_life_s` of wall-clock time, a day by default:
+the curves model load, so what a place learned stays good that long. Each
+bucket starts from the
 calibrated speed, flat up to one task per CPU and then slower in proportion as
 CPUs time-share, at the level the place has learned over all its buckets, so a
 bucket nothing has reached follows the ones that have. That start counts as
@@ -268,7 +270,8 @@ A sent run's time is everything the client waits for, from offering the job to
 its last output. Its part other than compiling (staging and sending inputs,
 the linker waiting for late rlibs, receiving outputs) is its own term,
 predicted from the unit's recent sends to that place, else every unit's, else
-200 ms, and added in full. The server reports the token-µs and load it
+200 ms, and added in full. Its weights halve every `copy_half_life_s`, an hour
+by default, since the network a laptop is on changes as it moves. The server reports the token-µs and load it
 measured, counted from when rustc started, so time waiting for inputs isn't
 counted as the job's.
 
@@ -604,7 +607,8 @@ Config is real TOML (`toml` + serde), parsed into two separate structs.
   `calibration_seconds`, and for a farm `base` (the netidx path every box
   publishes under), `name` (the host name without its domain by default), `bind` (where other
   boxes reach this one, in netidx's syntax, since netidx's default is often
-  loopback only), `cache_dir`, `cache_gb` and `remote_links` (on by default).
+  loopback only), `cache_dir`, `cache_gb`, `remote_links` (on by default),
+  and `half_life_s` and `copy_half_life_s` (see Cost).
   Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit
   those to override them. The netidx config is netidx's own (`NETIDX_CFG` or
   its default paths).
@@ -945,7 +949,8 @@ Every number below is a guess. None has been tested on an idle box.
 | halve a unit's histograms at | 256 runs | `src/stats.rs` `HALVE_AT` |
 | size of a job with no history at all | 1 G instructions | `src/stats.rs` `UNKNOWN_COST_MI` |
 | a place's calibration counts as, in each load bucket | 30 s of runs | `src/stats.rs` `PRIOR_US` |
-| runs count half after | 1 day | `src/stats.rs` `HALF_LIFE_S` |
+| runs count half toward speed and size after | 1 day | `half_life_s` in the config |
+| sent runs count half toward time moving files after | 1 hour | `copy_half_life_s` in the config |
 | load buckets, runnable tasks per CPU | 0, ¼, ½, ¾, 1, 1½, 2, 3, 4, 6, 8 | `src/stats.rs` `BUCKETS` |
 | republish load alone once it moves | ¼ task per CPU | `src/sched.rs` `LOAD_STEP_C` |
 | share of compressed swap predicted peaks may use beyond RAM | 50% | `src/config.rs` `compressed_swap_share` |

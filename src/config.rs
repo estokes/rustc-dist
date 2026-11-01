@@ -1,3 +1,4 @@
+use crate::stats::Decay;
 use anyhow::{Context, Result, bail};
 use compact_str::format_compact;
 use netidx::publisher::BindCfg;
@@ -43,6 +44,13 @@ pub struct Config {
     /// Send jobs that link (binaries, tests, proc macros) to other boxes
     /// too, which means sending every rlib below them.
     pub remote_links: bool,
+    /// Old runs count half as much toward how fast each place runs and how
+    /// big each unit is after this many seconds.
+    pub half_life_s: u64,
+    /// Old sent runs count half as much toward how long sending a job takes
+    /// after this many seconds. Shorter, since the network a laptop is on
+    /// changes as it moves.
+    pub copy_half_life_s: u64,
 }
 
 impl Default for Config {
@@ -57,7 +65,15 @@ impl Default for Config {
             cache_dir: xdg("XDG_CACHE_HOME", ".cache").join("rustc-dist"),
             cache_gb: 20,
             remote_links: true,
+            half_life_s: Decay::default().half_life_s as u64,
+            copy_half_life_s: Decay::default().copy_half_life_s as u64,
         }
+    }
+}
+
+impl Config {
+    pub fn decay(&self) -> Decay {
+        Decay { half_life_s: self.half_life_s as f64, copy_half_life_s: self.copy_half_life_s as f64 }
     }
 }
 
@@ -119,6 +135,9 @@ pub fn load() -> Result<Config> {
     }
     if cfg.cache_gb == 0 {
         bail!("{}: cache_gb must be at least 1", path.display());
+    }
+    if cfg.half_life_s < 60 || cfg.copy_half_life_s < 60 {
+        bail!("{}: half_life_s and copy_half_life_s must be at least 60", path.display());
     }
     Ok(cfg)
 }

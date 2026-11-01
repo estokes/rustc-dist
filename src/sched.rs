@@ -7,7 +7,7 @@ use crate::{
         BoxStatus, ClassStatus, Measured, PROTOCOL, Ran, Reply, SpreadStatus, Status, Switching, Unit,
         UnitStatus, frame,
     },
-    stats::{self, Origin, PlaceId, Prediction, Run, Stats, Transfer},
+    stats::{self, Decay, Origin, PlaceId, Prediction, Run, Stats, Transfer},
     sys::{self, BoxMemory},
 };
 use anyhow::{Context, Result};
@@ -631,6 +631,7 @@ pub struct Setup {
     pub runnable: Box<dyn Fn() -> Result<u32> + Send + Sync>,
     pub tokens_per_cpu: f64,
     pub calibration_seconds: u64,
+    pub decay: Decay,
 }
 
 /// A job that may run on another box, with the crate files it reads.
@@ -868,9 +869,9 @@ impl Sched {
         load: watch::Sender<Load>,
         tx: mpsc::UnboundedSender<Msg>,
     ) -> Result<Self> {
-        let mut stats = Stats::load(&setup.state_dir.join("jobs.hdr")).unwrap_or_else(|e| {
+        let mut stats = Stats::load(&setup.state_dir.join("jobs.hdr"), setup.decay).unwrap_or_else(|e| {
             warn!("starting with empty job stats: {e:#}");
-            Stats::new()
+            Stats::new(setup.decay)
         });
         let graph = Graph::load(&setup.state_dir.join("graph")).unwrap_or_else(|e| {
             warn!("starting with an empty build graph: {e:#}");
@@ -1949,7 +1950,7 @@ mod test {
     }
 
     fn spot() -> Spot {
-        Spot { at: Stats::new().place("t/0", 1, 1), threads: 1., adds: 0 }
+        Spot { at: Stats::new(Decay::default()).place("t/0", 1, 1), threads: 1., adds: 0 }
     }
 
     fn local(run_us: u64, frees_in_us: u64) -> Cand {
@@ -2045,6 +2046,7 @@ mod test {
             },
             tokens_per_cpu: room.tokens_per_cpu,
             calibration_seconds: 4,
+            decay: Decay::default(),
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let (load_tx, load) = watch::channel(Load::default());

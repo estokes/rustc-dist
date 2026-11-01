@@ -80,6 +80,7 @@ pub async fn run() -> Result<()> {
         runnable: Box::new(sys::runnable),
         tokens_per_cpu: cfg.tokens_per_cpu,
         calibration_seconds: cfg.calibration_seconds,
+        decay: cfg.decay(),
     };
     let (tx, rx) = mpsc::unbounded_channel();
     let (load_tx, load) = watch::channel(Load::default());
