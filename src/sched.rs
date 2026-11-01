@@ -857,7 +857,9 @@ struct Running {
     start: Instant,
     /// The root of its processes, once it has started here.
     pid: Option<u32>,
-    /// Its processes' RSS plus swap at the last sample, and the most seen.
+    /// The anonymous and shared memory its processes hold in RAM, plus
+    /// their swap (`sys::tree_footprint_kb`), at the last sample, and the
+    /// most seen.
     foot_kb: u64,
     peak_kb: u64,
 }

@@ -159,7 +159,7 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     })
 }
 
-// CR claude for claude: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
+// XCR claude for claude: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
 // LLVM's text, shared by every rustc on the box, and the rlibs a linker maps. box_memory's use
 // leaves most of those out, as MemAvailable counts page cache as available. On washu-chan
 // (2026-11-01) samples of a small rustc read VmRSS 107 to 124 MB, RssFile 65 to 93 MB of it. So
@@ -181,6 +181,11 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
 // 2026-11-01 claude: Holds, except the doc this XCR's note names: sched::Running::foot_kb still says
 // "Its processes' RSS plus swap", while it is now the anonymous and shared memory they hold plus swap
 // (sys::status_kb). Fix that line and this can go. The test fails with VmRSS counted (checked).
+// 2026-11-01 claude: sched::Running::foot_kb's doc now says the anonymous and shared memory its
+// processes hold in RAM plus their swap (sys::tree_footprint_kb), at the last sample, and the most
+// seen; no doc or comment outside CR notes says RSS plus swap any more. A doc line has no test; the
+// code it describes stays covered by
+// sys::test::status_counts_anonymous_shared_and_swapped_but_not_file_pages.
 /// The memory `pid` and its descendants hold in RAM or swap, in kB: see
 /// [`status_kb`].
 pub fn tree_footprint_kb(pid: u32) -> u64 {
