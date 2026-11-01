@@ -123,6 +123,30 @@ fn prior(load_c: u32) -> f64 {
     (load_c as f64 / 100.).max(1.)
 }
 
+/// Pool runs of `(bucket, value, weight)` whose values fall into their
+/// weighted mean until the values never fall.
+fn non_decreasing(points: &mut [(usize, f64, f64)]) {
+    // Pools, each its first index, weighted mean and weight.
+    let mut pools: LPooled<Vec<(usize, f64, f64)>> = LPooled::take();
+    for (i, &(_, v, w)) in points.iter().enumerate() {
+        let mut pool = (i, v, w);
+        while let Some(&(start, pv, pw)) = pools.last()
+            && pv > pool.1
+        {
+            pools.pop();
+            let total = pw + pool.2;
+            pool = (start, (pv * pw + pool.1 * pool.2) / total, total);
+        }
+        pools.push(pool);
+    }
+    for (k, &(start, v, _)) in pools.iter().enumerate() {
+        let end = pools.get(k + 1).map_or(points.len(), |p| p.0);
+        for p in &mut points[start..end] {
+            p.1 = v;
+        }
+    }
+}
+
 /// The bucket below `load_c` and how far it is toward the next, or the
 /// last bucket if `load_c` is past it.
 fn between(load_c: u32) -> (usize, f64) {
@@ -240,32 +264,42 @@ impl Place {
         p
     }
 
-    /// Work out the factor at each bucket's load as of `now`, relative to
-    /// the starting curve: for a bucket runs have reached, the weighted
-    /// median of their comparisons and of the curve, which counts as
-    /// `PRIOR_US` and never ages; for one they haven't, between the nearest
-    /// buckets they have, so it follows them.
+    /// Work out the factor at each bucket's load as of `now`. A bucket
+    /// runs have reached takes the weighted median of their comparisons
+    /// and of the starting curve, which counts as `PRIOR_US` and never
+    /// ages. Idle is where the calibration ran, so with no runs there it
+    /// keeps the calibration's factor. More load never makes a run faster,
+    /// so buckets that say otherwise are pooled, by the weight of what each
+    /// learned. A bucket between those is interpolated; one past the last
+    /// follows the starting curve's slope.
     fn refresh(&mut self, now: f64, half_life_s: f64) {
         let mut samples: LPooled<Vec<(f64, f64)>> = LPooled::take();
-        let mut rel: [Option<f64>; BUCKETS.len()] = [None; BUCKETS.len()];
-        for ((r, q), &load_c) in rel.iter_mut().zip(&self.curve).zip(&BUCKETS) {
-            if !q.is_empty() {
-                samples.clear();
-                samples.push((1., PRIOR_US));
-                samples.extend(q.iter().map(|c| (c.ratio / prior(load_c), c.weight * keep(c.at, now, half_life_s))));
-                *r = median(&mut samples);
+        // Each bucket with a factor, its factor, and the weight behind it.
+        let mut learned: LPooled<Vec<(usize, f64, f64)>> = LPooled::take();
+        for (i, (q, &load_c)) in self.curve.iter().zip(&BUCKETS).enumerate() {
+            if q.is_empty() {
+                if i == 0 {
+                    learned.push((0, prior(0), PRIOR_US));
+                }
+                continue;
+            }
+            samples.clear();
+            samples.push((1., PRIOR_US));
+            samples.extend(q.iter().map(|c| (c.ratio / prior(load_c), c.weight * keep(c.at, now, half_life_s))));
+            let weight = samples.iter().map(|(_, w)| w).sum();
+            if let Some(r) = median(&mut samples) {
+                learned.push((i, prior(load_c) * r, weight));
             }
         }
-        let learned = |i: usize| Some((BUCKETS[i], rel[i]?));
-        for (j, (f, &load_c)) in self.factors.iter_mut().zip(&BUCKETS).enumerate() {
-            let below = (0..=j).rev().find_map(learned);
-            let above = (j..BUCKETS.len()).find_map(learned);
-            let r = match (below, above) {
-                (Some((lo, a)), Some((hi, b))) if hi > lo => a + (b - a) * (load_c - lo) as f64 / (hi - lo) as f64,
-                (Some((_, a)), _) | (None, Some((_, a))) => a,
-                (None, None) => 1.,
+        non_decreasing(&mut learned);
+        for (j, f) in self.factors.iter_mut().enumerate() {
+            let (lo, a) = learned.iter().rev().find(|l| l.0 <= j).map_or((0, prior(0)), |l| (l.0, l.1));
+            *f = match learned.iter().find(|l| l.0 > j) {
+                Some(&(hi, b, _)) if lo < j => {
+                    a + (b - a) * (BUCKETS[j] - BUCKETS[lo]) as f64 / (BUCKETS[hi] - BUCKETS[lo]) as f64
+                }
+                _ => a * prior(BUCKETS[j]) / prior(BUCKETS[lo]),
             };
-            *f = prior(load_c) * r;
         }
     }
 
@@ -1131,6 +1165,50 @@ mod test {
         // level the others learned, not from the calibration.
         let half = s.factor(a, 50);
         assert!(idle < half && half < busy, "{idle} {half} {busy}");
+    }
+
+    #[test]
+    fn a_place_that_only_ran_busy_keeps_its_calibration_idle() {
+        let mut s = Stats::new(Decay::default());
+        let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/0", 1000, 1000));
+        // a ran the unit only at 8 tasks per CPU, a quarter as slow as the
+        // starting curve has it: that says how a slows under load, not that
+        // it runs four times faster idle.
+        for _ in 0..200 {
+            s.record(&unit("u:1", "u"), &run(b, 0, 1000));
+            s.record(&unit("u:1", "u"), &run(a, 800, 2000));
+        }
+        assert!(near(s.factor(a, 0), 1.), "{}", s.factor(a, 0));
+        assert!(near(s.factor(a, 800) / s.factor(b, 0), 2.), "{} {}", s.factor(a, 800), s.factor(b, 0));
+    }
+
+    #[test]
+    fn more_load_never_predicts_a_faster_run() {
+        let mut s = Stats::new(Decay::default());
+        let (a, b, c) = (s.place("a/0", 1000, 1000), s.place("b/0", 1000, 1000), s.place("c/0", 1000, 1000));
+        // At 4 tasks per CPU the unit took twice as long on a as at 8; at 2,
+        // c took less than its calibration says idle.
+        for _ in 0..200 {
+            s.record(&unit("u:1", "u"), &run(b, 0, 1000));
+            s.record(&unit("u:1", "u"), &run(a, 400, 8000));
+            s.record(&unit("u:1", "u"), &run(a, 800, 4000));
+            s.record(&unit("u:1", "u"), &run(c, 200, 400));
+        }
+        for place in [a, c] {
+            let curve: Vec<f64> = (0..=1600).step_by(25).map(|l| s.factor(place, l)).collect();
+            assert!(curve.windows(2).all(|w| w[0] <= w[1] * 1.0001), "{curve:?}");
+        }
+        let idle = s.factor(b, 0);
+        let (four, eight) = (s.factor(a, 400) / idle, s.factor(a, 800) / idle);
+        assert!(four <= eight && four > 4. && eight < 8., "{four} {eight}");
+    }
+
+    #[test]
+    fn non_decreasing_pools_runs_that_fall_by_weight() {
+        let mut p = [(0, 1., 1.), (1, 3., 1.), (2, 1., 3.), (3, 5., 1.), (4, 4., 1.)];
+        non_decreasing(&mut p);
+        let v: Vec<f64> = p.iter().map(|p| p.1).collect();
+        assert_eq!(v, [1., 1.5, 1.5, 4.5, 4.5]);
     }
 
     #[test]

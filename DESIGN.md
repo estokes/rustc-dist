@@ -269,9 +269,23 @@ comparisons and of the starting curve: the calibrated speed, flat up to one
 task per CPU and then slower in proportion as CPUs time-share. The curve counts
 as a sample of 3 s of runs that never ages, as much as a few typical jobs, so
 a few runs that agree outweigh it, and it outweighs runs grown old: a place
-with no recent comparisons goes back to its calibration. A bucket nothing has
-reached lies between the nearest buckets that have, relative to the curve. A
-place whose calibration changes starts over. Only ratios between factors are
+with no recent comparisons goes back to its calibration. Idle is where the
+calibration ran, so with no runs there the idle bucket keeps the
+calibration's factor, with the curve's weight. More load never makes a run
+faster, so buckets whose factors fall as load grows are pooled into their
+mean, weighted by what each learned (pool adjacent violators). A bucket
+nothing has reached lies between the nearest buckets that have; one past the
+last that has follows the starting curve's slope. A place whose calibration
+changes starts over.
+
+On 2026-11-01 washu-chan ran builds at 2 to 14 runnable tasks per CPU and
+none idle. Its fastest class learned a factor of 0.42 at 2 tasks per CPU,
+4.00 at 4 and 1.34 at 8: runnable tasks are a poor measure of how much a
+rustc slows there. Without pooling, predictions here swung threefold as the
+load moved between buckets. Without the idle anchor, the idle bucket copied
+the 0.21 learned at 2 tasks per CPU relative to the curve, and status, which
+shows speeds against this box's fastest class idle, put ryouko at 0.74 of it.
+Calibrated, ryouko's cores are 3.3 times as fast. Only ratios between factors are
 fixed by data, since every unit could be bigger and every place faster; the
 calibration's weight anchors the scale.
 
