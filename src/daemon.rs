@@ -372,7 +372,6 @@ async fn compile(
                     }
                     Err(e) => {
                         warn!("{}: {e:#}", unit.exact);
-                        failed_remotely = true;
                         want = None;
                     }
                 }

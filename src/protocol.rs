@@ -9,18 +9,21 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 9;
+pub const PROTOCOL: u32 = 10;
 const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under
 /// `exact`, one cargo unit, and `coarse`, shared by every unit of that
 /// crate at the same opt-level. `id` names the job in the build graph and
-/// `deps` are the jobs whose outputs it reads.
+/// `deps` are the jobs whose outputs it reads. Every target directory that
+/// builds the same crate the same way shares its `id`; `dir` is where this
+/// one writes its crate files (`--out-dir`).
 #[derive(Debug, Clone, PartialEq, Eq, Pack)]
 pub struct Unit {
     pub exact: ArcStr,
     pub coarse: ArcStr,
     pub id: ArcStr,
+    pub dir: Option<ArcStr>,
     pub deps: Vec<Dep>,
     /// The most threads its codegen can use: `-C codegen-units`, or
     /// rustc's default.

@@ -13,21 +13,96 @@ use std::{
     collections::HashMap,
     fs,
     io::ErrorKind,
+    mem,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Nodes not seen for this many days are dropped when the graph loads.
 const KEEP_DAYS: u32 = 60;
-const MAGIC: &[u8; 8] = b"rdgraph2";
+const MAGIC: &[u8; 8] = b"rdgraph3";
+/// A graph whose crate files are absolute paths. It loads as if each file
+/// were beside its node.
+const MAGIC_ABSOLUTE: &[u8; 8] = b"rdgraph2";
+
+/// A dep as its node keeps it. `file` is the crate file relative to the
+/// node's own directory, so one node serves every target directory its
+/// crate is built in.
+#[derive(Debug, PartialEq, Eq, Pack)]
+struct Edge {
+    id: ArcStr,
+    file: Option<ArcStr>,
+}
 
 #[derive(Pack)]
 struct Node {
     id: ArcStr,
     exact: ArcStr,
     coarse: ArcStr,
-    deps: Vec<Dep>,
+    deps: Vec<Edge>,
     seen_day: u32,
+}
+
+/// `dep` as an edge of a node in `dir`.
+fn edge(dir: &str, dep: &Dep) -> Option<Edge> {
+    let file = match &dep.file {
+        Some(f) => Some(relative(dir, f)?),
+        None => None,
+    };
+    Some(Edge { id: dep.id.clone(), file })
+}
+
+/// Whether `edges` of a node in `dir` are `deps`.
+fn same_deps(dir: &str, edges: &[Edge], deps: &[Dep]) -> bool {
+    let mut path: LPooled<String> = LPooled::take();
+    edges.len() == deps.len()
+        && edges.iter().zip(deps).all(|(e, d)| {
+            e.id == d.id
+                && match (&e.file, &d.file) {
+                    (None, None) => true,
+                    (Some(rel), Some(file)) => {
+                        resolve(dir, rel, &mut path);
+                        path.as_str() == file.as_str()
+                    }
+                    _ => false,
+                }
+        })
+}
+
+/// `file` as a path from `dir`. Both are absolute and normalized, as cargo
+/// writes them.
+fn relative(dir: &str, file: &str) -> Option<ArcStr> {
+    if !dir.starts_with('/') || !file.starts_with('/') {
+        return None;
+    }
+    let mut base = dir.trim_end_matches('/');
+    let mut ups = 0;
+    loop {
+        if let Some(rest) = file.strip_prefix(base).and_then(|r| r.strip_prefix('/')) {
+            let mut rel: LPooled<String> = LPooled::take();
+            for _ in 0..ups {
+                rel.push_str("../");
+            }
+            rel.push_str(rest);
+            return Some(ArcStr::from(rel.as_str()));
+        }
+        base = base.rsplit_once('/')?.0;
+        ups += 1;
+    }
+}
+
+/// The path `rel` names from `dir`, written to `path`.
+fn resolve(dir: &str, rel: &str, path: &mut String) {
+    path.clear();
+    path.push_str(dir.trim_end_matches('/'));
+    for c in rel.split('/') {
+        if c == ".." {
+            path.truncate(path.rfind('/').unwrap_or(0));
+        } else {
+            path.push('/');
+            path.push_str(c);
+        }
+    }
 }
 
 /// Which jobs read which jobs' outputs, learned from every compile the
@@ -55,43 +130,50 @@ impl Graph {
         self.nodes.len()
     }
 
+    /// A unit whose crate files can't be placed relative to its directory
+    /// isn't recorded.
     pub fn record(&mut self, unit: &Unit) {
+        let Some(dir) = unit.dir.as_deref() else { return };
         let day = today();
-        let old_deps = match self.nodes.get_mut(&unit.id) {
-            Some(n) if n.deps == unit.deps => {
-                if n.seen_day != day || n.exact != unit.exact {
-                    n.seen_day = day;
-                    n.exact = unit.exact.clone();
-                    n.coarse = unit.coarse.clone();
-                    self.dirty = true;
-                }
-                return;
+        if let Some(n) = self.nodes.get_mut(&unit.id)
+            && same_deps(dir, &n.deps, &unit.deps)
+        {
+            if n.seen_day != day || n.exact != unit.exact {
+                n.seen_day = day;
+                n.exact = unit.exact.clone();
+                n.coarse = unit.coarse.clone();
+                self.dirty = true;
             }
+            return;
+        }
+        let Some(deps) = unit.deps.iter().map(|d| edge(dir, d)).collect::<Option<Vec<_>>>() else { return };
+        let old_deps = match self.nodes.get_mut(&unit.id) {
             Some(n) => {
                 n.seen_day = day;
                 n.exact = unit.exact.clone();
                 n.coarse = unit.coarse.clone();
-                std::mem::replace(&mut n.deps, unit.deps.clone())
+                mem::replace(&mut n.deps, deps)
             }
             None => {
                 let node = Node {
                     id: unit.id.clone(),
                     exact: unit.exact.clone(),
                     coarse: unit.coarse.clone(),
-                    deps: unit.deps.clone(),
+                    deps,
                     seen_day: day,
                 };
                 self.nodes.insert(unit.id.clone(), node);
                 Vec::new()
             }
         };
-        let has = |deps: &[Dep], id: &ArcStr| deps.iter().any(|d| &d.id == id);
-        for dep in old_deps.iter().filter(|d| !has(&unit.deps, &d.id)) {
+        let had = |id: &ArcStr| old_deps.iter().any(|d| &d.id == id);
+        let has = |id: &ArcStr| unit.deps.iter().any(|d| &d.id == id);
+        for dep in old_deps.iter().filter(|d| !has(&d.id)) {
             if let Some(ds) = self.dependents.get_mut(&dep.id) {
                 ds.retain(|d| d != &unit.id);
             }
         }
-        for dep in unit.deps.iter().filter(|d| !has(&old_deps, &d.id)) {
+        for dep in unit.deps.iter().filter(|d| !had(&d.id)) {
             self.dependents.entry(dep.id.clone()).or_default().push(unit.id.clone());
         }
         self.ranks.clear();
@@ -125,23 +207,32 @@ impl Graph {
 
     /// The crate files a job with `deps` reads: its own and, through the
     /// graph, those of every crate below it, since rustc loads the metadata
-    /// of indirect dependencies too. A proc macro's dependencies are linked
-    /// into its `.so`, and rustc never loads them. None if a crate below it
-    /// was never seen compiling, so its dependencies are unknown.
+    /// of indirect dependencies too. Each is found from the crate above it
+    /// as this job has it, so in the job's own target directory. A proc
+    /// macro's dependencies are linked into its `.so`, and rustc never loads
+    /// them. None if a crate below it was never seen compiling, so its
+    /// dependencies are unknown.
     pub fn inputs(&self, deps: &[Dep]) -> Option<Vec<ArcStr>> {
         let mut files = Vec::new();
         let mut seen: LPooled<HashMap<ArcStr, ()>> = LPooled::take();
-        let mut stack: LPooled<Vec<&Dep>> = LPooled::take();
-        stack.extend(deps);
-        while let Some(dep) = stack.pop() {
-            let Some(file) = &dep.file else { continue };
-            if seen.insert(dep.id.clone(), ()).is_some() {
+        let mut stack: LPooled<Vec<(ArcStr, ArcStr)>> = LPooled::take();
+        stack.extend(deps.iter().filter_map(|d| Some((d.id.clone(), d.file.clone()?))));
+        let mut path: LPooled<String> = LPooled::take();
+        while let Some((id, file)) = stack.pop() {
+            if seen.insert(id.clone(), ()).is_some() {
                 continue;
             }
-            files.push(file.clone());
             if !file.ends_with(".so") {
-                stack.extend(&self.nodes.get(&dep.id)?.deps);
+                let dir = file.rsplit_once('/')?.0;
+                for e in &self.nodes.get(&id)?.deps {
+                    let Some(rel) = &e.file else { continue };
+                    if !seen.contains_key(&e.id) {
+                        resolve(dir, rel, &mut path);
+                        stack.push((e.id.clone(), ArcStr::from(path.as_str())));
+                    }
+                }
             }
+            files.push(file);
         }
         Some(files)
     }
@@ -164,13 +255,22 @@ impl Graph {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Self::new()),
             Err(e) => return Err(e).with_context(|| format_compact!("reading {}", path.display())),
         };
-        let Some(mut body) = data.strip_prefix(MAGIC) else {
-            bail!("{} is not a graph file", path.display());
+        let (absolute, mut body) = match (data.strip_prefix(MAGIC), data.strip_prefix(MAGIC_ABSOLUTE)) {
+            (Some(body), _) => (false, body),
+            (None, Some(body)) => (true, body),
+            (None, None) => bail!("{} is not a graph file", path.display()),
         };
         let nodes = Vec::<Node>::decode(&mut body).map_err(|e| anyhow!("{}: {e}", path.display()))?;
         let oldest = today().saturating_sub(KEEP_DAYS);
         let mut graph = Self::new();
-        for node in nodes.into_iter().filter(|n| n.seen_day >= oldest) {
+        for mut node in nodes.into_iter().filter(|n| n.seen_day >= oldest) {
+            if absolute {
+                for file in node.deps.iter_mut().filter_map(|e| e.file.as_mut()) {
+                    if let Some((_, name)) = file.rsplit_once('/') {
+                        *file = ArcStr::from(name);
+                    }
+                }
+            }
             for dep in &node.deps {
                 graph.dependents.entry(dep.id.clone()).or_default().push(node.id.clone());
             }
@@ -206,16 +306,23 @@ mod test {
     use super::*;
     use crate::stats::{Origin, Sample};
 
-    /// A dep named `*_macro` is a proc macro.
+    /// A unit in the target directory `/t`.
     fn unit(id: &str, deps: &[&str]) -> Unit {
+        unit_in("/t", id, deps)
+    }
+
+    /// A unit whose crate files go in `dir`, with its deps beside it. A dep
+    /// named `*_macro` is a proc macro.
+    fn unit_in(dir: &str, id: &str, deps: &[&str]) -> Unit {
         let file = |d: &str| {
             let ext = if d.ends_with("_macro") { "so" } else { "rmeta" };
-            format_compact!("/t/lib{d}.{ext}").as_str().into()
+            format_compact!("{dir}/lib{d}.{ext}").as_str().into()
         };
         Unit {
             exact: ArcStr::from(id),
             coarse: ArcStr::from(id),
             id: ArcStr::from(id),
+            dir: Some(ArcStr::from(dir)),
             deps: deps.iter().map(|d| Dep { id: ArcStr::from(*d), file: Some(file(d)) }).collect(),
             codegen_units: 16,
         }
@@ -286,6 +393,94 @@ mod test {
         let mut files = g.inputs(&unit("app", &["model"]).deps).unwrap();
         files.sort();
         assert_eq!(files, ["/t/libderive_macro.so", "/t/libitoa.rmeta", "/t/liblibc.rmeta", "/t/libmodel.rmeta"]);
+    }
+
+    #[test]
+    fn inputs_come_from_the_jobs_own_target_directory() {
+        // Two checkouts build the same crates the same way, so they share
+        // ids. The other one recorded the crates below app last.
+        let mut g = Graph::new();
+        for (id, deps) in [("libc", &[][..]), ("regex_syntax", &["libc"]), ("regex", &["regex_syntax"])] {
+            g.record(&unit_in("/a/target/debug/deps", id, deps));
+        }
+        g.record(&unit_in("/b/target/debug/deps", "app", &["regex"]));
+        g.record(&unit_in("/a/target/debug/deps", "regex", &["regex_syntax"]));
+        let mut files = g.inputs(&unit_in("/b/target/debug/deps", "app", &["regex"]).deps).unwrap();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                "/b/target/debug/deps/liblibc.rmeta",
+                "/b/target/debug/deps/libregex.rmeta",
+                "/b/target/debug/deps/libregex_syntax.rmeta"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_proc_macro_below_a_target_crate_is_in_the_host_directory() {
+        let host = "/a/target/debug/deps";
+        let target = "/a/target/x86_64-unknown-linux-gnu/debug/deps";
+        let model = Unit {
+            deps: vec![Dep { id: "derive_macro".into(), file: Some(format_compact!("{host}/libderive_macro.so").as_str().into()) }],
+            ..unit_in(target, "model", &[])
+        };
+        let mut g = Graph::new();
+        g.record(&model);
+        let app = unit_in("/b/target/x86_64-unknown-linux-gnu/debug/deps", "app", &["model"]);
+        let mut files = g.inputs(&app.deps).unwrap();
+        files.sort();
+        assert_eq!(
+            files,
+            ["/b/target/debug/deps/libderive_macro.so", "/b/target/x86_64-unknown-linux-gnu/debug/deps/libmodel.rmeta"]
+        );
+    }
+
+    #[test]
+    fn moving_a_dep_to_another_directory_is_a_change() {
+        let mut g = Graph::new();
+        g.record(&unit_in("/a", "app", &["regex"]));
+        g.dirty = false;
+        g.record(&unit_in("/a", "app", &["regex"]));
+        assert!(!g.dirty, "nothing changed");
+        let moved = Unit {
+            deps: vec![Dep { id: "regex".into(), file: Some("/elsewhere/libregex.rmeta".into()) }],
+            ..unit_in("/a", "app", &[])
+        };
+        g.record(&moved);
+        assert!(g.dirty, "regex moved");
+        g.record(&unit_in("/a", "regex", &[]));
+        let mut files = g.inputs(&unit_in("/c", "x", &["app"]).deps).unwrap();
+        files.sort();
+        assert_eq!(files, ["/c/libapp.rmeta", "/elsewhere/libregex.rmeta"]);
+    }
+
+    #[test]
+    fn a_graph_of_absolute_paths_loads_with_each_dep_beside_its_node() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-graph-abs-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("graph");
+        let node = |id: &str, deps: &[&str]| Node {
+            id: ArcStr::from(id),
+            exact: ArcStr::from(id),
+            coarse: ArcStr::from(id),
+            deps: deps
+                .iter()
+                .map(|d| Edge { id: ArcStr::from(*d), file: Some(format_compact!("/a/deps/lib{d}.rmeta").as_str().into()) })
+                .collect(),
+            seen_day: today(),
+        };
+        let nodes = vec![node("libc", &[]), node("regex", &["libc"])];
+        let mut buf = BytesMut::new();
+        buf.put_slice(MAGIC_ABSOLUTE);
+        nodes.encode(&mut buf).map_err(|e| anyhow!("{e}"))?;
+        fs::write(&path, &buf)?;
+        let g = Graph::load(&path)?;
+        let mut files = g.inputs(&unit_in("/b/deps", "app", &["regex"]).deps).unwrap();
+        files.sort();
+        assert_eq!(files, ["/b/deps/liblibc.rmeta", "/b/deps/libregex.rmeta"]);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]

@@ -389,7 +389,14 @@ pub async fn run(
         tokio::select! {
             exit = &mut receiving => break exit?,
             r = &mut sending, if !sending_done => {
-                r?;
+                // A rustc that fails before linking exits without the late
+                // rlibs, and the server closes the channel after its exit,
+                // which is still on its way.
+                if let Err(e) = r
+                    && !con.is_dead()
+                {
+                    return Err(e);
+                }
                 sending_done = true;
             }
         }

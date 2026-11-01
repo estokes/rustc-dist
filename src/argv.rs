@@ -116,6 +116,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
         unit: Unit {
             coarse: format_compact!("{driver}:{name}:O{opt}:{emit}{suffix}").as_str().into(),
             id: id.unwrap_or_else(|| exact.clone()),
+            dir: out_dir_arg.map(ArcStr::from),
             exact,
             deps,
             codegen_units,

@@ -269,6 +269,16 @@ links them.
 The daemon records every admitted job's id and dependencies, persisted in
 `$XDG_STATE_HOME/rustc-dist/graph`. Nodes not seen for 60 days are dropped.
 
+Cargo's hash doesn't depend on where the workspace is, so every checkout of a
+workspace builds its crates under the same file names, even checkouts of
+different branches. Agents working in several checkouts at once give the same
+ids to crates in different target directories. A node therefore keeps each
+dependency's crate file relative to its own directory, and a job finds each
+crate below it from the crate above as the job has it, so in its own target
+directory. Checkouts share nodes and ranks, and each job reads only its own
+files. A proc macro under a `--target` build sits in the host directory, which
+the relative path reaches.
+
 A job's rank is its predicted cost plus the costliest chain of jobs that
 depend on it: the work that waits on this job before the build can finish.
 Ranks are cached and recomputed when the graph changes or each minute when
@@ -820,7 +830,7 @@ Every number below is a guess. None has been tested on an idle box.
 | share of compressed swap predicted peaks may use beyond RAM | 50% | `src/config.rs` `compressed_swap_share` |
 | zswap compression ratio before it has stored anything | 3:1 | `src/sys.rs` `ZSWAP_RATIO` |
 | sample memory and job footprints every | 250 ms | `src/sched.rs` `MEASURE` |
-| keep graph nodes unseen for | 60 days | `src/graph.rs:18` |
+| keep graph nodes unseen for | 60 days | `src/graph.rs` `KEEP_DAYS` |
 | only send jobs predicted to take at least | 1 s | `src/sched.rs` `REMOTE_MIN_US` |
 | predicted cost of going remote | 200 ms | `src/sched.rs` `REMOTE_OVERHEAD_US` |
 | count free tokens and lend to heavy jobs every | 100 ms | `src/sched.rs` `SAMPLE` |

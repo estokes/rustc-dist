@@ -1815,6 +1815,7 @@ mod test {
             exact: ArcStr::from(name),
             coarse: ArcStr::from(name),
             id: ArcStr::from(name),
+            dir: Some(arcstr::literal!("/t")),
             deps: deps.iter().map(|d| crate::protocol::Dep { id: ArcStr::from(*d), file: None }).collect(),
             codegen_units: 16,
         }

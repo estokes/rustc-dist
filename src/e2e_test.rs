@@ -238,6 +238,63 @@ fn binary_on_a_new_crate(dir: &Path) -> Result<((Job, Unit), Vec<ArcStr>)> {
     Ok((bin, vec![ArcStr::from(rlib.as_str())]))
 }
 
+/// A binary that fails to compile, on `big`, built here, whose rlib takes
+/// a while to send.
+fn broken_binary_on_a_big_crate(dir: &Path) -> Result<((Job, Unit), Vec<ArcStr>)> {
+    let deps = dir.join("target/deps");
+    fs::create_dir_all(&deps)?;
+    fs::create_dir_all(dir.join("big/src"))?;
+    fs::create_dir_all(dir.join("broken/src"))?;
+    // The data is in the object code, not the metadata, which comes first.
+    fs::write(
+        dir.join("big/src/lib.rs"),
+        "#[inline(never)]\npub fn data() -> &'static [u8] { static DATA: [u8; 64 << 20] = [7; 64 << 20]; &DATA }\n",
+    )?;
+    fs::write(dir.join("broken/src/main.rs"), "fn main() { let n: u32 = \"no\"; println!(\"{n} {}\", big::data()[0]); }\n")?;
+    let status = Command::new(rustc())
+        .current_dir(dir)
+        .args(["--crate-name", "big", "--crate-type", "lib", "--edition", "2021", "big/src/lib.rs"])
+        .args(["--emit=dep-info,metadata,link", "-C", "extra-filename=-g1", "--out-dir"])
+        .arg(&deps)
+        .status()?;
+    assert!(status.success());
+    let rlib = format!("{}/libbig-g1.rlib", deps.display());
+    let bin = job(
+        dir,
+        "broken",
+        &[
+            "--crate-name", "broken", "--crate-type", "bin", "--edition", "2021", "broken/src/main.rs",
+            "--error-format=json", "--json=artifacts", "--emit=dep-info,link", "-C", "extra-filename=-b1",
+            "--out-dir", deps.to_str().unwrap(), "--extern", &format!("big={rlib}"),
+        ],
+    )?;
+    Ok((bin, vec![ArcStr::from(rlib.as_str())]))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compile_error_ends_a_job_whose_rlibs_are_still_coming() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-broken-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    let (bin, crates) = broken_binary_on_a_big_crate(&dir.join("ws"))?;
+    let rlib = fs::metadata(crates[0].as_str())?.len();
+    // The server stops reading the rlib when rustc exits, and closes the
+    // channel. Which side notices first varies, so try a few times.
+    let mut early = 0;
+    for _ in 0..6 {
+        let (outcome, events) = send(&b, &bin, &crates, &Hashes::default(), None).await?;
+        let Outcome::Exit { code, moved, .. } = outcome else { bail!("busy") };
+        assert_eq!(code, 1, "{:?}", stderr(&events));
+        early += usize::from(moved.bytes < rlib);
+    }
+    assert!(early > 0, "the rlib always came before rustc failed");
+    drop(b);
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 fn artifacts(events: &[Event]) -> Vec<String> {
     events
         .iter()

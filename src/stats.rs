@@ -328,7 +328,7 @@ mod test {
 
     fn unit(exact: &str, coarse: &str) -> Unit {
         let (exact, coarse) = (ArcStr::from(exact), ArcStr::from(coarse));
-        Unit { id: exact.clone(), exact, coarse, deps: vec![], codegen_units: 16 }
+        Unit { id: exact.clone(), dir: None, exact, coarse, deps: vec![], codegen_units: 16 }
     }
 
     fn predict(s: &Stats, u: &Unit) -> Prediction {
