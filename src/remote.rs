@@ -2,7 +2,7 @@ use crate::{
     blobs::{Hash, Hashes},
     protocol::{self, Job, Measured, Ran, Reads, Unit},
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
 use compact_str::format_compact;
@@ -19,6 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{ErrorKind, Read, Write},
+    iter,
     os::unix::fs::{FileExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     pin::pin,
@@ -329,15 +330,15 @@ pub struct Staged {
     pub dirs: Vec<ArcStr>,
     pub late: Option<Late>,
     pub outputs: Vec<PathBuf>,
-    /// Where to read each blob the server may ask for.
-    blobs: HashMap<Hash, ArcStr>,
+    /// Where to read each blob the server may ask for, and its size.
+    blobs: HashMap<Hash, (ArcStr, u64)>,
     /// The bytes staging hashed, those it already knew aside, and µs it
     /// spent on them.
     pub hashed: (u64, u64),
 }
 
 impl Staged {
-    // CR claude for claude: [bug/low] This reports every late rlib's `.rmeta` as
+    // XCR claude for claude: [bug/low] This reports every late rlib's `.rmeta` as
     // held by the server, but sandbox::job claims `r.meta` only for rlibs the
     // store lacks (`rlibs.iter().filter(|r| !store.has(&r.hash))`). When the
     // server already had the rlib, it never received the rmeta, yet
@@ -346,14 +347,27 @@ impl Staged {
     // sends it. Fix: have the server say what it holds (e.g. in Need or Exit),
     // or leave out the meta of rlibs that weren't asked for. It also stats
     // every crate file on an async worker, after the exit. (remote-03)
-    /// The crate files among its inputs, by hash with their size in kB.
-    fn crates(&self) -> impl Iterator<Item = (Hash, u64)> + '_ {
+    // 2026-11-01 claude: Took the CR's second option, no protocol change:
+    // Staged::crates(asked) counts a late rlib's .rmeta only when the server's
+    // Need asked for the rlib (later) or the .rmeta (now); a server that had the
+    // rlib never claimed it. That can under-report (rlib and .rmeta both coming
+    // through another job's upload), which only prices a later send a little
+    // high. Sizes now come from staging (Staged.blobs holds each blob's length),
+    // so nothing is stat'd after the exit. Test:
+    // remote::test::a_server_holds_a_late_rlibs_metadata_only_if_it_asked_for_one_of_them
+    // (fails if the meta is always counted, or if sizes come from stat: the
+    // files are removed first).
+    /// The crate files among its inputs the server holds once the job has
+    /// run, by hash with their size in kB. That leaves out the metadata of
+    /// a late rlib unless the server `asked` for it or for the rlib: a
+    /// server that has the rlib needs no stand-in.
+    fn crates<'a>(&'a self, asked: &'a HashSet<Hash>) -> impl Iterator<Item = (Hash, u64)> + 'a {
         let late = self.late.iter().flat_map(|l| &l.rlibs).flat_map(|r| {
-            let meta = Path::new(r.path.as_str()).with_extension("rmeta");
-            [(r.hash, PathBuf::from(r.path.as_str())), (r.meta, meta)]
+            let meta = (asked.contains(&r.hash) || asked.contains(&r.meta)).then_some(r.meta);
+            iter::once(r.hash).chain(meta)
         });
-        let files = self.files.iter().filter(|f| kept(&f.path)).map(|f| (f.hash, PathBuf::from(f.path.as_str())));
-        files.chain(late).filter_map(|(hash, path)| Some((hash, fs::metadata(path).ok()?.len().div_ceil(1024))))
+        let files = self.files.iter().filter(|f| kept(&f.path)).map(|f| f.hash);
+        files.chain(late).filter_map(|hash| Some((hash, self.blobs.get(&hash)?.1.div_ceil(1024))))
     }
 }
 
@@ -449,7 +463,7 @@ struct Collect<'a> {
     hashes: &'a Hashes,
     files: Vec<FileEntry>,
     rlibs: Vec<Rlib>,
-    blobs: HashMap<Hash, ArcStr>,
+    blobs: HashMap<Hash, (ArcStr, u64)>,
     dirs: HashSet<PathBuf>,
     seen: HashSet<PathBuf>,
     walked: u64,
@@ -476,7 +490,7 @@ impl<'a> Collect<'a> {
         if let Some(us) = named.hashed_us {
             self.hashed = (self.hashed.0 + named.len, self.hashed.1 + us);
         }
-        self.blobs.insert(named.hash, s.clone());
+        self.blobs.insert(named.hash, (s.clone(), named.len));
         Ok((s, named.hash))
     }
 
@@ -533,7 +547,7 @@ impl<'a> Collect<'a> {
                     if recursive && !skip {
                         stack.push(path);
                     }
-                // CR claude for claude: [bug/low] WALK_LIMIT counts a symlink at
+                // XCR claude for claude: [bug/low] WALK_LIMIT counts a symlink at
                 // its own size: DirEntry::metadata doesn't follow links, but the
                 // check above and Hashes::name do, so a package with a symlink to
                 // a large file is sent whole while `walked` grows by a few bytes.
@@ -541,8 +555,18 @@ impl<'a> Collect<'a> {
                 // line up. Symlinked directories are never walked (file_type says
                 // symlink, the followed metadata says not a file); a test should
                 // say whether that is intended. (remote-02)
-                } else if fs::metadata(e.path()).is_ok_and(|m| m.is_file()) {
-                    self.walked += e.metadata().map(|m| m.len()).unwrap_or(0);
+                // 2026-11-01 claude: The walk counts the length from the followed
+                // fs::metadata it already takes. Not walking symlinked
+                // directories is kept on purpose (a link may lead anywhere, even
+                // into a cycle; dep-info still sends what rustc read through
+                // one), and the test says so. Test:
+                // remote::test::a_symlink_counts_at_its_files_size_and_a_symlinked_directory_is_not_walked
+                // (a symlink to a sparse file past WALK_LIMIT must fail the walk;
+                // it passed without the fix).
+                } else if let Ok(m) = fs::metadata(e.path())
+                    && m.is_file()
+                {
+                    self.walked += m.len();
                     if self.walked > WALK_LIMIT {
                         bail!("{} holds more than {} MB", root.display(), WALK_LIMIT >> 20);
                     }
@@ -699,7 +723,9 @@ pub async fn run(
         m => bail!("unexpected {m:?}"),
     };
     let manifest_us = lap();
+    let asked: LPooled<HashSet<Hash>> = now.iter().chain(&later).copied().collect();
     let sent = Sent::default();
+
     for hash in now {
         send_blob(&out, staged, hash, level, &sent).await.context("sending inputs")?;
     }
@@ -707,7 +733,8 @@ pub async fn run(
     out.send(ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
     out.flush().await.context("starting rustc")?;
     // A rustc that fails before linking exits while late rlibs are still
-    // on their way; its exit ends sending them.
+    // on their way; its exit ends sending them, which comes once those
+    // other jobs on the box wait for are in.
     let mut sending = pin!(async {
         for hash in later {
             send_blob(&out, staged, hash, level, &sent).await?;
@@ -725,7 +752,7 @@ pub async fn run(
             }
         }
     };
-    let kept = staged.crates().chain(built).collect();
+    let kept = staged.crates(&asked).chain(built).collect();
     let (bytes, wire_bytes) = (sent.raw.load(Ordering::Relaxed), sent.wire.load(Ordering::Relaxed));
     let steps = Steps { offer_us, manifest_us, send_us, run_us: lap() };
     let moved = Moved { bytes, wire_bytes, linker_waited_us, kept, steps };
@@ -750,7 +777,7 @@ pub async fn heartbeat(links: &Links, jobs: &NPath, kb: u64, level: i32) -> Resu
 
 /// Send the blob `hash` compressed at `level`, adding its size to `sent`.
 pub async fn send_blob(out: &Out, staged: &Staged, hash: Hash, level: i32, sent: &Sent) -> Result<()> {
-    let path = staged.blobs.get(&hash).with_context(|| format_compact!("server asked for unknown {hash}"))?;
+    let (path, _) = staged.blobs.get(&hash).with_context(|| format_compact!("server asked for unknown {hash}"))?;
     let file = File::open(path.as_str()).with_context(|| format_compact!("opening {path}"))?;
     let mut chunks = pin!(pack_file(file, level)?);
     while let Some(chunk) = chunks.next().await {
@@ -763,7 +790,7 @@ pub async fn send_blob(out: &Out, staged: &Staged, hash: Hash, level: i32, sent:
     Ok(())
 }
 
-// CR claude for claude: [bug/medium] A partly written output is never
+// XCR claude for claude: [bug/medium] A partly written output is never
 // removed. remote::receive returns early on any error while a file is open
 // (the link failing mid-file, Packed::unpack or write_all failing, a Failed
 // or unexpected message), and Writing has no Drop, so `<stem>.rustc-dist-<pid>`
@@ -772,12 +799,49 @@ pub async fn send_blob(out: &Out, staged: &Staged, hash: Hash, level: i32, sent:
 // a RAM-backed tmpfs, so a link that drops during a 338 MB rlib leaves 338 MB
 // of RAM used until someone notices. Fix: a Drop on Writing that removes `tmp`
 // unless the rename happened (e.g. take the path out on success). (remote-01)
-/// An output arriving in chunks, written beside its destination.
+// 2026-11-01 claude: Writing now has create/write/finish and a Drop that
+// removes `tmp` unless finish renamed it (tmp is emptied then), so any early
+// return from remote::receive leaves nothing in --out-dir. Test:
+// remote::test::an_output_cut_short_leaves_nothing_behind (fails without the
+// Drop).
+/// An output arriving in chunks, written beside its destination, which it
+/// replaces once whole. Dropped before then, it is removed.
 struct Writing {
     dest: PathBuf,
+    /// Empty once renamed to `dest`.
     tmp: PathBuf,
     file: File,
     len: u64,
+}
+
+impl Writing {
+    fn create(dest: PathBuf) -> Result<Self> {
+        let tmp = dest.with_extension(format_compact!("rustc-dist-{}", std::process::id()).as_str());
+        let file = File::create(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?;
+        Ok(Self { dest, tmp, file, len: 0 })
+    }
+
+    fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.file.write_all(data).with_context(|| format_compact!("writing {}", self.tmp.display()))?;
+        self.len += data.len() as u64;
+        Ok(())
+    }
+
+    /// Put the whole file at its destination with `mode`.
+    fn finish(mut self, mode: u32) -> Result<()> {
+        self.file.set_permissions(fs::Permissions::from_mode(mode))?;
+        fs::rename(&self.tmp, &self.dest).with_context(|| format_compact!("writing {}", self.dest.display()))?;
+        self.tmp = PathBuf::new();
+        Ok(())
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        if !self.tmp.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
 }
 
 /// rustc's output until it exits.
@@ -794,25 +858,24 @@ async fn receive(
         match inbox.recv().await? {
             FromServer::Output { path, mode, data, part } => {
                 let data = data.unpack()?;
-                if writing.is_none() {
-                    let dest = PathBuf::from(path.as_str());
-                    if !staged.outputs.iter().any(|o| dest.parent() == Some(o.as_path())) {
-                        bail!("{jobs} sent {path}, outside the job's output directories");
+                let w = match &mut writing {
+                    Some(w) => w,
+                    None => {
+                        let dest = PathBuf::from(path.as_str());
+                        if !staged.outputs.iter().any(|o| dest.parent() == Some(o.as_path())) {
+                            bail!("{jobs} sent {path}, outside the job's output directories");
+                        }
+                        writing.insert(Writing::create(dest)?)
                     }
-                    let tmp = dest.with_extension(format_compact!("rustc-dist-{}", std::process::id()).as_str());
-                    let file = File::create(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?;
-                    writing = Some(Writing { dest, tmp, file, len: 0 });
-                }
-                let w = writing.as_mut().ok_or_else(|| anyhow!("no output open"))?;
-                w.file.write_all(&data)?;
-                w.len += data.len() as u64;
+                };
+                w.write(&data)?;
                 if let Part::End(kept) = part {
                     let w = writing.take().expect("open");
-                    w.file.set_permissions(fs::Permissions::from_mode(mode))?;
-                    fs::rename(&w.tmp, &w.dest).with_context(|| format_compact!("writing {}", w.dest.display()))?;
+                    let (dest, len) = (w.dest.clone(), w.len);
+                    w.finish(mode)?;
                     if let Some(hash) = kept {
-                        hashes.insert(&w.dest, hash)?;
-                        built.push((hash, w.len.div_ceil(1024)));
+                        hashes.insert(&dest, hash)?;
+                        built.push((hash, len.div_ceil(1024)));
                     }
                 }
             }
@@ -922,6 +985,88 @@ mod test {
     }
 
     #[test]
+    fn a_symlink_counts_at_its_files_size_and_a_symlinked_directory_is_not_walked() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-walk-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for d in ["pkg/src", "elsewhere/dir"] {
+            fs::create_dir_all(dir.join(d))?;
+        }
+        fs::write(dir.join("pkg/src/lib.rs"), "x")?;
+        fs::write(dir.join("elsewhere/dir/a.rs"), "x")?;
+        fs::write(dir.join("elsewhere/small.txt"), "small")?;
+        std::os::unix::fs::symlink(dir.join("elsewhere/dir"), dir.join("pkg/src/linked"))?;
+        std::os::unix::fs::symlink(dir.join("elsewhere/small.txt"), dir.join("pkg/small.txt"))?;
+        let hashes = Hashes::default();
+        let mut c = Collect::new(&hashes);
+        c.walk(&dir.join("pkg"), true)?;
+        let mut got: Vec<&str> = c.files.iter().filter_map(|f| f.path.rsplit_once("/pkg/")).map(|(_, p)| p).collect();
+        got.sort();
+        assert_eq!(got, ["small.txt", "src/lib.rs"], "a linked directory may lead anywhere, so only dep-info sends it");
+        assert_eq!(c.walked, 6);
+        // Past the limit through a link, though the link itself is small.
+        let big = File::create(dir.join("elsewhere/big"))?;
+        big.set_len(WALK_LIMIT + 1)?;
+        std::os::unix::fs::symlink(dir.join("elsewhere/big"), dir.join("pkg/big"))?;
+        let mut c = Collect::new(&hashes);
+        assert!(c.walk(&dir.join("pkg"), true).is_err(), "walked {}", c.walked);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_output_cut_short_leaves_nothing_behind() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-writing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let mut w = Writing::create(dir.join("liba.rlib"))?;
+        w.write(b"half an rlib")?;
+        drop(w);
+        assert_eq!(fs::read_dir(&dir)?.count(), 0, "the partial file is gone");
+        let mut w = Writing::create(dir.join("liba.rlib"))?;
+        w.write(b"a whole rlib")?;
+        w.finish(0o644)?;
+        let left: Vec<_> = fs::read_dir(&dir)?.flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, ["liba.rlib"]);
+        assert_eq!(fs::read(dir.join("liba.rlib"))?, b"a whole rlib");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_server_holds_a_late_rlibs_metadata_only_if_it_asked_for_one_of_them() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-held-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let mut blobs = HashMap::new();
+        let mut file = |name: &str, kb: usize| -> Result<(ArcStr, Hash)> {
+            let path = dir.join(name);
+            fs::write(&path, vec![name.as_bytes()[3]; kb * 1024])?;
+            let hash = Hash::of(&fs::read(&path)?);
+            let path = utf8(&path)?;
+            blobs.insert(hash, (path.clone(), (kb * 1024) as u64));
+            Ok((path, hash))
+        };
+        let (a, a_hash) = file("liba.rlib", 1)?;
+        let (_, src) = file("lib.rs", 1)?;
+        let [b, c] = [("libb", 4), ("libc", 8)].map(|(name, kb)| -> Result<Rlib> {
+            let (path, hash) = file(&format!("{name}.rlib"), kb)?;
+            let (_, meta) = file(&format!("{name}.rmeta"), 1)?;
+            Ok(Rlib { path, hash, meta })
+        });
+        let (b, c) = (b?, c?);
+        let files = vec![FileEntry { path: a, hash: a_hash }, FileEntry { path: "/x/src/lib.rs".into(), hash: src }];
+        let late = Some(Late { linker: "cc".into(), rlibs: vec![b.clone(), c.clone()] });
+        let staged = Staged { files, dirs: vec![], late, outputs: vec![], blobs, hashed: (0, 0) };
+        // The files are gone: the sizes are those staging took.
+        fs::remove_dir_all(&dir)?;
+        // It lacked b, and had c.
+        let asked: HashSet<Hash> = [b.hash].into_iter().collect();
+        let held: Vec<_> = staged.crates(&asked).collect();
+        assert_eq!(held, [(a_hash, 1), (b.hash, 4), (b.meta, 1), (c.hash, 8)]);
+        Ok(())
+    }
+
+    #[test]
     fn crates_a_job_links_come_late_when_metadata_can_stand_in() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("rustc-dist-krate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -945,7 +1090,7 @@ mod test {
         let [x] = &link.rlibs[..] else { panic!("{:?}", link.rlibs) };
         assert!(x.path.ends_with("/libx.rlib"));
         assert_eq!(x.meta, hashes.get(&dir.join("libx.rmeta"))?.0);
-        assert_eq!(link.blobs[&x.meta].as_str(), dir.join("libx.rmeta").to_str().unwrap(), "meta is sent from its file");
+        assert_eq!(link.blobs[&x.meta].0.as_str(), dir.join("libx.rmeta").to_str().unwrap(), "meta is sent from its file");
         let rlibs = stage(&Reads::Rlibs)?;
         assert_eq!(names(&rlibs), ["libx.rlib", "liby.rlib", "libz.so"]);
         assert!(rlibs.rlibs.is_empty());
