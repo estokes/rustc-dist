@@ -559,8 +559,10 @@ thousands of units, which is why it isn't faster.
 
 ### Inputs
 
-Inputs are addressed by content. The client daemon caches
-`(path, size, mtime, inode) -> blake3`. The input set is:
+Inputs are addressed by content: a 128-bit xxh3 hash. Boxes trust each other,
+as netidx's authentication says who they are, so the hash need only make
+chance collisions vanishingly rare. The client daemon caches
+`(path, size, mtime, inode) -> hash`. The input set is:
 
 - Sources: every file the unit's previous dep-info
   (`<out-dir>/<crate><extra>.d`) lists, which includes files outside the
@@ -590,13 +592,16 @@ reads when it sends the job, keeping each hash until the file's size, mtime
 or inode changes. Most are known by then: the wrapper tells the daemon the
 crate files a compile here wrote, which the daemon hashes in the background
 once it ends, and crate files built on another box come back with their
-hash. Placement prices a send only by hashes already known. It hashes a file in 16 MB blocks spread over every CPU,
-and a job that needs a file another job is hashing waits for that hash. On
-2026-11-01, with washu-chan at 8 to 14 runnable tasks per CPU, staging took
-8.4 s for a graphix test that links, 31 s for a rustc-dist test, and 1.3 s
-for each of ten build scripts sent at once, which hashed the same 355 MB
-each; a release build hashed graphix_types' 338 MB rlib there in 1.88 s on
-one thread and 0.26 s over every CPU. The client sends a manifest of paths and hashes; the server
+hash. Placement prices a send only by hashes already known. A job that needs
+a file another job is hashing waits for that hash. On 2026-11-01, with
+washu-chan at 8 to 14 runnable tasks per CPU, staging took 8.4 s for a
+graphix test that links, 31 s for a rustc-dist test, and 1.3 s for each of
+ten build scripts sent at once, which hashed the same 355 MB each, then with
+blake3 on one thread. On one thread there, with the box nearly idle,
+blake3 hashed graphix_types' 338 MB rlib at 2.9 to 3.8 GB/s and 128-bit xxh3
+at 18 to 21 GB/s, as fast as reading it; zstd at level 1 compresses about
+0.3 to 0.5 GB/s. A server's store removes, when it opens, files whose names
+aren't hashes, such as blobs named by an older hash. The client sends a manifest of paths and hashes; the server
 answers with the hashes it lacks; the client sends those in 1 MB chunks and
 the server checks each blob's hash before storing it. Each chunk goes
 compressed with zstd at the sender's `compression_level` (1 by default, 0 for

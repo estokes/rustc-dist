@@ -1,5 +1,5 @@
 use crate::{
-    blobs::{self, Claim, Coming, Hash, Store, Upload},
+    blobs::{self, Claim, Coming, Hash, Hasher, Store, Upload},
     link::{self, Gate},
     protocol::{self, Front, Ran, Unit},
     remote::{self, ExchangeId, FileEntry, FromBox, FromServer, Late, Part, Rlib, SYSTEM, ToBox, ToServer},
@@ -621,7 +621,7 @@ async fn send_artifact(reply: &Reply, store: &Store, root: &Path, line: &[u8], l
     let host = root.join(&path[1..]);
     let file = File::open(&host).with_context(|| format_compact!("opening {}", host.display()))?;
     let mode = file.metadata()?.permissions().mode() & 0o777;
-    let mut hasher = remote::kept(&path).then(blake3::Hasher::new);
+    let mut hasher = remote::kept(&path).then(Hasher::default);
     let mut chunks = pin!(remote::pack_file(file, level)?);
     while let Some(chunk) = chunks.next().await {
         let (raw, data, last) = chunk.with_context(|| format_compact!("reading {}", host.display()))?;
@@ -632,7 +632,7 @@ async fn send_artifact(reply: &Reply, store: &Store, root: &Path, line: &[u8], l
             (false, _) => Part::Middle,
             (true, None) => Part::End(None),
             (true, Some(h)) => {
-                let hash = Hash(*h.finalize().as_bytes());
+                let hash = h.finish();
                 store.adopt(&host, &hash)?;
                 Part::End(Some(hash))
             }

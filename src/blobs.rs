@@ -4,6 +4,7 @@ use compact_str::format_compact;
 use log::{info, warn};
 use netidx_core::pack::{Pack, PackError};
 use parking_lot::Mutex;
+use xxhash_rust::xxh3::Xxh3;
 use poolshark::local::LPooled;
 use std::{
     collections::{HashMap, hash_map::Entry},
@@ -17,9 +18,47 @@ use std::{
 };
 use tokio::sync::watch;
 
-/// A file's blake3 hash, the name of its content on every box.
+/// A file's 128-bit xxh3 hash, the name of its content on every box. Boxes
+/// trust each other, as netidx's authentication says who they are, so the
+/// hash need only make chance collisions vanishingly rare, and it is as
+/// fast as reading the file.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Hash(pub [u8; 32]);
+pub struct Hash(pub [u8; 16]);
+
+impl Hash {
+    #[cfg(test)]
+    pub fn of(bytes: &[u8]) -> Self {
+        let mut h = Hasher::default();
+        h.update(bytes);
+        h.finish()
+    }
+
+    /// The hash a blob's name in the store spells.
+    fn from_hex(name: &[u8]) -> Option<Self> {
+        if name.len() != 32 {
+            return None;
+        }
+        let mut h = [0u8; 16];
+        for (b, pair) in h.iter_mut().zip(name.chunks(2)) {
+            *b = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        }
+        Some(Hash(h))
+    }
+}
+
+/// A `Hash` of bytes as they come.
+#[derive(Default)]
+pub struct Hasher(Xxh3);
+
+impl Hasher {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub fn finish(&self) -> Hash {
+        Hash(self.0.digest128().to_be_bytes())
+    }
+}
 
 impl fmt::Display for Hash {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -38,7 +77,7 @@ impl fmt::Debug for Hash {
 
 impl Pack for Hash {
     fn encoded_len(&self) -> usize {
-        32
+        16
     }
 
     fn encode(&self, buf: &mut impl BufMut) -> Result<(), PackError> {
@@ -47,39 +86,30 @@ impl Pack for Hash {
     }
 
     fn decode(buf: &mut impl Buf) -> Result<Self, PackError> {
-        if buf.remaining() < 32 {
+        if buf.remaining() < 16 {
             return Err(PackError::BufferShort);
         }
-        let mut h = [0u8; 32];
+        let mut h = [0u8; 16];
         buf.copy_to_slice(&mut h);
         Ok(Hash(h))
     }
 }
 
-/// Bytes of a file read at once to hash, spread over every CPU: on a box
-/// whose CPUs are shared with a build, one thread hashing an rlib makes
-/// the job sending it wait for its share of one CPU.
-const HASH_BLOCK: usize = 16 << 20;
+/// Bytes of a file read at once to hash.
+const HASH_BLOCK: usize = 1 << 20;
 
 fn hash_file(path: &Path) -> Result<Hash> {
     let mut file = File::open(path).with_context(|| format_compact!("opening {}", path.display()))?;
     let len = file.metadata()?.len();
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = Hasher::default();
     let mut buf: LPooled<Vec<u8>> = LPooled::take();
     buf.resize((len as usize).clamp(1, HASH_BLOCK), 0);
     loop {
-        let mut n = 0;
-        while n < buf.len() {
-            match file.read(&mut buf[n..]) {
-                Ok(0) => break,
-                Ok(k) => n += k,
-                Err(e) if e.kind() == ErrorKind::Interrupted => (),
-                Err(e) => return Err(e).with_context(|| format_compact!("reading {}", path.display())),
-            }
-        }
-        hasher.update_rayon(&buf[..n]);
-        if n < buf.len() {
-            return Ok(Hash(*hasher.finalize().as_bytes()));
+        match file.read(&mut buf) {
+            Ok(0) => return Ok(hasher.finish()),
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => (),
+            Err(e) => return Err(e).with_context(|| format_compact!("reading {}", path.display())),
         }
     }
 }
@@ -218,7 +248,7 @@ impl Store {
         let tmp = dir.join("tmp");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?;
-        let used = blobs(&dir).iter().map(|(_, len, _)| len).sum();
+        let used = blobs(&dir, true).iter().map(|(_, len, _)| len).sum();
         Ok(Self {
             dir,
             cap_bytes,
@@ -282,7 +312,7 @@ impl Store {
     pub fn upload(&self, want: Hash) -> Result<Upload> {
         let tmp = self.tmp();
         let file = File::create(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?;
-        Ok(Upload { file, tmp, want, hasher: blake3::Hasher::new(), len: 0 })
+        Ok(Upload { file, tmp, want, hasher: Hasher::default(), len: 0 })
     }
 
     /// Keep a file a job wrote, whose hash is `h`, for later jobs that
@@ -325,7 +355,7 @@ impl Store {
         if self.used.load(Ordering::Relaxed) <= self.cap_bytes {
             return;
         }
-        let mut all = blobs(&self.dir);
+        let mut all = blobs(&self.dir, false);
         all.sort_by_key(|(_, _, mtime)| *mtime);
         let keep = self.cap_bytes / 10 * 9;
         let mut freed = 0;
@@ -363,18 +393,28 @@ impl<I: Iterator<Item = Hash> + Clone> Drop for Pins<'_, I> {
     }
 }
 
-/// Every blob with its length and last use.
-fn blobs(dir: &Path) -> Vec<(Hash, u64, SystemTime)> {
+/// Every blob with its length and last use. With `prune`, files whose
+/// names aren't hashes, such as blobs named by an older hash, are removed.
+fn blobs(dir: &Path, prune: bool) -> Vec<(Hash, u64, SystemTime)> {
     let mut out = Vec::new();
     let Ok(prefixes) = fs::read_dir(dir) else { return out };
+    let mut pruned = 0;
     for prefix in prefixes.flatten().filter(|p| p.file_name().len() == 2) {
         let Ok(entries) = fs::read_dir(prefix.path()) else { continue };
         for e in entries.flatten() {
-            let Ok(h) = blake3::Hash::from_hex(e.file_name().as_encoded_bytes()) else { continue };
+            let Some(h) = Hash::from_hex(e.file_name().as_encoded_bytes()) else {
+                if prune && fs::remove_file(e.path()).is_ok() {
+                    pruned += 1;
+                }
+                continue;
+            };
             if let Ok(meta) = e.metadata() {
-                out.push((Hash(*h.as_bytes()), meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+                out.push((h, meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
             }
         }
+    }
+    if pruned > 0 {
+        info!("removed {pruned} files from {} that aren't blobs", dir.display());
     }
     out
 }
@@ -385,7 +425,7 @@ pub struct Upload {
     file: File,
     tmp: PathBuf,
     want: Hash,
-    hasher: blake3::Hasher,
+    hasher: Hasher,
     len: u64,
 }
 
@@ -397,7 +437,7 @@ impl Upload {
     }
 
     pub fn finish(self, store: &Store) -> Result<()> {
-        let got = Hash(*self.hasher.finalize().as_bytes());
+        let got = self.hasher.finish();
         if got != self.want {
             let _ = fs::remove_file(&self.tmp);
             bail!("blob {} arrived with hash {got}", self.want);
@@ -440,12 +480,31 @@ mod test {
     use super::*;
 
     #[test]
-    fn a_file_hashes_the_same_in_blocks_over_every_cpu() -> Result<()> {
+    fn a_store_removes_files_not_named_by_a_hash_when_it_opens() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let blob = Hash::of(b"kept");
+        let name = format_compact!("{blob}");
+        let old = "ab".to_string() + &"0".repeat(62);
+        for (prefix, file, contents) in [(&name[..2], name.as_str(), &b"kept"[..]), ("ab", old.as_str(), &[0u8; 100][..])] {
+            fs::create_dir_all(dir.join(prefix))?;
+            fs::write(dir.join(prefix).join(file), contents)?;
+        }
+        let store = Store::open(dir.clone(), 1 << 20)?;
+        assert!(store.has(&blob));
+        assert!(!dir.join("ab").join(&old).exists(), "a blake3 name is gone");
+        assert_eq!(store.used.load(Ordering::Relaxed), 4, "and isn't counted");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_hashes_the_same_read_in_blocks() -> Result<()> {
         let path = std::env::temp_dir().join(format!("rustc-dist-hash-{}", std::process::id()));
         for len in [0, 1, 4096, HASH_BLOCK, 2 * HASH_BLOCK + 7] {
             let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             fs::write(&path, &data)?;
-            assert_eq!(hash_file(&path)?.0, *blake3::hash(&data).as_bytes(), "{len}");
+            assert_eq!(hash_file(&path)?, Hash::of(&data), "{len}");
         }
         fs::remove_file(&path)?;
         Ok(())
@@ -461,7 +520,7 @@ mod test {
         let known = hashes.entry(&path);
         let hashing = known.lock();
         assert_eq!(hashes.known(&path), Some((None, 8)), "pricing doesn't wait");
-        let theirs = Hash([7; 32]);
+        let theirs = Hash([7; 16]);
         std::thread::scope(|s| {
             let waiter = s.spawn(|| hashes.get(&path));
             std::thread::sleep(std::time::Duration::from_millis(50));

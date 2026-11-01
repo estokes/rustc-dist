@@ -2935,7 +2935,7 @@ mod test {
 
     #[test]
     fn what_a_box_holds_is_kept_to_its_cache_size_least_recently_used_first() {
-        let h = |n: u8| Hash([n; 32]);
+        let h = |n: u8| Hash([n; 16]);
         let mut held = Held::default();
         held.used(&[(h(1), 40), (h(2), 40)], 100);
         held.used(&[(h(1), 40)], 100);

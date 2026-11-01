@@ -3,7 +3,7 @@
 
 use crate::{
     argv::{self, Invocation},
-    blobs::{Hashes, Store},
+    blobs::{Hash, Hashes, Store},
     classes::{self, Class, Profile},
     farm::Load,
     protocol::{Job, Reads, Unit},
@@ -531,7 +531,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     // here, and nothing else came back named.
     for f in ["libapp-a1.rlib", "libapp-a1.rmeta"] {
         let (named, _) = hashes.known(&deps.join(f)).context("came back")?;
-        assert_eq!(named.map(|h| h.0), Some(*blake3::hash(&fs::read(deps.join(f))?).as_bytes()), "{f}");
+        assert_eq!(named, Some(Hash::of(&fs::read(deps.join(f))?)), "{f}");
     }
     assert!(matches!(hashes.known(&deps.join("app-a1.d")), Some((None, _))), "dep-info isn't named");
     // The server holds the crate files it read and the ones it built.
