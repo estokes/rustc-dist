@@ -116,8 +116,9 @@ caps how many wrappers wait. Set it at or above the farm's slot count.
 Boxes overcommit RAM into compressed swap. Capacity is RAM plus half of the
 data compressed swap can still take (`compressed_swap_share`). For zram, that
 is its swap devices' free space; for zswap, the pool limit times the
-compression ratio zswap is getting, or 3:1 until it has stored something, never
-more than the swap behind it, less what the pool holds.
+compression ratio zswap is getting, or 3:1 until it has stored something,
+less what the pool holds, and never more than the free space of the swap
+behind it, since every page zswap holds keeps a slot there.
 
 The daemon measures the box rather than trusting its own bookkeeping, so other
 processes count. Use is what RAM holds (`MemTotal - MemAvailable`), which
@@ -127,8 +128,12 @@ disk has room for them, since the kernel can move them there. A tmpfs that
 holds target directories would otherwise look like jobs' memory. Its pages
 already in zram count at their compressed size: without a writeback device,
 zram never moves them to disk.
-Each job's footprint is the RSS plus swap of its processes: the wrapper and
+Each job's footprint is the anonymous and shared memory its processes hold
+in RAM, plus their swap (`RssAnon + RssShmem + VmSwap`): the wrapper and
 everything under it, or bwrap and everything under it for another box's job.
+File-backed pages are left out, as the box's use leaves out page cache: most
+are rustc's and LLVM's code, which every rustc on the box shares (65 to 93 MB
+of a small rustc's 107 to 124 MB of RSS on washu-chan).
 The daemon walks every thread's children, since rustc starts the linker from
 its compiler thread.
 

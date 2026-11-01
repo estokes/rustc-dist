@@ -107,7 +107,8 @@ const ZSWAP_RATIO: f64 = 3.;
 /// the RAM it takes, less shared pages, such as tmpfs files, that swap on
 /// disk has room for. Capacity is RAM plus `swap_share` of the data
 /// compressed swap can still take: free zram swap, and the rest of zswap's
-/// pool at its compression ratio.
+/// pool at its compression ratio, up to the free slots of the swap behind
+/// it, as every page zswap holds keeps one.
 pub fn box_memory(swap_share: f64) -> Result<BoxMemory> {
     let meminfo = fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
     let swaps = fs::read_to_string("/proc/swaps").context("reading /proc/swaps")?;
@@ -126,7 +127,7 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     };
     let need = |name: &str| field(name).with_context(|| format_compact!("no {name} in /proc/meminfo"));
     let (total, available) = (need("MemTotal:")?, need("MemAvailable:")?);
-    let (swap_total, swap_free) = (need("SwapTotal:")?, need("SwapFree:")?);
+    let swap_free = need("SwapFree:")?;
     let (zswap, zswapped) = (field("Zswap:").unwrap_or(0), field("Zswapped:").unwrap_or(0));
     let shared = field("Shmem:").unwrap_or(0);
     let (mut zram_kb, mut zram_used) = (0, 0);
@@ -140,7 +141,7 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     }
     let zram_free = zram_kb.saturating_sub(zram_used);
     let disk_free = swap_free.saturating_sub(zram_free);
-    // CR claude for claude: [bug/medium] zswap's room is capped by the whole swap behind it
+    // XCR claude for claude: [bug/medium] zswap's room is capped by the whole swap behind it
     // (`swap_total - zram_kb`) where it should be capped by that swap's free slots: each page zswap
     // holds keeps a slot on the swap device, so zswap can take at most `disk_free` more. Swap full
     // of pages written back to disk (by zswap's shrinker, or once the pool filled) then counts as
@@ -150,10 +151,16 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     // * ratio) as u64).saturating_sub(zswapped).min(disk_free)`. The zswap case in
     // memory_counts_compressed_swap_at_the_ram_it_takes has a nearly empty disk, so it can't tell
     // the two apart. (sys-01)
+    // 2026-11-01 claude: zswap's room is now ((pool * ratio) - zswapped).min(disk_free), and
+    // SwapTotal is no longer read. A third case in
+    // sys::test::memory_counts_compressed_swap_at_the_ram_it_takes (an 8 GB disk holding 7.5 GB,
+    // 0.5 GB free) fails with the old formula (checked: it gave 7.5 GB of room). DESIGN's Memory
+    // section says the same. Not changed: used_kb also counts tmpfs pages free against the same
+    // disk_free that zswap's room now draws on.
     let zswap_free = zswap_pool_percent.map_or(0, |pct| {
         let ratio = if zswap > 0 { zswapped as f64 / zswap as f64 } else { ZSWAP_RATIO };
         let pool = (total * pct / 100) as f64;
-        ((pool * ratio) as u64).min(swap_total.saturating_sub(zram_kb)).saturating_sub(zswapped)
+        ((pool * ratio) as u64).saturating_sub(zswapped).min(disk_free)
     });
     Ok(BoxMemory {
         capacity_kb: total + ((zram_free + zswap_free) as f64 * swap_share) as u64,
@@ -161,7 +168,7 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
     })
 }
 
-// CR claude for claude: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
+// XCR claude for claude: [risk/medium] VmRSS counts file-backed pages (RssFile): librustc_driver's and
 // LLVM's text, shared by every rustc on the box, and the rlibs a linker maps. box_memory's use
 // leaves most of those out, as MemAvailable counts page cache as available. On washu-chan
 // (2026-11-01) samples of a small rustc read VmRSS 107 to 124 MB, RssFile 65 to 93 MB of it. So
@@ -174,7 +181,13 @@ fn memory(meminfo: &str, swaps: &str, zswap_pool_percent: Option<u64>, swap_shar
 // this alone leaves peaks high. (sys-02)
 // 2026-11-01 claude: Eric ruled (2026-11-01): footprints from RssAnon + RssShmem + VmSwap; peaks
 // stay on maxrss (a).
-/// RSS plus swap, in kB, of `pid` and its descendants.
+// 2026-11-01 claude: Per Eric's ruling: status_kb now sums RssAnon + RssShmem + VmSwap; recorded
+// peaks still take the larger of maxrss and the most footprint seen.
+// sys::test::status_counts_anonymous_shared_and_swapped_but_not_file_pages has a RssFile line and
+// fails if VmRSS (or RssFile) is counted. DESIGN's Memory section updated. sched.rs's
+// RunningJob::foot_kb doc still says 'RSS plus swap' (not my file).
+/// The memory `pid` and its descendants hold in RAM or swap, in kB: see
+/// [`status_kb`].
 pub fn tree_footprint_kb(pid: u32) -> u64 {
     let mut path: LPooled<String> = LPooled::take();
     let mut text: LPooled<String> = LPooled::take();
@@ -189,9 +202,12 @@ pub fn tree_footprint_kb(pid: u32) -> u64 {
     kb
 }
 
-/// VmRSS plus VmSwap from a `/proc/PID/status`.
+/// Resident anonymous and shared memory plus swap from a
+/// `/proc/PID/status`. File-backed pages, such as rustc's and LLVM's
+/// code, which every rustc on the box shares, are left out, as
+/// [`box_memory`] counts page cache as available.
 fn status_kb(status: &str) -> u64 {
-    ["VmRSS:", "VmSwap:"]
+    ["RssAnon:", "RssShmem:", "VmSwap:"]
         .iter()
         .filter_map(|f| status.lines().find_map(|l| l.strip_prefix(f)))
         .filter_map(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
@@ -280,6 +296,14 @@ mod test {
         let m = memory(meminfo, "Filename Type Size Used Priority\n", Some(20), 0.5)?;
         assert_eq!(m.capacity_kb, 1_000_000 + (200_000 * 4 - 400_000) / 2);
         assert_eq!(m.used_kb, 400_000);
+        // The same pool in front of an 8 GB disk holding 7 GB written back
+        // from zswap and the 500 MB zswap holds: each of those keeps a slot,
+        // so only the 500 MB of free slots is room.
+        let meminfo = "MemTotal: 16000000 kB\nMemAvailable: 9000000 kB\nSwapTotal: 8000000 kB\n\
+                       SwapFree: 500000 kB\nZswap: 125000 kB\nZswapped: 500000 kB\n";
+        let swaps = "Filename Type Size Used Priority\n/dev/nvme0n1p3 partition 8000000 7500000 -2\n";
+        let m = memory(meminfo, swaps, Some(20), 0.5)?;
+        assert_eq!(m.capacity_kb, 16_000_000 + 500_000 / 2);
         Ok(())
     }
 
@@ -311,10 +335,10 @@ mod test {
     }
 
     #[test]
-    fn status_counts_resident_and_swapped() {
-        let status =
-            "Name:\trustc\nVmPeak:\t 9000 kB\nVmRSS:\t    5012 kB\nRssAnon:\t 624 kB\nVmSwap:\t     300 kB\n";
-        assert_eq!(status_kb(status), 5312);
+    fn status_counts_anonymous_shared_and_swapped_but_not_file_pages() {
+        let status = "Name:\trustc\nVmPeak:\t 9000 kB\nVmRSS:\t    5012 kB\nRssAnon:\t 624 kB\n\
+                      RssFile:\t    4300 kB\nRssShmem:\t      88 kB\nVmSwap:\t     300 kB\n";
+        assert_eq!(status_kb(status), 624 + 88 + 300);
     }
 
     #[test]
