@@ -5,7 +5,7 @@ use crate::{
     config::{self, Config},
     farm::{self, Load, Member},
     protocol::{self, Ask, Job, PROTOCOL, Ran, Reads, Reply, Unit},
-    remote::{self, Event, Moved, Outcome, ToServer},
+    remote::{self, Event, Links, Moved, Outcome, ToServer},
     sandbox::{self, Server},
     sched::{Admission, Heartbeat, Msg, RemoteOutcome, RemoteSlot, Sched, SentRun, Setup, Want},
     stats::Transfer,
@@ -46,7 +46,7 @@ struct Ctx {
     keys: Keys,
     hashes: triomphe::Arc<Hashes>,
     /// Present when this box is part of a farm.
-    subscriber: Option<Subscriber>,
+    links: Option<Arc<Links>>,
     remote_links: bool,
     compression_level: i32,
 }
@@ -101,8 +101,9 @@ pub async fn run() -> Result<()> {
             }
         },
     };
-    if let Some(subscriber) = subscriber.clone() {
-        tokio::spawn(send_heartbeats(subscriber, heartbeat_rx, tx.clone(), cfg.compression_level));
+    let links = subscriber.map(|s| Arc::new(Links::new(s)));
+    if let Some(links) = links.clone() {
+        tokio::spawn(send_heartbeats(links, heartbeat_rx, tx.clone(), cfg.compression_level));
     }
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let ctx = Arc::new(Ctx {
@@ -110,7 +111,7 @@ pub async fn run() -> Result<()> {
         stop: stop_tx,
         keys: Keys::default(),
         hashes,
-        subscriber,
+        links,
         remote_links: cfg.remote_links,
         compression_level: cfg.compression_level,
     });
@@ -306,15 +307,15 @@ async fn admit(sock: &mut UnixStream, ctx: &Ctx, unit: Unit, build: u32, remote:
 /// Send each heartbeat the scheduler asks for, and tell it how long each
 /// took.
 async fn send_heartbeats(
-    subscriber: Subscriber,
+    links: Arc<Links>,
     mut asks: mpsc::UnboundedReceiver<Heartbeat>,
     tx: mpsc::UnboundedSender<Msg>,
     level: i32,
 ) {
     while let Some(Heartbeat { name, jobs, kb }) = asks.recv().await {
-        let (subscriber, tx) = (subscriber.clone(), tx.clone());
+        let (links, tx) = (links.clone(), tx.clone());
         tokio::spawn(async move {
-            match remote::heartbeat(&subscriber, jobs, kb, level).await {
+            match remote::heartbeat(&links, &jobs, kb, level).await {
                 Ok(us) => {
                     debug!("heartbeat of {kb} kB to {name} took {} ms", us / 1000);
                     let _ = tx.send(Msg::Heartbeat { name, kb, us });
@@ -333,7 +334,7 @@ async fn compile(
     build: u32,
     job: Option<Job>,
 ) -> Result<()> {
-    let mut want = match (&job, &ctx.subscriber) {
+    let mut want = match (&job, &ctx.links) {
         (Some(job), Some(_)) if job.reads == Reads::Metadata || ctx.remote_links => {
             let keys = &ctx.keys;
             let rustc = PathBuf::from(job.rustc.as_str());
@@ -423,15 +424,20 @@ async fn run_remote(
     job: &Job,
     r: RemoteSlot,
 ) -> Result<Remote> {
-    let subscriber = ctx.subscriber.as_ref().context("not in a farm")?;
+    let links = ctx.links.as_ref().context("not in a farm")?;
     let start = Instant::now();
     let staged = task::block_in_place(|| remote::stage(job, &r.crates, &ctx.hashes))?;
     let offer = ToServer::Offer { unit: r.unit().clone(), key: r.key.clone(), target: r.target.clone(), class: r.class };
     let (etx, mut events) = mpsc::unbounded_channel();
     let level = ctx.compression_level;
-    let running = remote::run(subscriber, r.jobs.clone(), offer, job, &staged, &ctx.hashes, level, |ev| {
-        etx.send(ev).map_err(|_| anyhow!("daemon connection gone"))
-    });
+    let jobs = r.jobs.clone();
+    let running = async {
+        let link = links.get(&jobs).await?;
+        remote::run(&link, offer, job, &staged, &ctx.hashes, level, |ev| {
+            etx.send(ev).map_err(|_| anyhow!("daemon connection gone"))
+        })
+        .await
+    };
     tokio::pin!(running);
     // Diagnostics wait for the exit, so a failure here leaves nothing for
     // cargo to see twice.

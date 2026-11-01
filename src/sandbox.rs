@@ -1,8 +1,8 @@
 use crate::{
     blobs::{self, Claim, Coming, Hash, Store, Upload},
     link::{self, Gate},
-    protocol::{self, Front, Ran},
-    remote::{self, CHUNK, FileEntry, FromServer, Late, Packed, Rlib, SYSTEM, ToServer},
+    protocol::{self, Front, Ran, Unit},
+    remote::{self, CHUNK, ExchangeId, FileEntry, FromBox, FromServer, Late, Packed, Rlib, SYSTEM, ToBox, ToServer},
     sched::{Answer, Msg, Slot},
     sys,
     toolchain::Installed,
@@ -47,6 +47,7 @@ use std::{
 };
 use tokio::{
     sync::{mpsc, oneshot},
+    task::{AbortHandle, JoinSet},
     time,
 };
 
@@ -87,8 +88,9 @@ impl Server {
 const CONNECT: Duration = Duration::from_secs(30);
 
 /// Publish the place other boxes send jobs, at `path`, and return what
-/// takes them until the publisher stops. Each client connects on its own,
-/// so one that stalls or botches its handshake holds up no other.
+/// takes them until the publisher stops. Each box's daemon connects once,
+/// on its own, so one that stalls or botches its handshake holds up no
+/// other.
 pub async fn listen(publisher: Publisher, path: NPath, server: Arc<Server>) -> Result<impl Future<Output = ()>> {
     let (tx, mut asks) = futures::channel::mpsc::channel(50);
     let listener =
@@ -112,7 +114,7 @@ pub async fn listen(publisher: Publisher, path: NPath, server: Arc<Server>) -> R
                     match connected.await {
                         Ok(Ok(con)) => {
                             if let Err(e) = serve(server, con).await {
-                                warn!("remote job: {e:#}");
+                                debug!("a client's channel closed: {e:#}");
                             }
                         }
                         Ok(Err(e)) => warn!("a client failed to connect: {e:#}"),
@@ -124,45 +126,115 @@ pub async fn listen(publisher: Publisher, path: NPath, server: Arc<Server>) -> R
     })
 }
 
-/// Serve one remote job on `con`.
+/// Where a job sends to its client: its exchange on the client's channel.
+struct Reply {
+    con: Arc<Connection>,
+    id: ExchangeId,
+}
+
+impl Reply {
+    async fn send(&self, msg: FromServer) -> Result<()> {
+        self.con.send_one(&FromBox { id: self.id, msg }).await
+    }
+}
+
+/// What a job's client sends it after its offer.
+type Inbox = mpsc::UnboundedReceiver<ToServer>;
+
+async fn next(inbox: &mut Inbox) -> Result<ToServer> {
+    inbox.recv().await.context("the client's channel closed")
+}
+
+/// Serve the exchanges another box's daemon opens on `con` until the
+/// channel closes, which stops every job still running.
 pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
-    let (unit, key, target, class) = match con.recv_one().await? {
-        ToServer::Offer { unit, key, target, class } => (unit, key, target, class),
-        ToServer::Heartbeat(data) => {
-            data.unpack()?;
-            return con.send_one(&FromServer::Heartbeat).await;
-        }
-        m => bail!("expected an offer, got {m:?}"),
-    };
-    let Some(tc) = server.toolchains.iter().find(|t| t.toolchain.builds(&key, target.as_deref())) else {
-        let why: ArcStr = format_compact!("no toolchain {key}").as_str().into();
-        con.send_one(&FromServer::Failed(why)).await?;
-        return Ok(());
-    };
-    let (reply, admitted) = oneshot::channel();
-    server.tx.send(Msg::Offer { unit, class, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
-    let Answer { slot, version } = admitted.await?;
-    let Some(slot) = slot else {
-        con.send_one(&FromServer::Busy { version }).await?;
-        return Ok(());
-    };
-    con.send_one(&FromServer::Accepted { version }).await?;
-    match job(&server, &con, tc, &slot).await {
-        Ok(Some((ran, linker_waited_us))) => slot.finish(ran, linker_waited_us),
-        Ok(None) => (),
-        Err(e) => {
-            let why: ArcStr = format_compact!("{e:#}").as_str().into();
-            let _ = con.send_one(&FromServer::Failed(why)).await;
-            return Err(e);
+    let con = Arc::new(con);
+    let mut jobs: HashMap<ExchangeId, (mpsc::UnboundedSender<ToServer>, AbortHandle)> = HashMap::new();
+    let mut running = JoinSet::new();
+    loop {
+        tokio::select! {
+            m = con.recv_one::<ToBox>() => {
+                let ToBox { id, msg } = m?;
+                match msg {
+                    ToServer::Heartbeat(data) => {
+                        data.unpack()?;
+                        con.send_one(&FromBox { id, msg: FromServer::Heartbeat }).await?;
+                    }
+                    ToServer::Offer { unit, key, target, class } => {
+                        let (tx, inbox) = mpsc::unbounded_channel();
+                        let reply = Reply { con: con.clone(), id };
+                        let task = running.spawn(take(server.clone(), reply, inbox, unit, key, target, class));
+                        if let Some((_, old)) = jobs.insert(id, (tx, task)) {
+                            old.abort();
+                            bail!("a second offer of exchange {id:?}");
+                        }
+                    }
+                    ToServer::Stop => {
+                        if let Some((_, task)) = jobs.remove(&id) {
+                            task.abort();
+                        }
+                    }
+                    // A job that ended may still get the late rlibs its
+                    // client was sending.
+                    msg => {
+                        if let Some((tx, _)) = jobs.get(&id) {
+                            let _ = tx.send(msg);
+                        }
+                    }
+                }
+            }
+            Some(ended) = running.join_next_with_id() => {
+                let task = ended.map_or_else(|e| e.id(), |(task, ())| task);
+                jobs.retain(|_, (_, t)| t.id() != task);
+            }
         }
     }
-    Ok(())
+}
+
+/// Take the job a client offered, if a slot is free, and run it, telling
+/// the client if it fails.
+async fn take(
+    server: Arc<Server>,
+    reply: Reply,
+    mut inbox: Inbox,
+    unit: Unit,
+    key: ArcStr,
+    target: Option<ArcStr>,
+    class: Option<u32>,
+) {
+    let run = async {
+        let Some(tc) = server.toolchains.iter().find(|t| t.toolchain.builds(&key, target.as_deref())) else {
+            bail!("no toolchain {key}");
+        };
+        let (answer, admitted) = oneshot::channel();
+        server.tx.send(Msg::Offer { unit, class, reply: answer }).map_err(|_| anyhow!("scheduler stopped"))?;
+        let Answer { slot, version } = admitted.await?;
+        let Some(slot) = slot else {
+            return reply.send(FromServer::Busy { version }).await;
+        };
+        reply.send(FromServer::Accepted { version }).await?;
+        if let Some((ran, linker_waited_us)) = job(&server, &reply, &mut inbox, tc, &slot).await? {
+            slot.finish(ran, linker_waited_us);
+        }
+        Ok(())
+    };
+    if let Err(e) = run.await {
+        warn!("remote job: {e:#}");
+        let why: ArcStr = format_compact!("{e:#}").as_str().into();
+        let _ = reply.send(FromServer::Failed(why)).await;
+    }
 }
 
 /// The Ran of a successful compile, and how long its linker waited for
 /// late rlibs.
-async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> Result<Option<(Ran, u64)>> {
-    let ToServer::Manifest { files, dirs, late } = con.recv_one().await? else {
+async fn job(
+    server: &Server,
+    reply: &Reply,
+    inbox: &mut Inbox,
+    tc: &Installed,
+    slot: &Slot,
+) -> Result<Option<(Ran, u64)>> {
+    let ToServer::Manifest { files, dirs, late } = next(inbox).await? else {
         bail!("expected a manifest");
     };
     let rlibs = late.as_ref().map_or(&[][..], |l| &l.rlibs);
@@ -196,14 +268,14 @@ async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> 
         claim(r.hash, &mut send_later, &mut coming_later);
     }
     let need = FromServer::Need { now: send_now.keys().copied().collect(), later: send_later.keys().copied().collect() };
-    con.send_one(&need).await?;
+    reply.send(need).await?;
     let now = send_now.keys().copied().collect();
-    receive(con, store, now, |hash| {
+    receive(inbox, store, now, |hash| {
         send_now.remove(&hash);
         Ok(())
     })
     .await?;
-    let ToServer::Run { args, env, cwd } = con.recv_one().await? else {
+    let ToServer::Run { args, env, cwd } = next(inbox).await? else {
         bail!("expected run");
     };
     check(&cwd)?;
@@ -241,7 +313,7 @@ async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> 
         None => None,
         Some(_) => {
             let sent = send_later.keys().copied().collect();
-            let sent = receive(con, store, sent, |hash| {
+            let sent = receive(inbox, store, sent, |hash| {
                 send_later.remove(&hash);
                 place(hash)
             });
@@ -256,20 +328,20 @@ async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> 
             Some((Gate::new()?, async { futures::try_join!(sent, others).map(|_| ()) }))
         }
     };
-    run(con, store, cmd, &root.0, slot, late, server.level).await
+    run(reply, store, cmd, &root.0, slot, late, server.level).await
 }
 
 /// Receive chunks until every blob in `need` is stored, telling `stored`
 /// of each as it is.
 async fn receive(
-    con: &Connection,
+    inbox: &mut Inbox,
     store: &Store,
     mut need: HashSet<Hash>,
     mut stored: impl FnMut(Hash) -> Result<()>,
 ) -> Result<()> {
     let mut uploads: HashMap<Hash, Upload> = HashMap::new();
     while !need.is_empty() {
-        let ToServer::Chunk { hash, data, last } = con.recv_one().await? else {
+        let ToServer::Chunk { hash, data, last } = next(inbox).await? else {
             bail!("expected a chunk");
         };
         if !need.contains(&hash) {
@@ -430,7 +502,7 @@ impl Drop for Kill {
 /// With `late`, a future stores late rlibs, and the gate holds the
 /// linker until it has.
 async fn run(
-    con: &Connection,
+    reply: &Reply,
     store: &Store,
     mut cmd: Command,
     root: &Path,
@@ -511,11 +583,11 @@ async fn run(
                             let wall_us = start.elapsed().as_micros() as u64;
                             front = Some(Front { wall_us });
                         }
-                        send_artifact(con, store, root, &line, level).await?;
+                        send_artifact(reply, store, root, &line, level).await?;
                     }
-                    con.send_one(&FromServer::Stderr(line)).await?;
+                    reply.send(FromServer::Stderr(line)).await?;
                 }
-                Ev::Stdout(data) => con.send_one(&FromServer::Stdout(data)).await?,
+                Ev::Stdout(data) => reply.send(FromServer::Stdout(data)).await?,
                 Ev::Eof => eofs += 1,
                 Ev::Exit(status, ru, at) => exit = Some((status, ru, at)),
             },
@@ -537,7 +609,7 @@ async fn run(
     let code = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     debug!("sandbox exited {code}");
     let linker_waited_us = gate.map_or(0, |g| g.waited_us());
-    con.send_one(&FromServer::Exit { code, ran, linker_waited_us, measured: slot.measured() }).await?;
+    reply.send(FromServer::Exit { code, ran, linker_waited_us, measured: slot.measured() }).await?;
     Ok((code == 0).then_some((ran, linker_waited_us)))
 }
 
@@ -548,7 +620,7 @@ struct Artifact {
 
 /// Send the file an artifact line names, before the line. A crate file
 /// stays in the store for jobs that read it later.
-async fn send_artifact(con: &Connection, store: &Store, root: &Path, line: &[u8], level: i32) -> Result<()> {
+async fn send_artifact(reply: &Reply, store: &Store, root: &Path, line: &[u8], level: i32) -> Result<()> {
     let a: Artifact = serde_json::from_slice(line).context("artifact line")?;
     check(&a.artifact)?;
     let host = root.join(&a.artifact[1..]);
@@ -562,7 +634,7 @@ async fn send_artifact(con: &Connection, store: &Store, root: &Path, line: &[u8]
         let last = n < buf.len();
         hasher.update(&buf[..n]);
         let data = Packed::pack(&buf[..n], level);
-        con.send_one(&FromServer::Output { path: path.clone(), mode, data, last }).await?;
+        reply.send(FromServer::Output { path: path.clone(), mode, data, last }).await?;
         if last {
             break;
         }

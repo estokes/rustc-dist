@@ -6,10 +6,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use bytes::Bytes;
 use compact_str::format_compact;
+use log::debug;
 use netidx::{path::Path as NPath, subscriber::Subscriber};
+use netidx_core::atomic_id;
 use netidx_derive::Pack;
 use netidx_protocols::pack_channel::client::Connection;
+use parking_lot::Mutex;
 use poolshark::local::LPooled;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
@@ -17,10 +21,16 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     pin::pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::time;
+use tokio::{
+    sync::{OnceCell, mpsc},
+    time,
+};
 
 /// Bytes per message when a file crosses the wire.
 pub const CHUNK: usize = 1 << 20;
@@ -63,6 +73,151 @@ pub enum ToServer {
     /// Instead of an offer: bytes to time a send by, which the server
     /// answers and drops.
     Heartbeat(Packed),
+    /// The client no longer wants the job: stop it if it still runs.
+    Stop,
+}
+
+atomic_id!(ExchangeId);
+
+/// A message on a link, for one of its exchanges: a job or a heartbeat.
+#[derive(Debug, Pack)]
+pub struct ToBox {
+    pub id: ExchangeId,
+    pub msg: ToServer,
+}
+
+#[derive(Debug, Pack)]
+pub struct FromBox {
+    pub id: ExchangeId,
+    pub msg: FromServer,
+}
+
+/// How long connecting to a box may take.
+const CONNECT: Duration = Duration::from_secs(10);
+
+/// The channel to a box, which every job sent there and every heartbeat
+/// shares, each an exchange of its own. It stays open until it fails.
+pub struct Link {
+    con: Connection,
+    jobs: NPath,
+    /// Where each open exchange's messages go; none once the channel failed.
+    exchanges: Mutex<Option<HashMap<ExchangeId, mpsc::UnboundedSender<FromServer>>>>,
+}
+
+impl Link {
+    async fn connect(subscriber: &Subscriber, jobs: NPath) -> Result<Arc<Self>> {
+        let con = match time::timeout(CONNECT, Connection::connect(subscriber, jobs.clone())).await {
+            Ok(con) => con.with_context(|| format_compact!("connecting to {jobs}"))?,
+            Err(_) => bail!("connecting to {jobs} timed out"),
+        };
+        let link = Arc::new(Self { con, jobs, exchanges: Mutex::new(Some(HashMap::new())) });
+        tokio::spawn(link.clone().read());
+        Ok(link)
+    }
+
+    /// Hand each message to its exchange until the channel fails, then end
+    /// every exchange.
+    async fn read(self: Arc<Self>) {
+        let e = loop {
+            let read = self.con.recv(|m: FromBox| {
+                if let Some(tx) = self.exchanges.lock().as_ref().and_then(|ex| ex.get(&m.id)) {
+                    let _ = tx.send(m.msg);
+                }
+                true
+            });
+            if let Err(e) = read.await {
+                break e;
+            }
+        };
+        debug!("the channel to {} failed: {e:#}", self.jobs);
+        *self.exchanges.lock() = None;
+    }
+
+    pub fn failed(&self) -> bool {
+        self.exchanges.lock().is_none()
+    }
+
+    pub fn open(self: &Arc<Self>) -> Result<(Out, In)> {
+        let id = ExchangeId::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        match &mut *self.exchanges.lock() {
+            Some(ex) => ex.insert(id, tx),
+            None => bail!("the channel to {} failed", self.jobs),
+        };
+        Ok((Out { link: self.clone(), id }, In { link: self.clone(), id, rx, over: false }))
+    }
+}
+
+/// What an exchange sends.
+pub struct Out {
+    link: Arc<Link>,
+    id: ExchangeId,
+}
+
+impl Out {
+    pub fn send(&self, msg: ToServer) -> Result<()> {
+        self.link.con.send_one(&ToBox { id: self.id, msg })
+    }
+
+    pub async fn flush(&self) -> Result<()> {
+        self.link.con.flush().await
+    }
+}
+
+/// What an exchange receives. Dropped before the box ends the exchange,
+/// it tells the box to stop the job.
+pub struct In {
+    link: Arc<Link>,
+    id: ExchangeId,
+    rx: mpsc::UnboundedReceiver<FromServer>,
+    over: bool,
+}
+
+impl In {
+    pub async fn recv(&mut self) -> Result<FromServer> {
+        let m = self.rx.recv().await.with_context(|| format_compact!("the channel to {} failed", self.link.jobs))?;
+        self.over |= matches!(
+            m,
+            FromServer::Busy { .. } | FromServer::Failed(_) | FromServer::Exit { .. } | FromServer::Heartbeat
+        );
+        Ok(m)
+    }
+}
+
+impl Drop for In {
+    fn drop(&mut self) {
+        if let Some(ex) = &mut *self.link.exchanges.lock() {
+            ex.remove(&self.id);
+        }
+        if !self.over {
+            let _ = self.link.con.send_one(&ToBox { id: self.id, msg: ToServer::Stop });
+        }
+    }
+}
+
+/// The link to each box jobs from here go to, opened when first used.
+pub struct Links {
+    subscriber: Subscriber,
+    links: Mutex<HashMap<NPath, Arc<OnceCell<Arc<Link>>>>>,
+}
+
+impl Links {
+    pub fn new(subscriber: Subscriber) -> Self {
+        Self { subscriber, links: Mutex::default() }
+    }
+
+    /// The link to the box listening at `jobs`: the one open, else a new one.
+    pub async fn get(&self, jobs: &NPath) -> Result<Arc<Link>> {
+        let cell = {
+            let mut links = self.links.lock();
+            let cell = links.entry(jobs.clone()).or_default();
+            if cell.get().is_some_and(|l| l.failed()) {
+                *cell = Arc::default();
+            }
+            cell.clone()
+        };
+        cell.get_or_try_init(|| Link::connect(&self.subscriber, jobs.clone())).await.cloned()
+    }
 }
 
 /// A chunk of a file as sent: as it is, or compressed with zstd when that
@@ -440,13 +595,18 @@ pub struct Moved {
     pub kept: Vec<(Hash, u64)>,
 }
 
-/// Run a staged job on the box listening at `jobs`, compressing what it
-/// sends at `level`. `sink` gets rustc's output as it arrives. The hashes
-/// of the outputs go in `hashes`.
-#[allow(clippy::too_many_arguments)]
+/// Send `m` and wait for the answer.
+async fn ask(out: &Out, inbox: &mut In, m: ToServer) -> Result<FromServer> {
+    out.send(m)?;
+    out.flush().await?;
+    inbox.recv().await
+}
+
+/// Run a staged job on the box `link` goes to, compressing what it sends
+/// at `level`. `sink` gets rustc's output as it arrives. The hashes of the
+/// outputs go in `hashes`.
 pub async fn run(
-    subscriber: &Subscriber,
-    jobs: NPath,
+    link: &Arc<Link>,
     offer: ToServer,
     job: &Job,
     staged: &Staged,
@@ -454,16 +614,8 @@ pub async fn run(
     level: i32,
     mut sink: impl FnMut(Event) -> Result<()>,
 ) -> Result<Outcome> {
-    let con = match time::timeout(Duration::from_secs(10), Connection::connect(subscriber, jobs.clone())).await {
-        Ok(con) => con.context("connecting")?,
-        Err(_) => bail!("connecting timed out"),
-    };
-    let ask = async |m: &ToServer| {
-        con.send_one(m)?;
-        con.flush().await?;
-        con.recv_one::<FromServer>().await
-    };
-    match ask(&offer).await.context("offering the job")? {
+    let (out, mut inbox) = link.open()?;
+    match ask(&out, &mut inbox, offer).await.context("offering the job")? {
         FromServer::Accepted { version } => sink(Event::Accepted { version })?,
         FromServer::Busy { version } => return Ok(Outcome::Busy { version }),
         FromServer::Failed(why) => bail!("{why}"),
@@ -471,7 +623,7 @@ pub async fn run(
     }
     let manifest =
         ToServer::Manifest { files: staged.files.clone(), dirs: staged.dirs.clone(), late: staged.late.clone() };
-    let (now, later) = match ask(&manifest).await.context("sending the manifest")? {
+    let (now, later) = match ask(&out, &mut inbox, manifest).await.context("sending the manifest")? {
         FromServer::Need { now, later } => (now, later),
         FromServer::Failed(why) => bail!("{why}"),
         m => bail!("unexpected {m:?}"),
@@ -479,30 +631,25 @@ pub async fn run(
     let sent = Sent::default();
     let mut buf = vec![0u8; CHUNK];
     for hash in now {
-        send_blob(&con, staged, hash, &mut buf, level, &sent).await.context("sending inputs")?;
+        send_blob(&out, staged, hash, &mut buf, level, &sent).await.context("sending inputs")?;
     }
-    con.send_one(&ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
-    con.flush().await.context("starting rustc")?;
+    out.send(ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
+    out.flush().await.context("starting rustc")?;
+    // A rustc that fails before linking exits while late rlibs are still
+    // on their way; its exit ends sending them.
     let mut sending = pin!(async {
         for hash in later {
-            send_blob(&con, staged, hash, &mut buf, level, &sent).await?;
+            send_blob(&out, staged, hash, &mut buf, level, &sent).await?;
         }
         Ok::<_, anyhow::Error>(())
     });
-    let mut receiving = pin!(receive(&con, &jobs, staged, hashes, &mut sink));
+    let mut receiving = pin!(receive(&mut inbox, &link.jobs, staged, hashes, &mut sink));
     let mut sending_done = false;
     let Exited { code, ran, linker_waited_us, measured, built } = loop {
         tokio::select! {
             exit = &mut receiving => break exit.context("receiving outputs")?,
             r = &mut sending, if !sending_done => {
-                // A rustc that fails before linking exits without the late
-                // rlibs, and the server closes the channel after its exit,
-                // which is still on its way.
-                if let Err(e) = r
-                    && !con.is_dead()
-                {
-                    return Err(e.context("sending late rlibs"));
-                }
+                r.context("sending late rlibs")?;
                 sending_done = true;
             }
         }
@@ -515,18 +662,15 @@ pub async fn run(
 
 /// Send `kb` of this program's own code, which compresses about as object
 /// files do, to the box listening at `jobs`, compressed at `level`, and
-/// return how many µs that took, connecting included, as sending a job's
-/// files does.
-pub async fn heartbeat(subscriber: &Subscriber, jobs: NPath, kb: u64, level: i32) -> Result<u64> {
+/// return how many µs it took to be answered.
+pub async fn heartbeat(links: &Links, jobs: &NPath, kb: u64, level: i32) -> Result<u64> {
     let exe = File::open("/proc/self/exe").context("opening this program")?;
     let mut data = Vec::with_capacity(CHUNK);
     exe.take((kb * 1024).min(CHUNK as u64)).read_to_end(&mut data)?;
     let data = Packed::pack(&data, level);
+    let (out, mut inbox) = links.get(jobs).await?.open()?;
     let start = Instant::now();
-    let con = Connection::connect(subscriber, jobs.clone()).await.context("connecting")?;
-    con.send_one(&ToServer::Heartbeat(data))?;
-    con.flush().await?;
-    match next(&con).await? {
+    match ask(&out, &mut inbox, ToServer::Heartbeat(data)).await? {
         FromServer::Heartbeat => Ok(start.elapsed().as_micros() as u64),
         m => bail!("{jobs}: unexpected {m:?}"),
     }
@@ -534,7 +678,7 @@ pub async fn heartbeat(subscriber: &Subscriber, jobs: NPath, kb: u64, level: i32
 
 /// Send the blob `hash` compressed at `level`, adding its size to `sent`.
 pub async fn send_blob(
-    con: &Connection,
+    out: &Out,
     staged: &Staged,
     hash: Hash,
     buf: &mut [u8],
@@ -548,8 +692,8 @@ pub async fn send_blob(
         let last = n < buf.len();
         let data = Packed::pack(&buf[..n], level);
         sent.wire.fetch_add(data.wire_len() as u64, Ordering::Relaxed);
-        con.send_one(&ToServer::Chunk { hash, data, last })?;
-        con.flush().await?;
+        out.send(ToServer::Chunk { hash, data, last })?;
+        out.flush().await?;
         sent.raw.fetch_add(n as u64, Ordering::Relaxed);
         if last {
             return Ok(());
@@ -566,19 +710,9 @@ struct Writing {
     len: u64,
 }
 
-/// The server's next message. A send that finds the channel closed marks
-/// it dead, and `recv_one` then fails without reading what the server sent
-/// before closing it, which `try_recv_one` still returns.
-async fn next(con: &Connection) -> Result<FromServer> {
-    match con.recv_one().await {
-        Err(e) if con.is_dead() => con.try_recv_one().await?.ok_or(e),
-        r => r,
-    }
-}
-
 /// rustc's output until it exits.
 async fn receive(
-    con: &Connection,
+    inbox: &mut In,
     jobs: &NPath,
     staged: &Staged,
     hashes: &Hashes,
@@ -587,7 +721,7 @@ async fn receive(
     let mut writing: Option<Writing> = None;
     let mut built = Vec::new();
     loop {
-        match next(con).await? {
+        match inbox.recv().await? {
             FromServer::Output { path, mode, data, last } => {
                 let data = data.unpack()?;
                 if writing.is_none() {

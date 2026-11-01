@@ -300,8 +300,8 @@ box already holds, such as crates it just built, is cheap to send there:
 - While jobs wait here, a box with a token free that has run nothing from here
   and had no heartbeat for a minute gets one: half a MB or a MB, in turn, of
   the start of the rustc-dist binary, which compresses about as object code
-  does, and which the box answers and drops. Its time, connecting
-  included, is a send of each kind there, so a box whose recent sends judged
+  does, and which the box answers and drops. Its time is a send of each
+  kind there, so a box whose recent sends judged
   it badly gets fresh samples though no job goes. A heartbeat takes no token
   and runs nothing.
 
@@ -446,13 +446,19 @@ work, so build times say nothing yet; placement is all that was checked.
 ### Farm
 
 A daemon whose config has `base` (say `/build`) joins the farm. The farm's
-netidx namespace is under the protocol version, `BASE/vN` (`/build/v16`), so
+netidx namespace is under the protocol version, `BASE/vN` (`/build/v17`), so
 boxes of different versions never see each other:
 
 - `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
   a table.
 - `BASE/vN/api/NAME/jobs`: where the box takes jobs, a netidx pack channel
-  listener. Each job is one connection. Each client's handshake runs on its
+  listener. A daemon opens one channel to each box when it first sends it
+  something and keeps it until it fails: the handshake goes through the
+  resolver and isn't cheap. Every job and heartbeat sent there is an
+  exchange on it, each message tagged with the exchange's id. The box runs
+  each job as a task of its own, so one that waits holds up no other, and
+  a job whose client drops it gets `Stop`, which ends it and kills its
+  rustc; so does the channel failing. Each client's handshake runs on its
   own with 30 s to finish, so a client that dies or stalls while connecting
   holds up no other.
 - `BASE/vN/units/NAME/UNIT/COLUMN`: the units the box has run (see below).
@@ -944,8 +950,6 @@ What the test found:
 
 Known gaps:
 
-- One connection per job. A persistent connection per pair of boxes would
-  save the setup if it shows up in measurements.
 - Upload and output file I/O run on async worker threads.
 - A job stays local if the build graph doesn't know every crate below it,
   which happens when a project's target directory was built before the daemon

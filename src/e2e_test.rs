@@ -7,7 +7,7 @@ use crate::{
     classes::{self, Class, Profile},
     farm::Load,
     protocol::{Job, Reads, Unit},
-    remote::{self, CHUNK, Event, FromServer, Moved, Outcome, Sent, ToServer},
+    remote::{self, CHUNK, Event, FromServer, Links, Moved, Outcome, Packed, Sent, ToServer},
     sandbox::{self, Server},
     sched::{Msg, Sched, Setup},
     stats::Decay,
@@ -17,7 +17,6 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use arcstr::ArcStr;
 use netidx::{InternalOnly, path::Path as NPath, subscriber::Value};
-use netidx_protocols::pack_channel::client::Connection;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -33,6 +32,7 @@ use tokio::{
 struct ServerBox {
     _net: InternalOnly,
     subscriber: netidx::subscriber::Subscriber,
+    links: Links,
     jobs: NPath,
     tx: mpsc::UnboundedSender<Msg>,
     store_dir: PathBuf,
@@ -72,7 +72,8 @@ async fn server(dir: &Path) -> Result<ServerBox> {
     let server = Arc::new(Server::new(store, dir.join("jobs"), toolchain::installed(), tx.clone(), LEVEL)?);
     let jobs = NPath::from("/test/rustc-dist/b/jobs");
     tokio::spawn(sandbox::listen(net.publisher().clone(), jobs.clone(), server).await?);
-    Ok(ServerBox { subscriber: net.subscriber().clone(), _net: net, jobs, tx, store_dir })
+    let (subscriber, links) = (net.subscriber().clone(), Links::new(net.subscriber().clone()));
+    Ok(ServerBox { subscriber, links, _net: net, jobs, tx, store_dir })
 }
 
 fn rustc() -> PathBuf {
@@ -167,7 +168,8 @@ async fn send(
     let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
     let offer = ToServer::Offer { unit: unit.clone(), key, target: None, class };
     let mut events = Vec::new();
-    let outcome = remote::run(&b.subscriber, b.jobs.clone(), offer, job, &staged, hashes, LEVEL, |ev| {
+    let link = b.links.get(&b.jobs).await?;
+    let outcome = remote::run(&link, offer, job, &staged, hashes, LEVEL, |ev| {
         events.push(ev);
         Ok(())
     })
@@ -179,29 +181,26 @@ async fn send(
 /// rlibs only after `delay`. Its exit code and how long its linker waited.
 async fn send_late(b: &ServerBox, (job, unit): &(Job, Unit), crates: &[ArcStr], delay: Duration) -> Result<(i32, u64)> {
     let staged = remote::stage(job, crates, &Hashes::default())?;
-    let con = Connection::connect(&b.subscriber, b.jobs.clone()).await?;
+    let (out, mut inbox) = b.links.get(&b.jobs).await?.open()?;
     let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
-    con.send_one(&ToServer::Offer { unit: unit.clone(), key, target: None, class: None })?;
-    con.flush().await?;
-    let FromServer::Accepted { .. } = con.recv_one().await? else { bail!("not accepted") };
+    out.send(ToServer::Offer { unit: unit.clone(), key, target: None, class: None })?;
+    let FromServer::Accepted { .. } = inbox.recv().await? else { bail!("not accepted") };
     let manifest =
         ToServer::Manifest { files: staged.files.clone(), dirs: staged.dirs.clone(), late: staged.late.clone() };
-    con.send_one(&manifest)?;
-    con.flush().await?;
-    let FromServer::Need { now, later } = con.recv_one().await? else { bail!("expected need") };
+    out.send(manifest)?;
+    let FromServer::Need { now, later } = inbox.recv().await? else { bail!("expected need") };
     assert!(!later.is_empty(), "nothing comes late");
     let (sent, mut buf) = (Sent::default(), vec![0u8; CHUNK]);
     for hash in now {
-        remote::send_blob(&con, &staged, hash, &mut buf, LEVEL, &sent).await?;
+        remote::send_blob(&out, &staged, hash, &mut buf, LEVEL, &sent).await?;
     }
-    con.send_one(&ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
-    con.flush().await?;
+    out.send(ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
     time::sleep(delay).await;
     for hash in later {
-        remote::send_blob(&con, &staged, hash, &mut buf, LEVEL, &sent).await?;
+        remote::send_blob(&out, &staged, hash, &mut buf, LEVEL, &sent).await?;
     }
     loop {
-        if let FromServer::Exit { code, linker_waited_us, .. } = con.recv_one().await? {
+        if let FromServer::Exit { code, linker_waited_us, .. } = inbox.recv().await? {
             return Ok((code, linker_waited_us));
         }
     }
@@ -356,8 +355,89 @@ async fn a_box_answers_a_heartbeat() -> Result<()> {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
     let b = server(&dir.join("box")).await?;
-    let us = remote::heartbeat(&b.subscriber, b.jobs.clone(), 1024, LEVEL).await?;
+    let us = remote::heartbeat(&b.links, &b.jobs, 1024, LEVEL).await?;
     assert!(us > 0 && us < 10_000_000, "{us}");
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-drop-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    let lib = project(&dir.join("ws"))?;
+    let big: Vec<u8> = (0..16 << 20).map(|i: u32| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    fs::write(dir.join("ws/app/src/big.bin"), &big)?;
+    let crates: Vec<ArcStr> = lib.1.deps.iter().filter_map(|d| d.file.clone()).collect();
+    let link = b.links.get(&b.jobs).await?;
+    // The client sends one chunk of the blob, then drops the job.
+    {
+        let (job, unit) = &lib;
+        let staged = remote::stage(job, &crates, &Hashes::default())?;
+        let (out, mut inbox) = link.open()?;
+        let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
+        out.send(ToServer::Offer { unit: unit.clone(), key, target: None, class: None })?;
+        let FromServer::Accepted { .. } = inbox.recv().await? else { bail!("not accepted") };
+        let manifest = ToServer::Manifest { files: staged.files.clone(), dirs: staged.dirs.clone(), late: None };
+        out.send(manifest)?;
+        let FromServer::Need { now, .. } = inbox.recv().await? else { bail!("expected need") };
+        let hash = staged.files.iter().find(|f| f.path.ends_with("big.bin")).context("big.bin")?.hash;
+        assert!(now.contains(&hash));
+        out.send(ToServer::Chunk { hash, data: Packed::pack(&big[..CHUNK], LEVEL), last: false })?;
+        out.flush().await?;
+    }
+    // The box gives back its slot, and drops its claim on the blob, so the
+    // next job sends it rather than wait for it forever.
+    let serving = async || -> Result<u32> {
+        let (reply, status) = oneshot::channel();
+        b.tx.send(Msg::Status { reply })?;
+        let st = status.await?;
+        Ok(st.classes.iter().map(|c| c.serving).sum::<u32>() + st.spread.serving)
+    };
+    let mut tries = 0;
+    while serving().await? > 0 {
+        tries += 1;
+        assert!(tries < 50, "the box still serves the dropped job");
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    let again = time::timeout(Duration::from_secs(60), send(&b, &lib, &crates, &Hashes::default(), None)).await;
+    let (outcome, events) = again.context("the next job waited for the dropped job's blob")??;
+    let Outcome::Exit { code: 0, moved, .. } = outcome else { bail!("failed: {:?}", stderr(&events)) };
+    assert!(moved.bytes >= big.len() as u64, "{} bytes", moved.bytes);
+    // On the same channel all along.
+    let same = b.links.get(&b.jobs).await?;
+    assert!(Arc::ptr_eq(&link, &same) && !link.failed());
+    drop(b);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_channel_that_fails_is_replaced() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-relink-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    let lib = project(&dir.join("ws"))?;
+    let crates: Vec<ArcStr> = lib.1.deps.iter().filter_map(|d| d.file.clone()).collect();
+    let link = b.links.get(&b.jobs).await?;
+    // A client that offers one exchange twice breaks the protocol, and the
+    // box closes its channel.
+    let (out, mut inbox) = link.open()?;
+    let key = toolchain::key_of(Path::new(lib.0.rustc.as_str()))?;
+    for _ in 0..2 {
+        out.send(ToServer::Offer { unit: lib.1.clone(), key: key.clone(), target: None, class: None })?;
+    }
+    while inbox.recv().await.is_ok() {}
+    assert!(link.failed());
+    let (outcome, events) = send(&b, &lib, &crates, &Hashes::default(), None).await?;
+    let Outcome::Exit { code: 0, .. } = outcome else { bail!("failed: {:?}", stderr(&events)) };
+    assert!(!Arc::ptr_eq(&link, &b.links.get(&b.jobs).await?));
+    drop(b);
     fs::remove_dir_all(&dir)?;
     Ok(())
 }
