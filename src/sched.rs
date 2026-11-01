@@ -1536,7 +1536,7 @@ impl Sched {
         }
     }
 
-    // CR claude for claude: [risk/medium] The new layout starts with every class's full
+    // XCR claude for claude: [risk/medium] The new layout starts with every class's full
     // pool while the retired layouts' jobs still hold theirs on the same CPUs, and their
     // heavy jobs keep borrowing from the old pools (Event::Sample lends in every
     // layout). On a full box a switch admits a second full set of jobs at once: 16 CPUs
@@ -1579,6 +1579,18 @@ impl Sched {
     // slides to each later end while a free box goes unused. Fix: for an owed class, predict
     // the time when tokens back from retired jobs, taken in order of predicted end, cover
     // overdrawn plus the owed of faster classes plus one. Add a test with overdrawn > 0.
+    // 2026-11-01 claude: Sched::frees_in_us now predicts an owed class's token from the
+    // retired jobs taken in order of predicted end (Running::left_us), at the one whose tokens
+    // (Lease::lent) bring what they gave back past overdrawn plus what faster classes
+    // (Layout::by_speed) are owed; a class not owed still counts only the current layout's
+    // jobs holding its tokens, and an owed class takes the sooner of the two. New test
+    // a_class_owed_tokens_frees_one_when_the_old_jobs_have_given_back_what_comes_first: four
+    // old jobs of 1, 50, 100 and 200 s hold 4 tokens, battery has 2 (owed [1, 1], overdrawn
+    // 2); the fast class must free at the 100 s job's end and the slow one at the 200 s job's,
+    // both as frees_in_us and as published frees_in_ms, and still so after the 1 s job ends
+    // (overdrawn 1). With the old frees_in_us it fails at Some(999660), the 1 s job; leaving
+    // out overdrawn fails the fast class, leaving out the faster classes' owed fails the slow
+    // one. DESIGN.md (Calibration) says so.
     fn apply(&mut self, profile: Profile, classes: Vec<Class>) {
         let layout = Layout::new(&profile, classes, self.setup.tokens_per_cpu, &mut self.stats);
         let old = mem::replace(&mut self.layout, layout);
@@ -1597,20 +1609,34 @@ impl Sched {
         self.profile = profile;
     }
 
-    /// µs until a token of local `class` is expected to free, from the
-    /// jobs holding its tokens, if any do, counting jobs of earlier layouts
-    /// while the class is owed tokens they hold.
+    /// µs until a token of local `class` is expected to free: when the
+    /// first job holding one of its tokens ends, or, while the class is
+    /// owed tokens that jobs of earlier layouts hold, when those jobs, in
+    /// the order they are predicted to end, have given back what is
+    /// overdrawn and what faster classes are owed, and one more (see
+    /// `Layout::repaid`).
     fn frees_in_us(&self, class: usize, now: Instant) -> Option<u64> {
         let l = &self.layout;
-        let owed = l.owed[class] > 0;
-        let holds = |r: &&Running| match r.place {
-            Place::Local { layout, .. } | Place::Spread { layout, .. } if layout == l.id => {
-                l.leases.iter().any(|s| s.job == r.job && s.lent[class] > 0)
+        let left_us = |job: JobId| self.running.iter().find(|r| r.job == job).map(|r| r.left_us(now));
+        let own = l.leases.iter().filter(|s| s.lent[class] > 0).filter_map(|s| left_us(s.job)).min();
+        if l.owed[class] == 0 {
+            return own;
+        }
+        let order = l.by_speed();
+        let mut ahead = l.overdrawn + order.iter().take_while(|&&k| k != class).map(|&k| l.owed[k]).sum::<u32>();
+        let mut ends: LPooled<Vec<(u64, u32)>> = LPooled::take();
+        ends.extend(
+            self.retired.iter().flat_map(|r| &r.leases).filter_map(|s| Some((left_us(s.job)?, s.lent.iter().sum()))),
+        );
+        ends.sort_unstable();
+        let repaid = ends.iter().find_map(|&(us, n)| match n > ahead {
+            true => Some(us),
+            false => {
+                ahead -= n;
+                None
             }
-            Place::Local { .. } | Place::Spread { .. } => owed,
-            Place::Remote { .. } => false,
-        };
-        self.running.iter().filter(holds).map(|r| r.left_us(now)).min()
+        });
+        own.into_iter().chain(repaid).min()
     }
 
     /// Tick every job's jobserver: see `Lease::tick`.
@@ -3877,6 +3903,41 @@ mod test {
         assert_eq!(tokens(&s), (vec![6, 6], vec![0, 0]));
         assert!(s.retired.is_empty());
         drop((slot, s));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_class_owed_tokens_frees_one_when_the_old_jobs_have_given_back_what_comes_first() -> Result<()> {
+        let dir = scratch("switch-owed");
+        let (mut s, _rx, load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room(u64::MAX), &[], &[])?;
+        let names = ["a", "b", "c", "d"];
+        for (name, secs) in names.iter().zip([1, 50, 100, 200]) {
+            history(&mut s, name, secs * 1_000_000, 100);
+        }
+        let slots: Vec<Slot> = place(&mut s, &names, false).iter_mut().map(granted).collect();
+        // Battery has a token on its fast class and one on its slow one;
+        // the old jobs hold four.
+        classes::save(&dir, &Profile::new("battery")?, &[class(1000, &[0]), class(2000, &[1])])?;
+        s.switch_to(Profile::new("battery")?, false)?;
+        let tokens = |s: &Sched| (s.layout.pool.to_vec(), s.layout.owed.to_vec(), s.layout.overdrawn);
+        assert_eq!(tokens(&s), (vec![0, 0], vec![1, 1], 2));
+        let run_us = |s: &Sched, i: usize| s.running.iter().find(|r| r.job == slots[i].job).unwrap().run_us;
+        let near = |got: Option<u64>, want: u64| got.is_some_and(|us| us.abs_diff(want) < 100_000);
+        // The first two tokens back pay what is overdrawn, the third the
+        // fast class, the fourth the slow one.
+        let now = Instant::now();
+        assert!(near(s.frees_in_us(0, now), run_us(&s, 2)), "{:?}", s.frees_in_us(0, now));
+        assert!(near(s.frees_in_us(1, now), run_us(&s, 3)), "{:?}", s.frees_in_us(1, now));
+        s.publish();
+        let shown = load.borrow().classes.iter().map(|c| c.frees_in_ms.unwrap_or(0) as u64 * 1000).collect::<Vec<_>>();
+        assert!(near(Some(shown[0]), run_us(&s, 2)) && near(Some(shown[1]), run_us(&s, 3)), "{shown:?}");
+        s.finished(slots[0].job, &slots[0].unit, None);
+        assert_eq!(tokens(&s), (vec![0, 0], vec![1, 1], 1));
+        let now = Instant::now();
+        assert!(near(s.frees_in_us(0, now), run_us(&s, 2)), "the same jobs bring each class its token");
+        assert!(near(s.frees_in_us(1, now), run_us(&s, 3)));
+        drop((slots, s));
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

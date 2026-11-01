@@ -198,7 +198,10 @@ jobservers, which go away when their last job ends, and are lent no more
 tokens. The tokens they hold are on the same CPUs, so they come off the new
 profile's classes, slowest first, and go back to them, fastest first, as
 those jobs give them back: a switch never runs more than the box's tokens'
-worth of jobs. Switching
+worth of jobs. What they hold beyond the new classes' tokens is paid back
+first, so a class still owed one is predicted to get it when those jobs, in
+the order they are predicted to end, have given back that and what faster
+classes are owed. Switching
 to a profile with no calibration holds new jobs. Once every running job is
 done, the daemon calibrates, saves the result, and resumes. It doesn't try to
 guess whether other work on the box will distort the numbers. Calibrate each
