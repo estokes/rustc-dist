@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
 use compact_str::format_compact;
-use log::{debug, error, info, warn};
+use log::{Level, debug, error, info, log_enabled, warn};
 use netidx::path::Path as NPath;
 use netidx_core::atomic_id;
 use poolshark::local::LPooled;
@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     ffi::CString,
+    fmt::Write as _,
     fs, io, mem,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -843,12 +844,17 @@ impl RemoteBox {
         Some((ms as u64 * 1000).saturating_sub(now.duration_since(self.seen).as_micros() as u64))
     }
 
-    fn usable(&self, p: &Portable) -> Option<&(BoxState, Places)> {
-        let known = self.state.as_ref()?;
+    /// Its state, if it can take `p`, else why not.
+    fn usable(&self, p: &Portable) -> Result<&(BoxState, Places), &'static str> {
+        let known = self.state.as_ref().ok_or("its state hasn't arrived")?;
         let state = &known.0;
-        let ready = self.busy_until.is_none_or(|v| state.version >= v)
-            && state.toolchains.iter().any(|t| t.builds(&p.key, p.target.as_deref()));
-        ready.then_some(known)
+        if self.busy_until.is_some_and(|v| state.version < v) {
+            return Err("it answered busy");
+        }
+        if !state.toolchains.iter().any(|t| t.builds(&p.key, p.target.as_deref())) {
+            return Err("it lacks the toolchain");
+        }
+        Ok(known)
     }
 }
 
@@ -1553,7 +1559,7 @@ impl Sched {
         // jobs don't run here either, so smaller ones can't starve it.
         let mut mem_blocked = false;
         let mut cands: LPooled<Vec<Cand>> = LPooled::take();
-        let mut wide: LPooled<Vec<Wide>> = LPooled::take();
+        let logging = log_enabled!(target: "placement", Level::Debug);
         let mut granted: LPooled<Vec<(usize, Place, u64, PlaceId)>> = LPooled::take();
         let queue_us = |queued: &HashMap<(usize, usize), u64>, r: usize, k: usize| {
             queued.get(&(r, k)).copied().unwrap_or(0)
@@ -1563,23 +1569,24 @@ impl Sched {
             let fits = !mem_blocked && (first_here || w.pred.mem_kb <= mem_free);
             let waits_here = !fits || held.iter().all(|&n| n == 0);
             let fastest_us = self.stats.time_us(&w.pred, self.layout.places.classes[fastest], load_here, 1.);
-            let away = w
-                .portable
-                .as_ref()
-                .filter(|_| !w.pred.known || waits_here || fastest_us >= REMOTE_MIN_US);
-            let links = away.is_some_and(|p| p.links);
-            let picked = if light(&w.pred) {
+            let away = match &w.portable {
+                None => Err("it can't go to another box"),
+                Some(p) if !w.pred.known || waits_here || fastest_us >= REMOTE_MIN_US => Ok(p),
+                Some(_) => Err("it is short and a token is free here"),
+            };
+            let links = away.is_ok_and(|p| p.links);
+            cands.clear();
+            let chosen = if light(&w.pred) {
                 let local = if fits { held.len() } else { 0 };
-                cands.clear();
                 for k in 0..local {
                     let place = Place::Local { layout: id, class: k };
                     let spot = self.spot(&w.pred, w.unit.codegen_units, place);
                     let waits = held[k] == 0;
                     let run_us = self.run_us(&w.pred, &spot, if waits { self.load_c } else { load_here }, waits);
-                    cands.push(Cand { run_us, frees_in_us: frees_in[k], copy_us: 0, spot, place });
+                    cands.push(Cand { start_us: frees_in[k], copy_us: 0, run_us, spot, place, queue: None });
                 }
                 for (r, rb) in self.remotes.iter().enumerate() {
-                    let Some((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
+                    let Ok((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
                     let cpus = state.classes.iter().map(|c| c.cpus as u64).sum();
                     let missing_kb = away.map_or(0, |p| rb.held.missing_kb(&p.inputs));
                     for (k, &at) in places.classes.iter().enumerate() {
@@ -1598,19 +1605,17 @@ impl Sched {
                         let load_c = if waits { state.load_c } else { load_there[r] };
                         let run_us = self.run_us(&w.pred, &spot, load_c, waits);
                         let copy_us = self.stats.copy_us(&w.unit, at, links, missing_kb);
-                        cands.push(Cand { run_us, frees_in_us, copy_us, spot, place });
+                        cands.push(Cand { start_us: frees_in_us, copy_us, run_us, spot, place, queue: None });
                     }
                 }
                 (!cands.is_empty()).then(|| {
                     let slack_us = time_us(horizon[&w.build].saturating_sub(w.rank_mi), fastest_rate);
-                    let c = &cands[choose(&cands, local, slack_us)];
-                    (c.place, c.copy_us + c.run_us, c.spot, None)
+                    choose(&cands, local, slack_us)
                 })
             } else {
                 // Its front end runs first, on one thread, so the short jobs
                 // holding tokens now are gone by the time its codegen wants
                 // them: a box can give it as many threads as it has CPUs.
-                wide.clear();
                 if fits {
                     // Its first token from the fastest class with one, or it
                     // waits for the class that frees first.
@@ -1623,10 +1628,10 @@ impl Sched {
                     let spot = self.spot(&w.pred, w.unit.codegen_units, place);
                     let waits = held[class] == 0;
                     let run_us = self.run_us(&w.pred, &spot, if waits { self.load_c } else { load_here }, waits);
-                    wide.push(Wide { start_us, run_us, spot, queue: None, place });
+                    cands.push(Cand { start_us, copy_us: 0, run_us, spot, place, queue: None });
                 }
                 for (r, rb) in self.remotes.iter().enumerate() {
-                    let Some((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
+                    let Ok((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
                     let cpus = state.classes.iter().map(|c| c.cpus as u64).sum();
                     let place = Place::Remote { remote: r, class: None, shown_in: None };
                     let spot = Spot::new(&w.pred, w.unit.codegen_units, places.all, false, cpus);
@@ -1646,19 +1651,19 @@ impl Sched {
                         false => None,
                     };
                     if let Some((start_us, queue)) = start {
-                        wide.push(Wide { start_us, run_us: copy_us + run_us, spot, queue, place });
+                        cands.push(Cand { start_us, copy_us, run_us, spot, place, queue });
                     }
                 }
-                (!wide.is_empty()).then(|| {
-                    let c = &wide[pick_wide(&wide, w.pred.known)];
-                    (c.place, c.run_us, c.spot, c.queue)
-                })
+                (!cands.is_empty()).then(|| pick_wide(&cands, w.pred.known))
             };
-            let Some((place, run_us, spot, queue)) = picked else {
+            let Some(chosen) = chosen else {
                 mem_blocked = true;
                 self.starved = true;
                 continue;
             };
+            let c = &cands[chosen];
+            let (place, run_us, spot, queue) = (c.place, c.copy_us + c.run_us, c.spot, c.queue);
+            let line = logging.then(|| self.placement(w, fastest_us, fits, away, &cands, chosen));
             if place.here() {
                 // Memory is kept for a job waiting for a token too, so it
                 // fits when one frees.
@@ -1690,6 +1695,9 @@ impl Sched {
                     let unseen = &mut self.remotes[remote].unseen_left_us;
                     *unseen = Some(unseen.map_or(run_us, |t| t.min(run_us)));
                     load_there[remote] += spot.adds;
+                    if let Some(line) = line {
+                        debug!(target: "placement", "{}", line.as_str());
+                    }
                     granted.push((i, place, run_us, spot.at));
                 }
                 Place::Local { class, .. } | Place::Spread { class, .. } if held[class] == 0 => {
@@ -1707,6 +1715,9 @@ impl Sched {
                         frees_in[class] = self.frees_in_us(class, now).map_or(placed, |t| t.min(placed));
                     }
                     load_here += spot.adds;
+                    if let Some(line) = line {
+                        debug!(target: "placement", "{}", line.as_str());
+                    }
                     granted.push((i, place, run_us, spot.at));
                 }
             }
@@ -1731,6 +1742,55 @@ impl Sched {
                 Place::Remote { remote, class, .. } => self.send_remote(w, remote, class, at, run_us, now),
             }
         }
+    }
+
+    /// Where `w` goes and why: its prediction; each place it could go, with
+    /// the seconds until a slot, moving its files and running there, the
+    /// one it takes starred; and why it couldn't go anywhere else.
+    fn placement(
+        &self,
+        w: &Waiting,
+        fastest_us: u64,
+        fits: bool,
+        away: Result<&Portable, &str>,
+        cands: &[Cand],
+        chosen: usize,
+    ) -> LPooled<String> {
+        let mut line: LPooled<String> = LPooled::take();
+        let s = |us: u64| us as f64 / 1e6;
+        let history = if w.pred.known { "history" } else { "no history" };
+        let _ = write!(line, "{} ({history}, {:.2} s on the fastest class here):", w.unit.exact, s(fastest_us));
+        for (i, c) in cands.iter().enumerate() {
+            let star = if i == chosen { "*" } else { "" };
+            let _ = match c.place {
+                Place::Local { class, .. } => write!(line, " {star}here/{class}"),
+                Place::Spread { .. } => write!(line, " {star}here/all"),
+                Place::Remote { remote, class: Some(k), .. } => write!(line, " {star}{}/{k}", self.remotes[remote].name),
+                Place::Remote { remote, class: None, .. } => write!(line, " {star}{}/all", self.remotes[remote].name),
+            };
+            let _ = write!(line, " {:.2}+{:.2}+{:.2}", s(c.start_us), s(c.copy_us), s(c.run_us));
+        }
+        if !fits {
+            line.push_str("; not here: its memory doesn't fit");
+        }
+        match away {
+            Err(why) => {
+                let _ = write!(line, "; no other box: {why}");
+            }
+            Ok(p) => {
+                for (r, rb) in self.remotes.iter().enumerate() {
+                    let why = match rb.usable(p) {
+                        Err(why) => why,
+                        Ok(_) if cands.iter().any(|c| matches!(c.place, Place::Remote { remote, .. } if remote == r)) => {
+                            continue;
+                        }
+                        Ok(_) => "no token free, and none worth waiting for",
+                    };
+                    let _ = write!(line, "; not {}: {why}", rb.name);
+                }
+            }
+        }
+        line
     }
 
     /// While jobs wait here, send a heartbeat to each box that has a token
@@ -2067,16 +2127,23 @@ impl Sched {
     }
 }
 
-/// Somewhere a light job could run.
+/// Somewhere a job could run.
 struct Cand {
-    /// µs it would run there.
-    run_us: u64,
-    /// µs until it has a slot.
-    frees_in_us: u64,
-    /// µs a job sent there spends other than compiling.
+    /// µs until it has a slot, then moving its files, then running.
+    start_us: u64,
     copy_us: u64,
+    run_us: u64,
     spot: Spot,
     place: Place,
+    /// The class of another box whose next free token a heavy job would
+    /// wait for.
+    queue: Option<usize>,
+}
+
+impl Cand {
+    fn finish_us(&self) -> u64 {
+        self.start_us + self.copy_us + self.run_us
+    }
 }
 
 /// Where a light job runs. The first `local` candidates are this box's
@@ -2088,14 +2155,14 @@ struct Cand {
 /// boxes, which are spare capacity: the job goes to one if it finishes
 /// there sooner than on its local choice.
 fn choose(cands: &[Cand], local: usize, slack_us: u64) -> usize {
-    let finish = |c: &Cand| c.frees_in_us + c.copy_us + c.run_us;
+    let finish = Cand::finish_us;
     let here = &cands[..local];
     let first = here.iter().map(finish).min().unwrap_or(0);
     let deadline = first + slack_us;
     let slowest = |free_only: bool| {
         here.iter()
             .enumerate()
-            .filter(|(_, c)| finish(c) <= deadline && (!free_only || c.frees_in_us == 0))
+            .filter(|(_, c)| finish(c) <= deadline && (!free_only || c.start_us == 0))
             .max_by(|(i, a), (j, b)| a.run_us.cmp(&b.run_us).then(j.cmp(i)))
             .map(|(i, _)| i)
     };
@@ -2107,24 +2174,14 @@ fn choose(cands: &[Cand], local: usize, slack_us: u64) -> usize {
     }
 }
 
-/// Somewhere a heavy job could run: this box, or another, on every CPU.
-struct Wide {
-    /// µs until it could start, and until it would finish after that.
-    start_us: u64,
-    run_us: u64,
-    spot: Spot,
-    /// The class of another box whose next free token it would wait for.
-    queue: Option<usize>,
-    place: Place,
-}
-
-/// Where a heavy job runs: where it finishes soonest. A job with no history
-/// has no size to say waiting pays, so it goes where it finishes soonest of
-/// the places with a token free, else waits for this box's.
-fn pick_wide(cands: &[Wide], known: bool) -> usize {
+/// Where a heavy job runs, on every CPU of this box or another: where it
+/// finishes soonest. A job with no history has no size to say waiting
+/// pays, so it goes where it finishes soonest of the places with a token
+/// free, else waits for this box's.
+fn pick_wide(cands: &[Cand], known: bool) -> usize {
     let soonest = |free_only: bool| {
         let open = cands.iter().enumerate().filter(|(_, c)| !free_only || c.start_us == 0);
-        open.min_by_key(|(_, c)| c.start_us + c.run_us).map(|(i, _)| i)
+        open.min_by_key(|(_, c)| c.finish_us()).map(|(i, _)| i)
     };
     let free = if known { None } else { soonest(true) };
     free.or_else(|| soonest(false)).unwrap_or(0)
@@ -2168,9 +2225,9 @@ mod test {
         Spot { at: Stats::new(Decay::default()).place("t/0", 1, 1), threads: 1., adds: 0 }
     }
 
-    fn local(run_us: u64, frees_in_us: u64) -> Cand {
+    fn local(run_us: u64, start_us: u64) -> Cand {
         let place = Place::Local { layout: LayoutId::new(), class: 0 };
-        Cand { run_us, frees_in_us, copy_us: 0, spot: spot(), place }
+        Cand { start_us, copy_us: 0, run_us, spot: spot(), place, queue: None }
     }
 
     #[test]
@@ -2203,8 +2260,9 @@ mod test {
 
     #[test]
     fn heavy_jobs_go_where_they_finish_first() {
-        let wide = |start_us, run_us, here: bool| Wide {
+        let wide = |start_us, run_us, here: bool| Cand {
             start_us,
+            copy_us: 0,
             run_us,
             spot: spot(),
             queue: None,
@@ -2834,6 +2892,42 @@ mod test {
             Ok(Admission::Remote(r)) => assert_eq!(r.jobs, NPath::from("/farm/c/jobs")),
             _ => bail!("not sent"),
         }
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_placement_line_says_where_a_job_could_go_and_why_not_elsewhere() -> Result<()> {
+        let dir = scratch("placement-line");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], room(u64::MAX), &[], &[])?;
+        for (name, toolchain) in [("b", true), ("c", false)] {
+            let (jobs, mut state) = remote_box(200, 4, 4, 1);
+            if !toolchain {
+                state.toolchains.clear();
+            }
+            s.farm(name.into(), Some((jobs, state)));
+        }
+        let (reply, _rx) = oneshot::channel();
+        s.submit(unit("job", &[]), 1, want(), reply);
+        let (reply, _rx) = oneshot::channel();
+        s.submit(unit("stays", &[]), 1, None, reply);
+        let cand = |start_us, copy_us, run_us, place| Cand { start_us, copy_us, run_us, spot: spot(), place, queue: None };
+        let here = Place::Spread { layout: s.layout.id, class: 0 };
+        let b = Place::Remote { remote: 0, class: None, shown_in: None };
+        let cands = [cand(0, 0, 5_000_000, here), cand(250_000, 400_000, 1_000_000, b)];
+        let (job, stays) = (&s.queue[0], &s.queue[1]);
+        let away = job.portable.as_ref().context("portable")?;
+        assert_eq!(
+            s.placement(job, 1_000_000, true, Ok(away), &cands, 1).as_str(),
+            "job (no history, 1.00 s on the fastest class here): here/all 0.00+0.00+5.00 *b/all 0.25+0.40+1.00; \
+             not c: it lacks the toolchain"
+        );
+        assert_eq!(
+            s.placement(stays, 1_000_000, false, Err("it can't go to another box"), &cands[1..], 0).as_str(),
+            "stays (no history, 1.00 s on the fastest class here): *b/all 0.25+0.40+1.00; \
+             not here: its memory doesn't fit; no other box: it can't go to another box"
+        );
         drop(s);
         fs::remove_dir_all(&dir)?;
         Ok(())
