@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
-pub const PROTOCOL: u32 = 15;
+pub const PROTOCOL: u32 = 16;
 const MAX_MSG: usize = 1 << 24;
 
 /// What the scheduler knows a compile by. Job history is kept under

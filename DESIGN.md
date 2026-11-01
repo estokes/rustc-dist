@@ -295,10 +295,12 @@ box already holds, such as crates it just built, is cheap to send there:
   200 ms, each adjusted for the kB the box lacks now against the kB that send
   moved, at the place's µs per kB: the weighted median of the slopes between
   pairs of those 64 whose kB differ by at least 256 kB (Theil-Sen), with
-  50 MB/s as one more slope.
+  50 MB/s as one more slope. kB are counted before compression, so a place's
+  µs per kB takes in how well what crosses compresses.
 - While jobs wait here, a box with a token free that has run nothing from here
   and had no heartbeat for a minute gets one: half a MB or a MB, in turn, of
-  bytes no box holds, which the box answers and drops. Its time, connecting
+  the start of the rustc-dist binary, which compresses about as object code
+  does, and which the box answers and drops. Its time, connecting
   included, is a send of each kind there, so a box whose recent sends judged
   it badly gets fresh samples though no job goes. A heartbeat takes no token
   and runs nothing.
@@ -444,7 +446,7 @@ work, so build times say nothing yet; placement is all that was checked.
 ### Farm
 
 A daemon whose config has `base` (say `/build`) joins the farm. The farm's
-netidx namespace is under the protocol version, `BASE/vN` (`/build/v15`), so
+netidx namespace is under the protocol version, `BASE/vN` (`/build/v16`), so
 boxes of different versions never see each other:
 
 - `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
@@ -565,7 +567,12 @@ by default; a tmpfs keeps it in memory), evicting the least recently used past
 `cache_gb` down to 90% of it, except blobs a running job reads, which are
 pinned from its manifest until it ends. The client sends a manifest of paths and hashes; the server
 answers with the hashes it lacks; the client sends those in 1 MB chunks and
-the server checks each blob's hash before storing it. A blob another job's
+the server checks each blob's hash before storing it. Each chunk goes
+compressed with zstd at the sender's `compression_level` (1 by default, 0 for
+none) when that makes it smaller, and is stored as it was; outputs come back
+the same way at the server's level. On graphix's rlibs, rmetas and sources on
+2026-11-01, level 1 took rlibs to a fifth and the rest to a third, level 3
+did 8% better on rlibs, and a dictionary trained on rmetas gained nothing. A blob another job's
 client is already sending isn't asked for again: the job waits for it, before
 rustc starts if it needs it then, or behind a stand-in if it is a late rlib.
 If that upload fails, so does the job, and its client builds it. On
@@ -666,7 +673,8 @@ Config is real TOML (`toml` + serde), parsed into two separate structs.
   publishes under), `name` (the host name without its domain by default), `bind` (where other
   boxes reach this one, in netidx's syntax, since netidx's default is often
   loopback only), `cache_dir`, `cache_gb`, `remote_links` (on by default),
-  and `half_life_s` and `copy_half_life_s` (see Cost).
+  `half_life_s` and `copy_half_life_s` (see Cost), and `compression_level`
+  (see Farm).
   Classes live per profile in `~/.local/state/rustc-dist/profiles/`; edit
   those to override them. The netidx config is netidx's own (`NETIDX_CFG` or
   its default paths).
@@ -1068,6 +1076,7 @@ Every number below is a guess. None has been tested on an idle box.
 | heartbeat to an idle box while jobs wait, at most every | 60 s | `src/sched.rs` `HEARTBEAT_EVERY` |
 | runs count half toward speed and size after | 1 day | `half_life_s` in the config |
 | sent runs count half toward time moving files after | 1 hour | `copy_half_life_s` in the config |
+| zstd level for what a box sends | 1 | `compression_level` in the config |
 | load buckets, runnable tasks per CPU | 0, ¼, ½, ¾, 1, 1½, 2, 3, 4, 6, 8 | `src/stats.rs` `BUCKETS` |
 | republish load alone once it moves | ¼ task per CPU | `src/sched.rs` `LOAD_STEP_C` |
 | a load sample counts `1/e` as much after | 10 s | `src/sched.rs` `LOAD_TAU` |

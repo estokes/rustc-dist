@@ -2,7 +2,7 @@ use crate::{
     blobs::{self, Claim, Coming, Hash, Store, Upload},
     link::{self, Gate},
     protocol::{self, Front, Ran},
-    remote::{self, CHUNK, FileEntry, FromServer, Late, Rlib, SYSTEM, ToServer},
+    remote::{self, CHUNK, FileEntry, FromServer, Late, Packed, Rlib, SYSTEM, ToServer},
     sched::{Answer, Msg, Slot},
     sys,
     toolchain::Installed,
@@ -63,15 +63,23 @@ pub struct Server {
     /// The stand-in linker, which waits for late rlibs.
     stand_in: PathBuf,
     next_job: AtomicU64,
+    /// The zstd level it compresses outputs at, 0 for none.
+    level: i32,
 }
 
 impl Server {
-    pub fn new(store: Store, jobs_dir: PathBuf, toolchains: Vec<Installed>, tx: mpsc::UnboundedSender<Msg>) -> Result<Self> {
+    pub fn new(
+        store: Store,
+        jobs_dir: PathBuf,
+        toolchains: Vec<Installed>,
+        tx: mpsc::UnboundedSender<Msg>,
+        level: i32,
+    ) -> Result<Self> {
         let _ = fs::remove_dir_all(&jobs_dir);
         fs::create_dir_all(&jobs_dir).with_context(|| format_compact!("creating {}", jobs_dir.display()))?;
         let stand_in = jobs_dir.join("linker");
         link::write_stand_in_linker(&stand_in)?;
-        Ok(Self { store, jobs_dir, toolchains, tx, stand_in, next_job: AtomicU64::new(0) })
+        Ok(Self { store, jobs_dir, toolchains, tx, stand_in, next_job: AtomicU64::new(0), level })
     }
 }
 
@@ -120,7 +128,10 @@ pub async fn listen(publisher: Publisher, path: NPath, server: Arc<Server>) -> R
 pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
     let (unit, key, target, class) = match con.recv_one().await? {
         ToServer::Offer { unit, key, target, class } => (unit, key, target, class),
-        ToServer::Heartbeat(_) => return con.send_one(&FromServer::Heartbeat).await,
+        ToServer::Heartbeat(data) => {
+            data.unpack()?;
+            return con.send_one(&FromServer::Heartbeat).await;
+        }
         m => bail!("expected an offer, got {m:?}"),
     };
     let Some(tc) = server.toolchains.iter().find(|t| t.toolchain.builds(&key, target.as_deref())) else {
@@ -245,7 +256,7 @@ async fn job(server: &Server, con: &Connection, tc: &Installed, slot: &Slot) -> 
             Some((Gate::new()?, async { futures::try_join!(sent, others).map(|_| ()) }))
         }
     };
-    run(con, store, cmd, &root.0, slot, late).await
+    run(con, store, cmd, &root.0, slot, late, server.level).await
 }
 
 /// Receive chunks until every blob in `need` is stored, telling `stored`
@@ -268,7 +279,7 @@ async fn receive(
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(store.upload(hash)?),
         };
-        up.write(&data)?;
+        up.write(&data.unpack()?)?;
         if last {
             uploads.remove(&hash).expect("present").finish(store)?;
             need.remove(&hash);
@@ -425,6 +436,7 @@ async fn run(
     root: &Path,
     slot: &Slot,
     late: Option<(Gate, impl Future<Output = Result<()>>)>,
+    level: i32,
 ) -> Result<Option<(Ran, u64)>> {
     let (mut gate, arrive) = late.unzip();
     let cpus = slot.grant.cpus.clone();
@@ -499,7 +511,7 @@ async fn run(
                             let wall_us = start.elapsed().as_micros() as u64;
                             front = Some(Front { wall_us });
                         }
-                        send_artifact(con, store, root, &line).await?;
+                        send_artifact(con, store, root, &line, level).await?;
                     }
                     con.send_one(&FromServer::Stderr(line)).await?;
                 }
@@ -536,7 +548,7 @@ struct Artifact {
 
 /// Send the file an artifact line names, before the line. A crate file
 /// stays in the store for jobs that read it later.
-async fn send_artifact(con: &Connection, store: &Store, root: &Path, line: &[u8]) -> Result<()> {
+async fn send_artifact(con: &Connection, store: &Store, root: &Path, line: &[u8], level: i32) -> Result<()> {
     let a: Artifact = serde_json::from_slice(line).context("artifact line")?;
     check(&a.artifact)?;
     let host = root.join(&a.artifact[1..]);
@@ -549,7 +561,7 @@ async fn send_artifact(con: &Connection, store: &Store, root: &Path, line: &[u8]
         let n = file.read(&mut buf)?;
         let last = n < buf.len();
         hasher.update(&buf[..n]);
-        let data = Bytes::copy_from_slice(&buf[..n]);
+        let data = Packed::pack(&buf[..n], level);
         con.send_one(&FromServer::Output { path: path.clone(), mode, data, last }).await?;
         if last {
             break;

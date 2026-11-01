@@ -51,6 +51,9 @@ pub struct Config {
     /// after this many seconds. Shorter, since the network a laptop is on
     /// changes as it moves.
     pub copy_half_life_s: u64,
+    /// The zstd level this box compresses what it sends at, 0 for none.
+    /// Low levels cost little CPU and take rlibs to about a fifth.
+    pub compression_level: i32,
 }
 
 impl Default for Config {
@@ -67,6 +70,7 @@ impl Default for Config {
             remote_links: true,
             half_life_s: Decay::default().half_life_s as u64,
             copy_half_life_s: Decay::default().copy_half_life_s as u64,
+            compression_level: 1,
         }
     }
 }
@@ -138,6 +142,9 @@ pub fn load() -> Result<Config> {
     }
     if cfg.half_life_s < 60 || cfg.copy_half_life_s < 60 {
         bail!("{}: half_life_s and copy_half_life_s must be at least 60", path.display());
+    }
+    if !(0..=19).contains(&cfg.compression_level) {
+        bail!("{}: compression_level must be in [0, 19]", path.display());
     }
     Ok(cfg)
 }

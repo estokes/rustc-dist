@@ -58,11 +58,55 @@ pub enum ToServer {
     Offer { unit: Unit, key: ArcStr, target: Option<ArcStr>, class: Option<u32> },
     /// `files` are in place before rustc starts; `late` rlibs may follow.
     Manifest { files: Vec<FileEntry>, dirs: Vec<ArcStr>, late: Option<Late> },
-    Chunk { hash: Hash, data: Bytes, last: bool },
+    Chunk { hash: Hash, data: Packed, last: bool },
     Run { args: Vec<ArcStr>, env: Vec<(ArcStr, ArcStr)>, cwd: ArcStr },
     /// Instead of an offer: bytes to time a send by, which the server
     /// answers and drops.
-    Heartbeat(Bytes),
+    Heartbeat(Packed),
+}
+
+/// A chunk of a file as sent: as it is, or compressed with zstd when that
+/// makes it smaller.
+#[derive(Debug, Clone, Pack)]
+pub enum Packed {
+    Raw(Bytes),
+    Zstd(Bytes),
+}
+
+impl Packed {
+    /// `data`, compressed at `level` if that makes it smaller; as it is at
+    /// level 0.
+    pub fn pack(data: &[u8], level: i32) -> Self {
+        if level > 0
+            && let Ok(z) = zstd::bulk::compress(data, level)
+            && z.len() < data.len()
+        {
+            return Packed::Zstd(z.into());
+        }
+        Packed::Raw(Bytes::copy_from_slice(data))
+    }
+
+    /// Its size as sent.
+    pub fn wire_len(&self) -> usize {
+        match self {
+            Packed::Raw(b) | Packed::Zstd(b) => b.len(),
+        }
+    }
+
+    /// The bytes it carries, at most a `CHUNK`.
+    pub fn unpack(self) -> Result<Bytes> {
+        match self {
+            Packed::Raw(b) => Ok(b),
+            Packed::Zstd(z) => Ok(zstd::bulk::decompress(&z, CHUNK).context("decompressing a chunk")?.into()),
+        }
+    }
+}
+
+/// Bytes sent: of files, and as sent.
+#[derive(Default)]
+pub struct Sent {
+    pub raw: AtomicU64,
+    pub wire: AtomicU64,
 }
 
 #[derive(Debug, Pack)]
@@ -78,7 +122,7 @@ pub enum FromServer {
     /// One line of rustc's stderr. An artifact line comes after the file
     /// it names.
     Stderr(Bytes),
-    Output { path: ArcStr, mode: u32, data: Bytes, last: bool },
+    Output { path: ArcStr, mode: u32, data: Packed, last: bool },
     /// `ran` and `measured` are the server's measurements, whatever the
     /// code, and `linker_waited_us` how long its linker waited for late
     /// rlibs.
@@ -386,8 +430,9 @@ struct Exited {
 
 /// What moving a job's files took that compiling didn't.
 pub struct Moved {
-    /// Of inputs sent.
+    /// Of inputs sent, and those bytes as sent.
     pub bytes: u64,
+    pub wire_bytes: u64,
     /// How long the linker waited for rlibs still on their way.
     pub linker_waited_us: u64,
     /// The crate files the server holds after the job, by hash with their
@@ -395,8 +440,10 @@ pub struct Moved {
     pub kept: Vec<(Hash, u64)>,
 }
 
-/// Run a staged job on the box listening at `jobs`. `sink` gets rustc's
-/// output as it arrives. The hashes of the outputs go in `hashes`.
+/// Run a staged job on the box listening at `jobs`, compressing what it
+/// sends at `level`. `sink` gets rustc's output as it arrives. The hashes
+/// of the outputs go in `hashes`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     subscriber: &Subscriber,
     jobs: NPath,
@@ -404,6 +451,7 @@ pub async fn run(
     job: &Job,
     staged: &Staged,
     hashes: &Hashes,
+    level: i32,
     mut sink: impl FnMut(Event) -> Result<()>,
 ) -> Result<Outcome> {
     let con = match time::timeout(Duration::from_secs(10), Connection::connect(subscriber, jobs.clone())).await {
@@ -428,16 +476,16 @@ pub async fn run(
         FromServer::Failed(why) => bail!("{why}"),
         m => bail!("unexpected {m:?}"),
     };
-    let sent = AtomicU64::new(0);
+    let sent = Sent::default();
     let mut buf = vec![0u8; CHUNK];
     for hash in now {
-        send_blob(&con, staged, hash, &mut buf, &sent).await.context("sending inputs")?;
+        send_blob(&con, staged, hash, &mut buf, level, &sent).await.context("sending inputs")?;
     }
     con.send_one(&ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
     con.flush().await.context("starting rustc")?;
     let mut sending = pin!(async {
         for hash in later {
-            send_blob(&con, staged, hash, &mut buf, &sent).await?;
+            send_blob(&con, staged, hash, &mut buf, level, &sent).await?;
         }
         Ok::<_, anyhow::Error>(())
     });
@@ -460,24 +508,20 @@ pub async fn run(
         }
     };
     let kept = staged.crates().chain(built).collect();
-    let moved = Moved { bytes: sent.load(Ordering::Relaxed), linker_waited_us, kept };
+    let (bytes, wire_bytes) = (sent.raw.load(Ordering::Relaxed), sent.wire.load(Ordering::Relaxed));
+    let moved = Moved { bytes, wire_bytes, linker_waited_us, kept };
     Ok(Outcome::Exit { code, ran, measured, moved })
 }
 
-/// Send `kb` of bytes no box holds to the box listening at `jobs`, and
+/// Send `kb` of this program's own code, which compresses about as object
+/// files do, to the box listening at `jobs`, compressed at `level`, and
 /// return how many µs that took, connecting included, as sending a job's
 /// files does.
-pub async fn heartbeat(subscriber: &Subscriber, jobs: NPath, kb: u64) -> Result<u64> {
-    let mut x = std::process::id() as u64 ^ (kb << 32) ^ 0x9e37_79b9_7f4a_7c15;
-    let data: Bytes = (0..kb * 1024)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect::<Vec<u8>>()
-        .into();
+pub async fn heartbeat(subscriber: &Subscriber, jobs: NPath, kb: u64, level: i32) -> Result<u64> {
+    let exe = File::open("/proc/self/exe").context("opening this program")?;
+    let mut data = Vec::with_capacity(CHUNK);
+    exe.take((kb * 1024).min(CHUNK as u64)).read_to_end(&mut data)?;
+    let data = Packed::pack(&data, level);
     let start = Instant::now();
     let con = Connection::connect(subscriber, jobs.clone()).await.context("connecting")?;
     con.send_one(&ToServer::Heartbeat(data))?;
@@ -488,16 +532,25 @@ pub async fn heartbeat(subscriber: &Subscriber, jobs: NPath, kb: u64) -> Result<
     }
 }
 
-/// Send the blob `hash`, adding its size to `sent`.
-pub async fn send_blob(con: &Connection, staged: &Staged, hash: Hash, buf: &mut [u8], sent: &AtomicU64) -> Result<()> {
+/// Send the blob `hash` compressed at `level`, adding its size to `sent`.
+pub async fn send_blob(
+    con: &Connection,
+    staged: &Staged,
+    hash: Hash,
+    buf: &mut [u8],
+    level: i32,
+    sent: &Sent,
+) -> Result<()> {
     let path = staged.blobs.get(&hash).with_context(|| format_compact!("server asked for unknown {hash}"))?;
     let mut file = File::open(path.as_str()).with_context(|| format_compact!("opening {path}"))?;
     loop {
         let n = file.read(buf)?;
         let last = n < buf.len();
-        con.send_one(&ToServer::Chunk { hash, data: Bytes::copy_from_slice(&buf[..n]), last })?;
+        let data = Packed::pack(&buf[..n], level);
+        sent.wire.fetch_add(data.wire_len() as u64, Ordering::Relaxed);
+        con.send_one(&ToServer::Chunk { hash, data, last })?;
         con.flush().await?;
-        sent.fetch_add(n as u64, Ordering::Relaxed);
+        sent.raw.fetch_add(n as u64, Ordering::Relaxed);
         if last {
             return Ok(());
         }
@@ -536,6 +589,7 @@ async fn receive(
     loop {
         match next(con).await? {
             FromServer::Output { path, mode, data, last } => {
+                let data = data.unpack()?;
                 if writing.is_none() {
                     let dest = PathBuf::from(path.as_str());
                     if !staged.outputs.iter().any(|o| dest.parent() == Some(o.as_path())) {
@@ -578,6 +632,35 @@ async fn receive(
 mod test {
     use super::*;
     use crate::argv::{self, Invocation};
+
+    #[test]
+    fn a_chunk_is_compressed_only_when_that_makes_it_smaller() -> Result<()> {
+        let text: Vec<u8> = (0..CHUNK).map(|i| b"fn main() {}\n"[i % 13]).collect();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let noise: Vec<u8> = (0..CHUNK)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        for (data, level, zstd) in [(&text, 1, true), (&text, 0, false), (&noise, 1, false), (&noise, 3, false)] {
+            let packed = Packed::pack(data, level);
+            assert_eq!(matches!(packed, Packed::Zstd(_)), zstd, "level {level}");
+            assert!(packed.wire_len() <= data.len());
+            assert_eq!(packed.unpack()?.as_ref(), data.as_slice());
+        }
+        assert!(Packed::pack(&text, 1).wire_len() < CHUNK / 100);
+        Ok(())
+    }
+
+    #[test]
+    fn a_chunk_that_unpacks_past_a_chunk_is_refused() {
+        let big = vec![0u8; CHUNK + 1];
+        let z = zstd::bulk::compress(&big, 1).unwrap();
+        assert!(Packed::Zstd(z.into()).unpack().is_err());
+    }
 
     #[test]
     fn absolute_resolves_dots() {

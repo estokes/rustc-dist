@@ -48,6 +48,7 @@ struct Ctx {
     /// Present when this box is part of a farm.
     subscriber: Option<Subscriber>,
     remote_links: bool,
+    compression_level: i32,
 }
 
 pub async fn run() -> Result<()> {
@@ -101,7 +102,7 @@ pub async fn run() -> Result<()> {
         },
     };
     if let Some(subscriber) = subscriber.clone() {
-        tokio::spawn(send_heartbeats(subscriber, heartbeat_rx, tx.clone()));
+        tokio::spawn(send_heartbeats(subscriber, heartbeat_rx, tx.clone(), cfg.compression_level));
     }
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let ctx = Arc::new(Ctx {
@@ -111,6 +112,7 @@ pub async fn run() -> Result<()> {
         hashes,
         subscriber,
         remote_links: cfg.remote_links,
+        compression_level: cfg.compression_level,
     });
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -172,7 +174,7 @@ async fn join(
     let toolchains = installed.iter().map(|t| t.toolchain.clone()).collect();
     config::make_private_dir(&cfg.cache_dir)?;
     let store = Store::open(cfg.cache_dir.join("blobs"), cfg.cache_gb << 30)?;
-    let server = Arc::new(Server::new(store, cfg.cache_dir.join("jobs"), installed, tx.clone())?);
+    let server = Arc::new(Server::new(store, cfg.cache_dir.join("jobs"), installed, tx.clone(), cfg.compression_level)?);
     tokio::spawn(sandbox::listen(publisher.clone(), farm::jobs_path(&base, &name), server).await?);
     let status = browser::run(
         publisher.clone(),
@@ -307,11 +309,12 @@ async fn send_heartbeats(
     subscriber: Subscriber,
     mut asks: mpsc::UnboundedReceiver<Heartbeat>,
     tx: mpsc::UnboundedSender<Msg>,
+    level: i32,
 ) {
     while let Some(Heartbeat { name, jobs, kb }) = asks.recv().await {
         let (subscriber, tx) = (subscriber.clone(), tx.clone());
         tokio::spawn(async move {
-            match remote::heartbeat(&subscriber, jobs, kb).await {
+            match remote::heartbeat(&subscriber, jobs, kb, level).await {
                 Ok(us) => {
                     debug!("heartbeat of {kb} kB to {name} took {} ms", us / 1000);
                     let _ = tx.send(Msg::Heartbeat { name, kb, us });
@@ -425,7 +428,8 @@ async fn run_remote(
     let staged = task::block_in_place(|| remote::stage(job, &r.crates, &ctx.hashes))?;
     let offer = ToServer::Offer { unit: r.unit().clone(), key: r.key.clone(), target: r.target.clone(), class: r.class };
     let (etx, mut events) = mpsc::unbounded_channel();
-    let running = remote::run(subscriber, r.jobs.clone(), offer, job, &staged, &ctx.hashes, |ev| {
+    let level = ctx.compression_level;
+    let running = remote::run(subscriber, r.jobs.clone(), offer, job, &staged, &ctx.hashes, level, |ev| {
         etx.send(ev).map_err(|_| anyhow!("daemon connection gone"))
     });
     tokio::pin!(running);
@@ -464,7 +468,7 @@ async fn run_remote(
     }
     drop(handle);
     match outcome {
-        Ok(Outcome::Exit { code: 0, ran, measured, moved: Moved { bytes, linker_waited_us, kept } }) => {
+        Ok(Outcome::Exit { code: 0, ran, measured, moved: Moved { bytes, wire_bytes, linker_waited_us, kept } }) => {
             for (stderr, data) in held {
                 protocol::send_async(sock, buf, &Reply::Output { stderr, data }).await?;
             }
@@ -473,12 +477,13 @@ async fn run_remote(
             let links = job.reads != Reads::Metadata;
             let transfer = Transfer { sent_kb: bytes / 1024, copy_ms: copy_us / 1000, links };
             info!(
-                "{} on {}: compiled in {} ms, moving files took {} ms ({} kB sent, linker waited {} ms)",
+                "{} on {}: compiled in {} ms, moving files took {} ms ({} kB sent as {} kB, linker waited {} ms)",
                 r.unit().exact,
                 r.jobs,
                 ran.wall_us / 1000,
                 transfer.copy_ms,
                 transfer.sent_kb,
+                wire_bytes / 1024,
                 linker_waited_us / 1000
             );
             r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer, kept }));

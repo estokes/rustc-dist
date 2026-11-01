@@ -197,6 +197,7 @@ so start with a clean target directory.
 | `cache_dir` | `~/.cache/rustc-dist` | other boxes' inputs and builds; keep it on one file system |
 | `cache_gb` | 20 | cache size; the least recently used go first |
 | `remote_links` | `true` | send jobs that link (binaries, tests, proc macros) to other boxes |
+| `compression_level` | 1 | zstd level for files this box sends, 0 for none |
 | `tokens_per_cpu` | 1.5 | jobserver tokens per CPU |
 | `compressed_swap_share` | 0.5 | share of compressed swap that predicted job memory may fill beyond RAM |
 | `calibration_seconds` | 60 | how long calibration runs |

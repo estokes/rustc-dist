@@ -7,7 +7,7 @@ use crate::{
     classes::{self, Class, Profile},
     farm::Load,
     protocol::{Job, Reads, Unit},
-    remote::{self, CHUNK, Event, FromServer, Moved, Outcome, ToServer},
+    remote::{self, CHUNK, Event, FromServer, Moved, Outcome, Sent, ToServer},
     sandbox::{self, Server},
     sched::{Msg, Sched, Setup},
     stats::Decay,
@@ -22,7 +22,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, atomic::AtomicU64},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -43,6 +43,9 @@ impl Drop for ServerBox {
         let _ = self.tx.send(Msg::Drain);
     }
 }
+
+/// The zstd level both sides compress at.
+const LEVEL: i32 = 1;
 
 async fn server(dir: &Path) -> Result<ServerBox> {
     let net = InternalOnly::new().await?;
@@ -66,7 +69,7 @@ async fn server(dir: &Path) -> Result<ServerBox> {
     tokio::spawn(Sched::new(setup, Profile::DEFAULT, load, tx.clone())?.run(rx));
     let store_dir = dir.join("blobs");
     let store = Store::open(store_dir.clone(), 1 << 30)?;
-    let server = Arc::new(Server::new(store, dir.join("jobs"), toolchain::installed(), tx.clone())?);
+    let server = Arc::new(Server::new(store, dir.join("jobs"), toolchain::installed(), tx.clone(), LEVEL)?);
     let jobs = NPath::from("/test/rustc-dist/b/jobs");
     tokio::spawn(sandbox::listen(net.publisher().clone(), jobs.clone(), server).await?);
     Ok(ServerBox { subscriber: net.subscriber().clone(), _net: net, jobs, tx, store_dir })
@@ -164,7 +167,7 @@ async fn send(
     let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
     let offer = ToServer::Offer { unit: unit.clone(), key, target: None, class };
     let mut events = Vec::new();
-    let outcome = remote::run(&b.subscriber, b.jobs.clone(), offer, job, &staged, hashes, |ev| {
+    let outcome = remote::run(&b.subscriber, b.jobs.clone(), offer, job, &staged, hashes, LEVEL, |ev| {
         events.push(ev);
         Ok(())
     })
@@ -187,15 +190,15 @@ async fn send_late(b: &ServerBox, (job, unit): &(Job, Unit), crates: &[ArcStr], 
     con.flush().await?;
     let FromServer::Need { now, later } = con.recv_one().await? else { bail!("expected need") };
     assert!(!later.is_empty(), "nothing comes late");
-    let (sent, mut buf) = (AtomicU64::new(0), vec![0u8; CHUNK]);
+    let (sent, mut buf) = (Sent::default(), vec![0u8; CHUNK]);
     for hash in now {
-        remote::send_blob(&con, &staged, hash, &mut buf, &sent).await?;
+        remote::send_blob(&con, &staged, hash, &mut buf, LEVEL, &sent).await?;
     }
     con.send_one(&ToServer::Run { args: job.args.clone(), env: job.env.clone(), cwd: job.cwd.clone() })?;
     con.flush().await?;
     time::sleep(delay).await;
     for hash in later {
-        remote::send_blob(&con, &staged, hash, &mut buf, &sent).await?;
+        remote::send_blob(&con, &staged, hash, &mut buf, LEVEL, &sent).await?;
     }
     loop {
         if let FromServer::Exit { code, linker_waited_us, .. } = con.recv_one().await? {
@@ -353,7 +356,7 @@ async fn a_box_answers_a_heartbeat() -> Result<()> {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
     let b = server(&dir.join("box")).await?;
-    let us = remote::heartbeat(&b.subscriber, b.jobs.clone(), 1024).await?;
+    let us = remote::heartbeat(&b.subscriber, b.jobs.clone(), 1024, LEVEL).await?;
     assert!(us > 0 && us < 10_000_000, "{us}");
     fs::remove_dir_all(&dir)?;
     Ok(())
@@ -385,6 +388,31 @@ async fn jobs_sent_together_send_a_blob_they_share_once() -> Result<()> {
     let (one, two) = (bytes(one)?, bytes(two)?);
     assert!(one.max(two) >= big, "{one} {two}");
     assert!(one + two < big * 3 / 2, "both sent it: {one} {two}");
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_that_compresses_goes_small_and_its_output_comes_back_whole() -> Result<()> {
+    let _ = env_logger::try_init();
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-zstd-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    let lib = project(&dir.join("ws"))?;
+    let text = "a line of text that repeats\n".repeat(300_000);
+    fs::write(dir.join("ws/app/src/data.txt"), &text)?;
+    fs::write(dir.join("ws/app/src/lib.rs"), "pub static DATA: &str = include_str!(\"data.txt\");\n")?;
+    let crates: Vec<ArcStr> = lib.1.deps.iter().filter_map(|d| d.file.clone()).collect();
+    let (outcome, events) = send(&b, &lib, &crates, &Hashes::default(), None).await?;
+    let Outcome::Exit { code: 0, moved, .. } = outcome else { bail!("failed: {:?}", stderr(&events)) };
+    assert!(moved.bytes >= text.len() as u64, "{} bytes", moved.bytes);
+    assert!(moved.wire_bytes < moved.bytes / 20, "{} bytes as {}", moved.bytes, moved.wire_bytes);
+    // The rlib holds the text, and came back whole.
+    let rlib = fs::read(dir.join("ws/target/deps/libapp-a1.rlib"))?;
+    let at = rlib.windows(28).position(|w| w == &text.as_bytes()[..28]).context("the rlib lacks the text")?;
+    assert_eq!(&rlib[at..at + text.len()], text.as_bytes());
+    drop(b);
     fs::remove_dir_all(&dir)?;
     Ok(())
 }
