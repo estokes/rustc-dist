@@ -771,7 +771,7 @@ mod test {
         }
         until(10, "killing the sandbox", || running(&ws).is_empty()).await?;
         drop(b);
-        fs::remove_dir_all(&dir)?;
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 

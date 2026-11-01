@@ -489,7 +489,7 @@ async fn a_box_answers_a_heartbeat() -> Result<()> {
     let b = server(&dir.join("box")).await?;
     let us = remote::heartbeat(&b.links, &b.jobs, 1024, LEVEL).await?;
     assert!(us > 0 && us < 10_000_000, "{us}");
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -533,8 +533,8 @@ async fn a_toolchain_rustup_changes_is_refused_at_the_offer_before_the_run_and_a
     let (_, ended) = time::timeout(Duration::from_secs(30), m.ending()).await.map_err(within("the job"))??;
     assert!(ended.as_ref().is_err_and(|why| why.contains("while")), "{ended:?}");
     drop(b);
-    fs::remove_dir_all(&dir)?;
-    fs::remove_dir_all(&home)?;
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&home);
     Ok(())
 }
 
@@ -582,7 +582,7 @@ async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Res
     let same = b.links.get(&b.jobs).await?;
     assert!(Arc::ptr_eq(&link, &same) && !link.failed());
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -623,7 +623,7 @@ async fn a_running_sandbox_is_killed_when_its_client_drops_the_job_or_the_channe
         }
     }
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -650,7 +650,7 @@ async fn a_channel_that_fails_is_replaced() -> Result<()> {
     let Outcome::Exit { code: 0, .. } = outcome else { bail!("failed: {:?}", stderr(&events)) };
     assert!(!Arc::ptr_eq(&link, &b.links.get(&b.jobs).await?));
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -680,7 +680,7 @@ async fn jobs_sent_together_send_a_blob_they_share_once() -> Result<()> {
     let (one, two) = (bytes(one)?, bytes(two)?);
     assert!(one.max(two) >= big, "{one} {two}");
     assert!(one + two < big * 3 / 2, "both sent it: {one} {two}");
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -716,7 +716,7 @@ async fn a_late_rlib_comes_through_another_jobs_upload_even_when_that_job_fails_
         assert_eq!(code, 0, "linked against a's upload, as the stand-in has no code");
     }
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -749,7 +749,7 @@ async fn a_job_that_needs_another_jobs_late_rlib_before_rustc_starts_has_its_own
     assert_eq!(code, 0);
     drop(a);
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -798,7 +798,7 @@ async fn late_rlibs_are_stored_as_they_come_while_the_job_waits_for_another_jobs
     assert_eq!(code, 0);
     drop(sender);
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
@@ -824,7 +824,7 @@ async fn a_file_that_compresses_goes_small_and_its_output_comes_back_whole() -> 
     let at = rlib.windows(28).position(|w| w == &text.as_bytes()[..28]).context("the rlib lacks the text")?;
     assert_eq!(&rlib[at..at + text.len()], text.as_bytes());
     drop(b);
-    fs::remove_dir_all(&dir)?;
+    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
