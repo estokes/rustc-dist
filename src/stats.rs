@@ -2,7 +2,9 @@
 //! calibration load's instructions: how long it ran, times the calibrated
 //! speed of where it ran, over that place's factor at the load it saw. A
 //! place's factor, learned per load bucket from units that also ran
-//! elsewhere or at other loads, scales calibrated time to time there.
+//! elsewhere or at other loads, scales calibrated time to time there. Each
+//! estimate is a weighted median of recent samples, weights halving with
+//! age, so no one bad run moves it.
 
 use crate::protocol::Unit;
 use anyhow::{Context, Result, anyhow, bail};
@@ -12,40 +14,50 @@ use hdrhistogram::{
     Histogram,
     serialization::{Deserializer, Serializer, V2Serializer},
 };
+use poolshark::local::LPooled;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{self, File},
     io::{BufReader, BufWriter, ErrorKind, Read, Write},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// A place's calibration counts as this many µs of runs in each load
-/// bucket, and never decays.
-const PRIOR_US: f64 = 30_000_000.;
+/// A place's calibration counts as a sample this many µs of runs long in
+/// each load bucket, and never ages: as much as a few typical jobs, so a
+/// few runs that agree outweigh it, and it outweighs runs grown old.
+const PRIOR_US: f64 = 3_000_000.;
 /// Load buckets, in hundredths of a runnable task per CPU.
 const BUCKETS: [u32; 11] = [0, 25, 50, 75, 100, 150, 200, 300, 400, 600, 800];
+/// The comparisons each load bucket of a place keeps.
+const COMPARISONS_KEPT: usize = 32;
+/// The runs each unit keeps.
+const RUNS_KEPT: usize = 16;
+/// The sends each unit keeps for each place.
+const UNIT_SENDS_KEPT: usize = 8;
+/// The sends each place keeps of each kind.
+const SENDS_KEPT: usize = 64;
+/// Two sends make a slope for a place's µs per kB only if their kB differ
+/// by this much.
+const SLOPE_MIN_KB: f64 = 256.;
 /// A unit's histograms are halved once it has this many runs, so its
 /// peaks follow the crate as it grows.
 const HALVE_AT: u64 = 256;
-/// A cell unrun for this long, as long as the build graph keeps a node, is
-/// dropped when the table is saved.
+/// A sample this old, as long as the build graph keeps a node, is dropped
+/// when the table is saved.
 const KEEP_S: f64 = 60. * 86_400.;
 /// Before sends to a box say otherwise, moving a kB to it takes this many
-/// µs: 50 MB/s.
+/// µs: 50 MB/s. It counts as one more slope, as new as can be.
 const SEND_US_PER_KB: f64 = 20.;
-/// That guess counts as much toward a box's µs per kB as one send this many
-/// kB from the mean of the others.
-const SEND_PRIOR_KB: f64 = 100_000.;
 /// What a job sent to a place nothing has been sent to spends other than
 /// compiling, besides moving its bytes.
 const COPY_US: f64 = 200_000.;
 /// Predicted size, in millions of instructions, of a job when nothing at
 /// all has been recorded.
 const UNKNOWN_COST_MI: u64 = 1000;
-const MAGIC: &[u8; 8] = b"rdstats8";
-/// A table from before sends counted the bytes they moved.
-const UNSIZED_MAGIC: &[u8; 8] = b"rdstats7";
+const MAGIC: &[u8; 8] = b"rdstats9";
+/// A table of decayed sums, read as one sample for each sum.
+const SUMS_MAGIC: &[u8; 8] = b"rdstats8";
 /// A table from before runs were timed, read as seed history.
 const OLD_MAGIC: &[u8; 8] = b"rdstats4";
 /// Where seed history ran: calibrated at one instruction per µs, so its
@@ -63,10 +75,36 @@ fn keep(at: f64, now: f64, half_life_s: f64) -> f64 {
     0.5f64.powf((now - at).max(0.) / half_life_s)
 }
 
-/// How fast old runs stop counting. Their weight halves every
+/// The weighted median of `samples`, each a value and its weight; none if
+/// they weigh nothing.
+fn median(samples: &mut [(f64, f64)]) -> Option<f64> {
+    let total: f64 = samples.iter().map(|(_, w)| w).sum();
+    if total.is_nan() || total <= 0. {
+        return None;
+    }
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut below = 0.;
+    for &(v, w) in samples.iter() {
+        below += w;
+        if below >= total / 2. {
+            return Some(v);
+        }
+    }
+    samples.last().map(|(v, _)| *v)
+}
+
+/// Push `x` onto `q`, dropping the oldest past `cap`.
+fn push<T>(q: &mut VecDeque<T>, x: T, cap: usize) {
+    if q.len() == cap {
+        q.pop_front();
+    }
+    q.push_back(x);
+}
+
+/// How fast old samples stop counting. Their weight halves every
 /// `half_life_s` for how fast places run and how big units are, and every
-/// `copy_half_life_s` for how long sent runs spent moving files, which
-/// follows the network a laptop is on.
+/// `copy_half_life_s` for how long sends spent moving files, which follows
+/// the network a laptop is on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Decay {
     pub half_life_s: f64,
@@ -152,71 +190,21 @@ pub struct Run {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaceId(u32);
 
-/// Decayed sums of a place's runs near one load: their time, and what it
-/// would have been at the place's calibrated speed.
-#[derive(Clone, Copy, Default)]
-struct Bucket {
+/// A run's time at a place over what its unit's size from runs elsewhere
+/// predicted at the place's calibrated speed, weighing that prediction.
+#[derive(Clone, Copy)]
+struct Comparison {
     at: f64,
-    time_us: f64,
-    calibrated_us: f64,
+    ratio: f64,
+    weight: f64,
 }
 
-impl Bucket {
-    fn factor(&self, prior: f64, now: f64, half_life_s: f64) -> f64 {
-        let k = keep(self.at, now, half_life_s);
-        (PRIOR_US * prior + self.time_us * k) / (PRIOR_US + self.calibrated_us * k)
-    }
-
-    fn add(&mut self, w: f64, time_us: f64, calibrated_us: f64, now: f64, half_life_s: f64) {
-        let k = keep(self.at, now, half_life_s);
-        self.time_us = self.time_us * k + w * time_us;
-        self.calibrated_us = self.calibrated_us * k + w * calibrated_us;
-        self.at = now;
-    }
-}
-
-/// Decayed sums of one kind of sends to a place: how many, the µs they
-/// spent other than compiling and the kB they sent, and what a line through
-/// (kB, µs) needs.
-#[derive(Clone, Copy, Default)]
-struct Sends {
+/// What a send spent other than compiling, and the kB it sent.
+#[derive(Clone, Copy)]
+struct Send {
     at: f64,
-    n: f64,
-    us: f64,
+    copy_us: f64,
     kb: f64,
-    kb2: f64,
-    kb_us: f64,
-}
-
-impl Sends {
-    fn sums(&mut self) -> [&mut f64; 5] {
-        [&mut self.n, &mut self.us, &mut self.kb, &mut self.kb2, &mut self.kb_us]
-    }
-
-    fn add(&mut self, us: f64, kb: f64, now: f64, half_life_s: f64) {
-        let k = keep(self.at, now, half_life_s);
-        for (s, x) in self.sums().into_iter().zip([1., us, kb, kb * kb, kb * us]) {
-            *s = *s * k + x;
-        }
-        self.at = now;
-    }
-
-    /// Their mean µs and kB, if there are any.
-    fn mean(&self) -> Option<(f64, f64)> {
-        (self.n > 0.).then(|| (self.us / self.n, self.kb / self.n))
-    }
-
-    /// µs per kB sent: the slope of a line through them, drawn toward
-    /// `SEND_US_PER_KB`.
-    fn us_per_kb(&self, now: f64, half_life_s: f64) -> f64 {
-        let k = keep(self.at, now, half_life_s);
-        let (sxx, sxy) = match self.n > 0. {
-            true => (self.kb2 - self.kb * self.kb / self.n, self.kb_us - self.kb * self.us / self.n),
-            false => (0., 0.),
-        };
-        let prior = SEND_PRIOR_KB * SEND_PRIOR_KB;
-        ((sxy * k + prior * SEND_US_PER_KB) / (sxx * k + prior)).max(0.)
-    }
 }
 
 /// A class of a box, where light jobs run, or all of a box's CPUs, where
@@ -227,12 +215,14 @@ struct Place {
     /// end runs, and per CPU.
     fast: u64,
     rate: u64,
-    curve: [Bucket; BUCKETS.len()],
-    /// Every unit's sends there, of jobs that read only metadata and of
-    /// jobs that link, which send every rlib below them.
-    sends: [Sends; 2],
-    /// The factor at each bucket's load, as of the last `refresh`.
+    curve: [VecDeque<Comparison>; BUCKETS.len()],
+    /// Every unit's sends there, and heartbeats, of jobs that read only
+    /// metadata and of jobs that link, which send every rlib below them.
+    sends: [VecDeque<Send>; 2],
+    /// The factor at each bucket's load, and the µs per kB of each kind of
+    /// send, as of the last `refresh` and `fit`.
     factors: [f64; BUCKETS.len()],
+    per_kb: [f64; 2],
 }
 
 impl Place {
@@ -241,28 +231,41 @@ impl Place {
             key,
             fast: fast.max(1),
             rate: rate.max(1),
-            curve: Default::default(),
-            sends: Default::default(),
+            curve: std::array::from_fn(|_| VecDeque::new()),
+            sends: [VecDeque::new(), VecDeque::new()],
             factors: [1.; BUCKETS.len()],
+            per_kb: [SEND_US_PER_KB; 2],
         };
         p.refresh(0., 1.);
         p
     }
 
-    /// Work out the factor at each bucket's load as of `now`. A bucket
-    /// starts from the starting curve at the level the place has run at
-    /// over every load, so one nothing has run at follows the ones that
-    /// have.
+    /// Work out the factor at each bucket's load as of `now`, relative to
+    /// the starting curve: for a bucket runs have reached, the weighted
+    /// median of their comparisons and of the curve, which counts as
+    /// `PRIOR_US` and never ages; for one they haven't, between the nearest
+    /// buckets they have, so it follows them.
     fn refresh(&mut self, now: f64, half_life_s: f64) {
-        let (mut time_us, mut calibrated_us) = (PRIOR_US, PRIOR_US);
-        for (b, &load_c) in self.curve.iter().zip(&BUCKETS) {
-            let k = keep(b.at, now, half_life_s);
-            time_us += b.time_us * k / prior(load_c);
-            calibrated_us += b.calibrated_us * k;
+        let mut samples: LPooled<Vec<(f64, f64)>> = LPooled::take();
+        let mut rel: [Option<f64>; BUCKETS.len()] = [None; BUCKETS.len()];
+        for ((r, q), &load_c) in rel.iter_mut().zip(&self.curve).zip(&BUCKETS) {
+            if !q.is_empty() {
+                samples.clear();
+                samples.push((1., PRIOR_US));
+                samples.extend(q.iter().map(|c| (c.ratio / prior(load_c), c.weight * keep(c.at, now, half_life_s))));
+                *r = median(&mut samples);
+            }
         }
-        let level = time_us / calibrated_us;
-        for ((f, b), &load_c) in self.factors.iter_mut().zip(&self.curve).zip(&BUCKETS) {
-            *f = b.factor(prior(load_c) * level, now, half_life_s);
+        let learned = |i: usize| Some((BUCKETS[i], rel[i]?));
+        for (j, (f, &load_c)) in self.factors.iter_mut().zip(&BUCKETS).enumerate() {
+            let below = (0..=j).rev().find_map(learned);
+            let above = (j..BUCKETS.len()).find_map(learned);
+            let r = match (below, above) {
+                (Some((lo, a)), Some((hi, b))) if hi > lo => a + (b - a) * (load_c - lo) as f64 / (hi - lo) as f64,
+                (Some((_, a)), _) | (None, Some((_, a))) => a,
+                (None, None) => 1.,
+            };
+            *f = prior(load_c) * r;
         }
     }
 
@@ -278,94 +281,82 @@ impl Place {
     /// A run under `load_c` took `time_us` where its calibrated time was
     /// `calibrated_us`, and weighs `w`.
     fn learn(&mut self, load_c: u32, w: f64, time_us: f64, calibrated_us: f64, now: f64, half_life_s: f64) {
+        let ratio = time_us / calibrated_us.max(1.);
         let last = BUCKETS.len() - 1;
-        match between(load_c) {
-            (i, _) if i == last => {
-                let at_last = time_us * BUCKETS[last] as f64 / load_c as f64;
-                self.curve[last].add(w, at_last, calibrated_us, now, half_life_s);
+        let mut add = |j: usize, ratio: f64, share: f64| {
+            if share > 0. {
+                let c = Comparison { at: now, ratio, weight: w * share * calibrated_us };
+                push(&mut self.curve[j], c, COMPARISONS_KEPT);
             }
+        };
+        match between(load_c) {
+            (i, _) if i == last => add(last, ratio * BUCKETS[last] as f64 / load_c as f64, 1.),
             (i, a) => {
-                self.curve[i].add(w * (1. - a), time_us, calibrated_us, now, half_life_s);
-                self.curve[i + 1].add(w * a, time_us, calibrated_us, now, half_life_s);
+                add(i, ratio, 1. - a);
+                add(i + 1, ratio, a);
             }
         }
         self.refresh(now, half_life_s);
     }
+
+    fn send(&mut self, links: bool, send: Send, now: f64, half_life_s: f64) {
+        push(&mut self.sends[usize::from(links)], send, SENDS_KEPT);
+        self.fit(now, half_life_s);
+    }
+
+    /// Work out each kind's µs per kB: the weighted median of the slopes
+    /// between pairs of its sends whose kB differ by at least
+    /// `SLOPE_MIN_KB` (Theil-Sen), with the guess as one more.
+    fn fit(&mut self, now: f64, half_life_s: f64) {
+        let mut slopes: LPooled<Vec<(f64, f64)>> = LPooled::take();
+        for (per_kb, sends) in self.per_kb.iter_mut().zip(&self.sends) {
+            slopes.clear();
+            slopes.push((SEND_US_PER_KB, 1.));
+            for (i, a) in sends.iter().enumerate() {
+                for b in sends.iter().skip(i + 1).filter(|b| (b.kb - a.kb).abs() >= SLOPE_MIN_KB) {
+                    let w = keep(a.at, now, half_life_s) * keep(b.at, now, half_life_s);
+                    slopes.push(((b.copy_us - a.copy_us) / (b.kb - a.kb), w));
+                }
+            }
+            *per_kb = median(&mut slopes).unwrap_or(SEND_US_PER_KB).max(0.);
+        }
+    }
 }
 
-/// Decayed sums of a unit's runs at one place and load bucket. Work is
-/// counted at the place's calibrated speed: the place's factor at the
-/// cell's load divides it into the unit's size.
+/// A unit's run at a place: its work counted at the place's calibrated
+/// speed, which the place's factor at the run's load divides into the
+/// unit's size.
 #[derive(Clone, Copy)]
-struct Cell {
+struct RunSample {
     place: PlaceId,
-    bucket: u8,
     at: f64,
-    runs: f64,
-    load_c: f64,
+    load_c: u32,
     front_mi: f64,
     rest_mi: f64,
     rest_us: f64,
     tokens_us: f64,
-    /// Sent runs, the µs they spent other than compiling and the kB they
-    /// sent, which decay at the copy half-life.
-    sent: f64,
-    copy_us: f64,
-    sent_kb: f64,
 }
 
-impl Cell {
-    /// The sums that decay at the half-life for speed and size.
-    fn speed(&mut self) -> [&mut f64; 6] {
-        [&mut self.runs, &mut self.load_c, &mut self.front_mi, &mut self.rest_mi, &mut self.rest_us, &mut self.tokens_us]
-    }
-
-    fn copies(&mut self) -> [&mut f64; 3] {
-        [&mut self.sent, &mut self.copy_us, &mut self.sent_kb]
-    }
-
-    fn add(&mut self, mut other: Cell, now: f64, decay: Decay) {
-        let (k, kc) = (keep(self.at, now, decay.half_life_s), keep(self.at, now, decay.copy_half_life_s));
-        for (s, o) in self.speed().into_iter().zip(other.speed()) {
-            *s = *s * k + *o;
-        }
-        for (s, o) in self.copies().into_iter().zip(other.copies()) {
-            *s = *s * kc + *o;
-        }
-        self.at = now;
-    }
+/// One of a unit's sends to a place.
+#[derive(Clone, Copy)]
+struct UnitSend {
+    place: PlaceId,
+    send: Send,
 }
 
-/// A unit's size from some of its cells: decayed runs, their front-end and
-/// rest work divided by their places' factors, and their rest's wall time
-/// and tokens.
-#[derive(Default)]
+/// A unit's size from some of its runs: their weight, and the weighted
+/// medians of their front end and rest at their places' factors and of
+/// their width.
 struct Size {
     runs: f64,
     front_mi: f64,
     rest_mi: f64,
-    rest_us: f64,
-    tokens_us: f64,
-}
-
-impl Size {
-    fn front_mi(&self) -> f64 {
-        self.front_mi / self.runs
-    }
-
-    fn rest_mi(&self) -> f64 {
-        self.rest_mi / self.runs
-    }
-
-    /// Tokens held on average after the front end: 1 for a job with nothing
-    /// after it.
-    fn width(&self) -> f64 {
-        if self.rest_us > 0. { (self.tokens_us / self.rest_us).max(1.) } else { 1. }
-    }
+    width: f64,
 }
 
 struct Record {
-    cells: Vec<Cell>,
+    runs_kept: VecDeque<RunSample>,
+    sends: VecDeque<UnitSend>,
     mem_kb: Histogram<u32>,
     wall_ms: Histogram<u32>,
     /// Of sent runs.
@@ -377,13 +368,13 @@ struct Record {
 
 impl Record {
     fn new() -> Self {
-        let h = |high| Histogram::new_with_bounds(1, high, 2).expect("histogram bounds");
         Self {
-            cells: Vec::new(),
-            mem_kb: h(1 << 30),
-            wall_ms: h(36_000_000),
-            copy_ms: h(36_000_000),
-            sent_kb: h(1 << 30),
+            runs_kept: VecDeque::new(),
+            sends: VecDeque::new(),
+            mem_kb: histogram(1 << 30),
+            wall_ms: histogram(36_000_000),
+            copy_ms: histogram(36_000_000),
+            sent_kb: histogram(1 << 30),
             runs: [0; 3],
         }
     }
@@ -396,11 +387,14 @@ impl Record {
         [&mut self.mem_kb, &mut self.wall_ms, &mut self.copy_ms, &mut self.sent_kb]
     }
 
-    fn add(&mut self, cell: Cell, now: f64, decay: Decay) {
-        match self.cells.iter_mut().find(|c| (c.place, c.bucket) == (cell.place, cell.bucket)) {
-            Some(c) => c.add(cell, now, decay),
-            None => self.cells.push(cell),
+    fn send(&mut self, s: UnitSend) {
+        let there = self.sends.iter().filter(|o| o.place == s.place).count();
+        if there >= UNIT_SENDS_KEPT
+            && let Some(i) = self.sends.iter().position(|o| o.place == s.place)
+        {
+            self.sends.remove(i);
         }
+        self.sends.push_back(s);
     }
 
     fn count(&mut self, mem_kb: u64, wall_ms: u64, origin: Origin) {
@@ -425,19 +419,20 @@ impl Record {
         }
     }
 
-    /// Its size from every cell but `skip`'s.
-    fn size(&self, places: &[Place], now: f64, half_life_s: f64, skip: Option<(PlaceId, u8)>) -> Size {
-        let mut s = Size::default();
-        for c in self.cells.iter().filter(|c| Some((c.place, c.bucket)) != skip && c.runs > 0.) {
-            let k = keep(c.at, now, half_life_s);
-            let m = places[c.place.0 as usize].factor((c.load_c / c.runs) as u32);
-            s.runs += c.runs * k;
-            s.front_mi += c.front_mi * k / m;
-            s.rest_mi += c.rest_mi * k / m;
-            s.rest_us += c.rest_us * k;
-            s.tokens_us += c.tokens_us * k;
+    /// Its size from its runs but those at `skip`'s place and load bucket.
+    fn size(&self, places: &[Place], now: f64, half_life_s: f64, skip: Option<(PlaceId, u8)>) -> Option<Size> {
+        let (mut front, mut rest, mut width): (LPooled<Vec<_>>, LPooled<Vec<_>>, LPooled<Vec<_>>) =
+            (LPooled::take(), LPooled::take(), LPooled::take());
+        let mut runs = 0.;
+        for r in self.runs_kept.iter().filter(|r| Some((r.place, nearest(r.load_c))) != skip) {
+            let (k, m) = (keep(r.at, now, half_life_s), places[r.place.0 as usize].factor(r.load_c));
+            runs += k;
+            front.push((r.front_mi / m, k));
+            rest.push((r.rest_mi / m, k));
+            let w = if r.rest_us > 0. { (r.tokens_us / r.rest_us).max(1.) } else { 1. };
+            width.push((w, k));
         }
-        s
+        Some(Size { runs, front_mi: median(&mut front)?, rest_mi: median(&mut rest)?, width: median(&mut width)? })
     }
 }
 
@@ -475,15 +470,15 @@ pub struct UnitInfo {
 /// The prediction for a unit whose record `r` has size `s`.
 fn known(r: &Record, s: &Size) -> Prediction {
     Prediction {
-        front_mi: s.front_mi() as u64,
-        rest_mi: s.rest_mi() as u64,
-        width_c: Some((s.width() * 100.) as u64),
+        front_mi: s.front_mi as u64,
+        rest_mi: s.rest_mi as u64,
+        width_c: Some((s.width * 100.) as u64),
         mem_kb: r.mem_kb.value_at_quantile(0.9),
         known: true,
     }
 }
 
-fn median(h: &Histogram<u32>) -> Option<u64> {
+fn hist_median(h: &Histogram<u32>) -> Option<u64> {
     (!h.is_empty()).then(|| h.value_at_quantile(0.5))
 }
 
@@ -522,7 +517,7 @@ impl Stats {
         stats
     }
 
-    /// Decay every weight to `now`, seconds since the epoch.
+    /// Age every weight to `now`, seconds since the epoch.
     pub fn set_now(&mut self, now: f64) {
         self.now = now;
         for p in &mut self.places {
@@ -565,47 +560,62 @@ impl Stats {
     }
 
     /// Predicted µs a run of `unit` sent to `place`, where it must send
-    /// `missing_kb`, spends other than compiling. It is what its own sends
-    /// there took on average, else those of every job there that links as
-    /// it does or doesn't, else a guess, adjusted for sending more or fewer
-    /// kB than they did at the µs per kB sends there show.
+    /// `missing_kb`, spends other than compiling: the weighted median of
+    /// its own recent sends there, else those of every job there that
+    /// links as it does or doesn't, else a guess, each adjusted for
+    /// sending more or fewer kB than it did at the µs per kB sends there
+    /// show.
     pub fn copy_us(&self, unit: &Unit, place: PlaceId, links: bool, missing_kb: u64) -> u64 {
         let (now, half_life_s) = (self.now, self.decay.copy_half_life_s);
-        let sends = &self.places[place.0 as usize].sends[usize::from(links)];
-        let (mut n, mut us, mut kb) = (0., 0., 0.);
-        for c in self.exact.get(&unit.exact).iter().flat_map(|r| &r.cells).filter(|c| c.place == place) {
-            let k = keep(c.at, now, half_life_s);
-            (n, us, kb) = (n + c.sent * k, us + c.copy_us * k, kb + c.sent_kb * k);
+        let p = &self.places[place.0 as usize];
+        let per_kb = p.per_kb[usize::from(links)];
+        let at = |s: &Send| (s.copy_us + per_kb * (missing_kb as f64 - s.kb), keep(s.at, now, half_life_s));
+        let mut samples: LPooled<Vec<(f64, f64)>> = LPooled::take();
+        let own = self.exact.get(&unit.exact).into_iter().flat_map(|r| &r.sends).filter(|s| s.place == place);
+        samples.extend(own.map(|s| at(&s.send)));
+        if samples.is_empty() {
+            samples.extend(p.sends[usize::from(links)].iter().map(at));
         }
-        let (base_us, base_kb) = match n > 0. {
-            true => (us / n, kb / n),
-            false => sends.mean().unwrap_or((COPY_US, 0.)),
-        };
-        (base_us + sends.us_per_kb(now, half_life_s) * (missing_kb as f64 - base_kb)).max(0.) as u64
+        median(&mut samples).unwrap_or(COPY_US + per_kb * missing_kb as f64).max(0.) as u64
     }
 
-    /// What sends to `place` of jobs that link, or of jobs that don't,
-    /// spent other than compiling on average, if there were any, and the
-    /// MB per second they moved at.
+    /// The weighted median time sends to `place` of jobs that link, or of
+    /// jobs that don't, spent other than compiling, if there were any, and
+    /// the MB per second they moved at.
     pub fn sends(&self, place: PlaceId, links: bool) -> (Option<u64>, f64) {
-        let sends = &self.places[place.0 as usize].sends[usize::from(links)];
-        let per_kb = sends.us_per_kb(self.now, self.decay.copy_half_life_s);
-        (sends.mean().map(|(us, _)| us as u64), 1000. / per_kb.max(1e-3))
+        let p = &self.places[place.0 as usize];
+        let (now, half_life_s) = (self.now, self.decay.copy_half_life_s);
+        let mut samples: LPooled<Vec<(f64, f64)>> = LPooled::take();
+        samples.extend(p.sends[usize::from(links)].iter().map(|s| (s.copy_us, keep(s.at, now, half_life_s))));
+        (median(&mut samples).map(|us| us as u64), 1000. / p.per_kb[usize::from(links)].max(1e-3))
+    }
+
+    /// A heartbeat moved `kb` to the box `places` are on in `us`: a sample
+    /// of both kinds of sends to each.
+    pub fn heartbeat(&mut self, places: &[PlaceId], kb: u64, us: u64) {
+        let (now, half_life_s) = (self.now, self.decay.copy_half_life_s);
+        let send = Send { at: now, copy_us: us as f64, kb: kb as f64 };
+        for p in places {
+            for links in [false, true] {
+                self.places[p.0 as usize].send(links, send, now, half_life_s);
+            }
+        }
+        self.dirty = true;
     }
 
     pub fn predict(&self, exact: &ArcStr, coarse: &ArcStr) -> Prediction {
         let own = [(&self.exact, exact), (&self.coarse, coarse)].into_iter().find_map(|(map, key)| {
             let r = map.get(key)?;
-            let s = r.size(&self.places, self.now, self.decay.half_life_s, None);
-            (s.runs > 0.).then_some((r, s))
+            let s = r.size(&self.places, self.now, self.decay.half_life_s, None)?;
+            Some((r, s))
         });
         match own {
             Some((r, s)) => known(r, &s),
             None => Prediction {
                 front_mi: 0,
-                rest_mi: median(&self.global_cost).unwrap_or(UNKNOWN_COST_MI),
+                rest_mi: hist_median(&self.global_cost).unwrap_or(UNKNOWN_COST_MI),
                 width_c: None,
-                mem_kb: median(&self.global_mem).unwrap_or(0),
+                mem_kb: hist_median(&self.global_mem).unwrap_or(0),
                 known: false,
             },
         }
@@ -614,17 +624,15 @@ impl Stats {
     /// Every unit with runs.
     pub fn units(&self) -> impl Iterator<Item = (&ArcStr, UnitInfo)> {
         self.exact.iter().filter_map(|(key, r)| {
-            let s = r.size(&self.places, self.now, self.decay.half_life_s, None);
-            (s.runs > 0.).then(|| {
-                let info = UnitInfo {
-                    runs: r.runs,
-                    pred: known(r, &s),
-                    wall_ms: median(&r.wall_ms).unwrap_or(0),
-                    copy_ms: median(&r.copy_ms),
-                    sent_kb: median(&r.sent_kb),
-                };
-                (key, info)
-            })
+            let s = r.size(&self.places, self.now, self.decay.half_life_s, None)?;
+            let info = UnitInfo {
+                runs: r.runs,
+                pred: known(r, &s),
+                wall_ms: hist_median(&r.wall_ms).unwrap_or(0),
+                copy_ms: hist_median(&r.copy_ms),
+                sent_kb: hist_median(&r.sent_kb),
+            };
+            Some((key, info))
         })
     }
 
@@ -639,47 +647,43 @@ impl Stats {
         let rest_us = wall_us - front_us;
         // The front end holds the one token the job starts with.
         let tokens_us = (run.tokens_us as f64 - front_us).max(rest_us);
-        let bucket = nearest(run.load_c);
-        if let Some(r) = self.exact.get(&unit.exact) {
-            let other = r.size(&self.places, now, self.decay.half_life_s, Some((run.place, bucket)));
-            if other.runs > 0. {
-                let threads = if rest_us > 0. { tokens_us / rest_us } else { 1. };
-                let calibrated_us = other.front_mi() * 1e6 / fast + other.rest_mi() * 1e6 / (rate * threads);
-                let w = other.runs / (other.runs + 1.);
-                let half_life_s = self.decay.half_life_s;
-                self.places[run.place.0 as usize].learn(run.load_c, w, wall_us, calibrated_us, now, half_life_s);
-            }
+        if let Some(r) = self.exact.get(&unit.exact)
+            && let Some(other) = r.size(&self.places, now, self.decay.half_life_s, Some((run.place, nearest(run.load_c))))
+            && other.runs > 0.
+        {
+            let threads = if rest_us > 0. { tokens_us / rest_us } else { 1. };
+            let calibrated_us = other.front_mi * 1e6 / fast + other.rest_mi * 1e6 / (rate * threads);
+            let w = other.runs / (other.runs + 1.);
+            let half_life_s = self.decay.half_life_s;
+            self.places[run.place.0 as usize].learn(run.load_c, w, wall_us, calibrated_us, now, half_life_s);
         }
-        let (sent, copy_us, sent_kb) = match run.origin {
-            Origin::Sent(t) => (1., t.copy_ms as f64 * 1000., t.sent_kb as f64),
-            Origin::Here | Origin::Served => (0., 0., 0.),
-        };
-        let cell = Cell {
+        let sample = RunSample {
             place: run.place,
-            bucket,
             at: now,
-            runs: 1.,
-            load_c: run.load_c as f64,
+            load_c: run.load_c,
             front_mi: front_us * fast / 1e6,
             rest_mi: tokens_us * rate / 1e6,
             rest_us,
             tokens_us,
-            sent,
-            copy_us,
-            sent_kb,
         };
-        let decay = self.decay;
+        let sent = match run.origin {
+            Origin::Sent(t) => Some((t, Send { at: now, copy_us: t.copy_ms as f64 * 1000., kb: t.sent_kb as f64 })),
+            Origin::Here | Origin::Served => None,
+        };
         for (map, key) in [(&mut self.exact, &unit.exact), (&mut self.coarse, &unit.coarse)] {
             let r = map.entry(key.clone()).or_insert_with(Record::new);
-            r.add(cell, now, decay);
+            push(&mut r.runs_kept, sample, RUNS_KEPT);
+            if let Some((_, send)) = sent {
+                r.send(UnitSend { place: run.place, send });
+            }
             r.count(run.mem_kb, run.wall_us / 1000, run.origin);
         }
         let place = &mut self.places[run.place.0 as usize];
-        if let Origin::Sent(t) = run.origin {
-            place.sends[usize::from(t.links)].add(copy_us, sent_kb, now, decay.copy_half_life_s);
+        if let Some((t, send)) = sent {
+            place.send(t.links, send, now, self.decay.copy_half_life_s);
         }
         let m = place.factor(run.load_c);
-        self.global_cost.saturating_record(((cell.front_mi + cell.rest_mi) / m).max(1.) as u64);
+        self.global_cost.saturating_record(((sample.front_mi + sample.rest_mi) / m).max(1.) as u64);
         self.global_mem.saturating_record(run.mem_kb.max(1));
         self.dirty = true;
     }
@@ -688,10 +692,10 @@ impl Stats {
     /// `rest_mi` of work, `width_c` hundredths of a thread wide.
     #[cfg(test)]
     pub fn seed(&mut self, unit: &Unit, front_mi: u64, rest_mi: u64, width_c: u64, mem_kb: u64) {
-        let cell = seed_cell(front_mi, rest_mi, width_c, self.now);
+        let sample = seed_run(front_mi, rest_mi, width_c, self.now);
         for (map, key) in [(&mut self.exact, &unit.exact), (&mut self.coarse, &unit.coarse)] {
             let r = map.entry(key.clone()).or_insert_with(Record::new);
-            r.add(cell, self.now, self.decay);
+            push(&mut r.runs_kept, sample, RUNS_KEPT);
             r.mem_kb.saturating_record(mem_kb.max(1));
         }
         self.global_cost.saturating_record((front_mi + rest_mi).max(1));
@@ -699,18 +703,29 @@ impl Stats {
         self.dirty = true;
     }
 
-    /// Drop cells that have decayed away, and recompute the global
-    /// histograms from every unit's size now.
+    /// Drop samples gone stale, refit every place's sends, and recompute
+    /// the global histograms from every unit's size now.
     pub fn rebuild_global(&mut self) {
         let now = self.now;
-        let (mut cost, mut mem) = (histogram(1_000_000_000), histogram(1 << 30));
+        let fresh = |at: f64| now - at <= KEEP_S;
         for r in self.exact.values_mut().chain(self.coarse.values_mut()) {
-            r.cells.retain(|c| now - c.at <= KEEP_S);
+            r.runs_kept.retain(|s| fresh(s.at));
+            r.sends.retain(|s| fresh(s.send.at));
         }
+        for p in &mut self.places {
+            for q in &mut p.curve {
+                q.retain(|c| fresh(c.at));
+            }
+            for q in &mut p.sends {
+                q.retain(|s| fresh(s.at));
+            }
+            p.fit(now, self.decay.copy_half_life_s);
+            p.refresh(now, self.decay.half_life_s);
+        }
+        let (mut cost, mut mem) = (histogram(1_000_000_000), histogram(1 << 30));
         for r in self.exact.values() {
-            let s = r.size(&self.places, now, self.decay.half_life_s, None);
-            if s.runs > 0. {
-                cost.saturating_record(((s.front_mi + s.rest_mi) / s.runs).max(1.) as u64);
+            if let Some(s) = r.size(&self.places, now, self.decay.half_life_s, None) {
+                cost.saturating_record((s.front_mi + s.rest_mi).max(1.) as u64);
                 mem.saturating_record(r.mem_kb.value_at_quantile(0.9).max(1));
             }
         }
@@ -728,8 +743,8 @@ impl Stats {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         let mut stats = match &magic {
-            MAGIC => Self::read(&mut r, decay, true)?,
-            UNSIZED_MAGIC => Self::read(&mut r, decay, false)?,
+            MAGIC => Self::read(&mut r, decay)?,
+            SUMS_MAGIC => Self::read_sums(&mut r, decay)?,
             OLD_MAGIC => Self::read_old(&mut r, decay)?,
             _ => bail!("{} is not a stats file", path.display()),
         };
@@ -738,65 +753,42 @@ impl Stats {
         Ok(stats)
     }
 
-    /// Without `sized`, sends counted no kB.
-    fn read(r: &mut impl Read, decay: Decay, sized: bool) -> Result<Self> {
-        let mut stats = Self::new(decay);
-        stats.places.clear();
-        stats.by_key.clear();
+    /// The places, each read by `read`, which pushes its samples.
+    fn read_places(
+        &mut self,
+        r: &mut impl Read,
+        mut read: impl FnMut(&mut Place, &mut dyn Read) -> Result<()>,
+    ) -> Result<()> {
+        self.places.clear();
+        self.by_key.clear();
         for i in 0..read_u32(r)? {
             let key = read_key(r)?;
             let (fast, rate) = (read_u64(r)?, read_u64(r)?);
             let mut p = Place::new(key.clone(), fast, rate);
-            for b in &mut p.curve {
-                *b = Bucket { at: read_f64(r)?, time_us: read_f64(r)?, calibrated_us: read_f64(r)? };
-            }
-            for sends in &mut p.sends {
-                sends.at = read_f64(r)?;
-                for x in sends.sums().into_iter().take(if sized { 5 } else { 2 }) {
-                    *x = read_f64(r)?;
-                }
-            }
-            stats.places.push(p);
-            stats.by_key.insert(key, PlaceId(i));
+            read(&mut p, r)?;
+            self.places.push(p);
+            self.by_key.insert(key, PlaceId(i));
         }
-        if !stats.by_key.contains_key(SEED) {
+        if !self.by_key.contains_key(SEED) {
             bail!("no seed place");
         }
+        Ok(())
+    }
+
+    /// The units, each read by `read`, which pushes its samples, then their
+    /// histograms and run counts.
+    fn read_units(
+        &mut self,
+        r: &mut impl Read,
+        mut read: impl FnMut(&mut Record, &mut dyn Read, u32) -> Result<()>,
+    ) -> Result<()> {
+        let places = self.places.len() as u32;
         let mut de = Deserializer::new();
-        let places = stats.places.len() as u32;
-        for map in [&mut stats.exact, &mut stats.coarse] {
+        for map in [&mut self.exact, &mut self.coarse] {
             for _ in 0..read_u32(r)? {
                 let key = read_key(r)?;
                 let mut rec = Record::new();
-                for _ in 0..read_u32(r)? {
-                    let place = read_u32(r)?;
-                    if place >= places {
-                        bail!("cell of {key} at unknown place {place}");
-                    }
-                    let mut bucket = [0u8];
-                    r.read_exact(&mut bucket)?;
-                    let mut cell = Cell {
-                        place: PlaceId(place),
-                        bucket: bucket[0],
-                        at: read_f64(r)?,
-                        runs: 0.,
-                        load_c: 0.,
-                        front_mi: 0.,
-                        rest_mi: 0.,
-                        rest_us: 0.,
-                        tokens_us: 0.,
-                        sent: 0.,
-                        copy_us: 0.,
-                        sent_kb: 0.,
-                    };
-                    for s in cell.speed() {
-                        *s = read_f64(r)?;
-                    }
-                    for s in cell.copies().into_iter().take(if sized { 3 } else { 2 }) {
-                        *s = read_f64(r)?;
-                    }
-                    rec.cells.push(cell);
-                }
+                read(&mut rec, r, places).with_context(|| format_compact!("unit {key}"))?;
                 for h in rec.all() {
                     *h = de.deserialize(r).map_err(|e| anyhow!("{e:?}"))?;
                 }
@@ -806,11 +798,99 @@ impl Stats {
                 map.insert(key, rec);
             }
         }
+        Ok(())
+    }
+
+    fn read(r: &mut impl Read, decay: Decay) -> Result<Self> {
+        let mut stats = Self::new(decay);
+        stats.read_places(r, |p, r| {
+            for q in &mut p.curve {
+                for _ in 0..read_u32(r)? {
+                    q.push_back(Comparison { at: read_f64(r)?, ratio: read_f64(r)?, weight: read_f64(r)? });
+                }
+            }
+            for q in &mut p.sends {
+                for _ in 0..read_u32(r)? {
+                    q.push_back(Send { at: read_f64(r)?, copy_us: read_f64(r)?, kb: read_f64(r)? });
+                }
+            }
+            Ok(())
+        })?;
+        stats.read_units(r, |rec, r, places| {
+            for _ in 0..read_u32(r)? {
+                let place = read_place(r, places)?;
+                rec.runs_kept.push_back(RunSample {
+                    place,
+                    at: read_f64(r)?,
+                    load_c: read_u32(r)?,
+                    front_mi: read_f64(r)?,
+                    rest_mi: read_f64(r)?,
+                    rest_us: read_f64(r)?,
+                    tokens_us: read_f64(r)?,
+                });
+            }
+            for _ in 0..read_u32(r)? {
+                let place = read_place(r, places)?;
+                let send = Send { at: read_f64(r)?, copy_us: read_f64(r)?, kb: read_f64(r)? };
+                rec.sends.push_back(UnitSend { place, send });
+            }
+            Ok(())
+        })?;
+        Ok(stats)
+    }
+
+    /// A table of decayed sums: each sum's mean becomes one sample.
+    fn read_sums(r: &mut impl Read, decay: Decay) -> Result<Self> {
+        let mut stats = Self::new(decay);
+        stats.read_places(r, |p, r| {
+            for q in &mut p.curve {
+                let (at, time_us, calibrated_us) = (read_f64(r)?, read_f64(r)?, read_f64(r)?);
+                if calibrated_us > 0. {
+                    q.push_back(Comparison { at, ratio: time_us / calibrated_us, weight: calibrated_us });
+                }
+            }
+            for q in &mut p.sends {
+                let (at, n, us, kb, _kb2, _kb_us) =
+                    (read_f64(r)?, read_f64(r)?, read_f64(r)?, read_f64(r)?, read_f64(r)?, read_f64(r)?);
+                if n > 0. {
+                    q.push_back(Send { at, copy_us: us / n, kb: kb / n });
+                }
+            }
+            Ok(())
+        })?;
+        stats.read_units(r, |rec, r, places| {
+            for _ in 0..read_u32(r)? {
+                let place = read_place(r, places)?;
+                let mut bucket = [0u8];
+                r.read_exact(&mut bucket)?;
+                let at = read_f64(r)?;
+                let mut sums = [0.; 9];
+                for s in &mut sums {
+                    *s = read_f64(r)?;
+                }
+                let [runs, load_c, front_mi, rest_mi, rest_us, tokens_us, sent, copy_us, sent_kb] = sums;
+                if runs > 0. {
+                    rec.runs_kept.push_back(RunSample {
+                        place,
+                        at,
+                        load_c: (load_c / runs) as u32,
+                        front_mi: front_mi / runs,
+                        rest_mi: rest_mi / runs,
+                        rest_us: rest_us / runs,
+                        tokens_us: tokens_us / runs,
+                    });
+                }
+                if sent > 0. {
+                    rec.sends.push_back(UnitSend { place, send: Send { at, copy_us: copy_us / sent, kb: sent_kb / sent } });
+                }
+            }
+            Ok(())
+        })?;
         Ok(stats)
     }
 
     /// A table of instruction counts: each unit's medians become a seed
-    /// cell, and its other histograms carry over.
+    /// run, and its other histograms carry over.
     fn read_old(r: &mut impl Read, decay: Decay) -> Result<Self> {
         let mut stats = Self::new(decay);
         let mut de = Deserializer::new();
@@ -828,9 +908,9 @@ impl Stats {
                     *n = read_u64(r)?;
                 }
                 let [cost, front, width, wall, mem, copy, sent] = old;
-                if let (Some(cost_mi), Some(width_c)) = (median(&cost), median(&width)) {
-                    let front_mi = median(&front).unwrap_or(0).min(cost_mi);
-                    rec.cells.push(seed_cell(front_mi, cost_mi - front_mi, width_c, now));
+                if let (Some(cost_mi), Some(width_c)) = (hist_median(&cost), hist_median(&width)) {
+                    let front_mi = hist_median(&front).unwrap_or(0).min(cost_mi);
+                    rec.runs_kept.push_back(seed_run(front_mi, cost_mi - front_mi, width_c, now));
                 }
                 (rec.mem_kb, rec.wall_ms, rec.copy_ms, rec.sent_kb) = (mem, wall, copy, sent);
                 map.insert(key, rec);
@@ -853,33 +933,35 @@ impl Stats {
             write_key(&mut w, &p.key)?;
             w.write_all(&p.fast.to_be_bytes())?;
             w.write_all(&p.rate.to_be_bytes())?;
-            for b in &p.curve {
-                for x in [b.at, b.time_us, b.calibrated_us] {
-                    w.write_all(&x.to_be_bytes())?;
+            for q in &p.curve {
+                w.write_all(&(q.len() as u32).to_be_bytes())?;
+                for c in q {
+                    write_f64s(&mut w, &[c.at, c.ratio, c.weight])?;
                 }
             }
-            for sends in &p.sends {
-                for x in [sends.at, sends.n, sends.us, sends.kb, sends.kb2, sends.kb_us] {
-                    w.write_all(&x.to_be_bytes())?;
+            for q in &p.sends {
+                w.write_all(&(q.len() as u32).to_be_bytes())?;
+                for s in q {
+                    write_f64s(&mut w, &[s.at, s.copy_us, s.kb])?;
                 }
             }
         }
         let mut ser = V2Serializer::new();
-        for map in [&mut self.exact, &mut self.coarse] {
+        for map in [&self.exact, &self.coarse] {
             w.write_all(&(map.len() as u32).to_be_bytes())?;
-            for (key, rec) in map.iter_mut() {
+            for (key, rec) in map.iter() {
                 write_key(&mut w, key)?;
-                w.write_all(&(rec.cells.len() as u32).to_be_bytes())?;
-                for cell in &mut rec.cells {
-                    w.write_all(&cell.place.0.to_be_bytes())?;
-                    w.write_all(&[cell.bucket])?;
-                    w.write_all(&cell.at.to_be_bytes())?;
-                    for s in cell.speed() {
-                        w.write_all(&s.to_be_bytes())?;
-                    }
-                    for s in cell.copies() {
-                        w.write_all(&s.to_be_bytes())?;
-                    }
+                w.write_all(&(rec.runs_kept.len() as u32).to_be_bytes())?;
+                for s in &rec.runs_kept {
+                    w.write_all(&s.place.0.to_be_bytes())?;
+                    w.write_all(&s.at.to_be_bytes())?;
+                    w.write_all(&s.load_c.to_be_bytes())?;
+                    write_f64s(&mut w, &[s.front_mi, s.rest_mi, s.rest_us, s.tokens_us])?;
+                }
+                w.write_all(&(rec.sends.len() as u32).to_be_bytes())?;
+                for s in &rec.sends {
+                    w.write_all(&s.place.0.to_be_bytes())?;
+                    write_f64s(&mut w, &[s.send.at, s.send.copy_us, s.send.kb])?;
                 }
                 for h in rec.each() {
                     ser.serialize(h, &mut w).map_err(|e| anyhow!("{e:?}"))?;
@@ -896,43 +978,46 @@ impl Stats {
     }
 }
 
-fn seed_cell(front_mi: u64, rest_mi: u64, width_c: u64, now: f64) -> Cell {
+fn seed_run(front_mi: u64, rest_mi: u64, width_c: u64, now: f64) -> RunSample {
     let rest_us = 1e6;
-    Cell {
+    RunSample {
         place: PlaceId(0),
-        bucket: 0,
         at: now,
-        runs: 1.,
-        load_c: 0.,
+        load_c: 0,
         front_mi: front_mi as f64,
         rest_mi: rest_mi as f64,
         rest_us,
         tokens_us: rest_us * width_c as f64 / 100.,
-        sent: 0.,
-        copy_us: 0.,
-        sent_kb: 0.,
     }
 }
 
-fn read_u32(r: &mut impl Read) -> Result<u32> {
+fn read_u32(r: &mut (impl Read + ?Sized)) -> Result<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(u32::from_be_bytes(b))
 }
 
-fn read_u64(r: &mut impl Read) -> Result<u64> {
+fn read_u64(r: &mut (impl Read + ?Sized)) -> Result<u64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b)?;
     Ok(u64::from_be_bytes(b))
 }
 
-fn read_f64(r: &mut impl Read) -> Result<f64> {
+fn read_f64(r: &mut (impl Read + ?Sized)) -> Result<f64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b)?;
     Ok(f64::from_be_bytes(b))
 }
 
-fn read_key(r: &mut impl Read) -> Result<ArcStr> {
+fn read_place(r: &mut (impl Read + ?Sized), places: u32) -> Result<PlaceId> {
+    let place = read_u32(r)?;
+    if place >= places {
+        bail!("a sample at unknown place {place}");
+    }
+    Ok(PlaceId(place))
+}
+
+fn read_key(r: &mut (impl Read + ?Sized)) -> Result<ArcStr> {
     let mut key = vec![0u8; read_u32(r)? as usize];
     r.read_exact(&mut key)?;
     Ok(ArcStr::from(String::from_utf8(key).context("key")?))
@@ -941,6 +1026,13 @@ fn read_key(r: &mut impl Read) -> Result<ArcStr> {
 fn write_key(w: &mut impl Write, key: &str) -> Result<()> {
     w.write_all(&(key.len() as u32).to_be_bytes())?;
     Ok(w.write_all(key.as_bytes())?)
+}
+
+fn write_f64s(w: &mut impl Write, xs: &[f64]) -> Result<()> {
+    for x in xs {
+        w.write_all(&x.to_be_bytes())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1042,20 +1134,46 @@ mod test {
     }
 
     #[test]
-    fn weights_halve_every_half_life() {
+    fn old_runs_stop_counting_as_they_age() {
         let mut s = Stats::new(Decay::default());
         let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/0", 1000, 1000));
         s.set_now(0.);
-        // 60 s at b against 30 at a: b's bucket holds 60 s of time for
-        // about 30 of calibrated time, beside the prior's 30.
-        s.record(&unit("u:1", "u"), &run(a, 0, 30_000));
-        s.record(&unit("u:1", "u"), &run(b, 0, 60_000));
-        let fresh = s.factor(b, 0);
+        // b takes twice as long as a on the same unit.
+        for _ in 0..10 {
+            s.record(&unit("u:1", "u"), &run(a, 0, 30_000));
+            s.record(&unit("u:1", "u"), &run(b, 0, 60_000));
+        }
+        let ratio = |s: &Stats| s.factor(b, 0) / s.factor(a, 0);
+        assert!(ratio(&s) > 1.5, "{}", ratio(&s));
+        // A median doesn't drift: a day later the runs still outweigh the
+        // calibration.
         s.set_now(Decay::default().half_life_s);
-        let old = s.factor(b, 0);
-        assert!(fresh > old && old > 1., "{fresh} {old}");
+        assert!(ratio(&s) > 1.5, "{}", ratio(&s));
         s.set_now(Decay::default().half_life_s * 30.);
-        assert!(near(s.factor(b, 0), 1.), "back to its calibration");
+        assert!((ratio(&s) - 1.).abs() < 0.01, "back to the calibration: {}", ratio(&s));
+    }
+
+    #[test]
+    fn one_bad_run_or_send_does_not_move_a_median() {
+        let mut s = Stats::new(Decay::default());
+        let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/all", 1000, 1000));
+        for _ in 0..20 {
+            s.record(&unit("u:1", "u"), &run(a, 0, 1000));
+            s.record(&unit("u:1", "u"), &run(b, 0, 2000));
+        }
+        let before = s.factor(b, 0) / s.factor(a, 0);
+        // One run there starved behind other work: fifty times as long.
+        s.record(&unit("u:1", "u"), &run(b, 0, 100_000));
+        let after = s.factor(b, 0) / s.factor(a, 0);
+        assert!((after - before).abs() < before * 0.05, "{before} {after}");
+        // Seven sends of a second, then one that took 135 s.
+        let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1000, copy_ms, links: true }), ..run(b, 0, 100) };
+        for _ in 0..7 {
+            s.record(&unit("t:1", "t"), &sent(1000));
+        }
+        s.record(&unit("t:1", "t"), &sent(135_000));
+        assert_eq!(s.copy_us(&unit("t:1", "t"), b, true, 1000), 1_000_000);
+        assert_eq!(s.copy_us(&unit("other:1", "other"), b, true, 1000), 1_000_000);
     }
 
     #[test]
@@ -1063,18 +1181,17 @@ mod test {
         let mut s = Stats::new(Decay::default());
         let there = s.place("b/all", 1000, 1000);
         let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms, links: false }), ..run(there, 0, 100) };
-        // 10 s to move its files on a slow link, then 1 s two hours later:
-        // the old one counts a quarter.
+        // Twice 10 s to move its files on a slow link, then 1 s two hours
+        // later: the old ones count a quarter each, and the new one wins
+        // the median. At the day's half-life they'd still outweigh it.
         s.set_now(0.);
+        s.record(&unit("a:1", "a"), &sent(10_000));
         s.record(&unit("a:1", "a"), &sent(10_000));
         s.set_now(2. * 3600.);
         s.record(&unit("a:1", "a"), &sent(1000));
-        let want = (10. * 0.25 + 1.) / 1.25 * 1e6;
-        let got = s.copy_us(&unit("a:1", "a"), there, false, 1) as f64;
-        assert!((got - want).abs() < want * 0.01, "{got} {want}");
-        let every = s.copy_us(&unit("b:1", "b"), there, false, 1) as f64;
-        assert!((every - want).abs() < want * 0.01, "every unit's too: {every}");
-        // Its size counts both runs nearly alike.
+        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 1), 1_000_000);
+        assert_eq!(s.copy_us(&unit("b:1", "b"), there, false, 1), 1_000_000, "every unit's too");
+        // Its size counts every run.
         let p = predict(&s, &unit("a:1", "a"));
         assert!((99..=100).contains(&p.rest_mi), "{}", p.rest_mi);
     }
@@ -1088,13 +1205,12 @@ mod test {
             ..run(there, 0, 100)
         };
         // Sent cold, its 100 MB of rlibs took 10 s; warm, nothing to send,
-        // 1 s: 90 µs a kB, which a hundred of each mostly outweigh the guess
-        // of 20 with.
-        for _ in 0..100 {
+        // 1 s: 90 µs a kB.
+        for _ in 0..20 {
             s.record(&unit("bin:1", "bin"), &sent(10_000, 100_000));
             s.record(&unit("bin:1", "bin"), &sent(1000, 0));
         }
-        let near = |got: u64, want: u64| got.abs_diff(want) < want / 10;
+        let near = |got: u64, want: u64| got.abs_diff(want) < want / 50;
         let bin = unit("bin:1", "bin");
         assert!(near(s.copy_us(&bin, there, true, 0), 1_000_000), "{}", s.copy_us(&bin, there, true, 0));
         assert!(near(s.copy_us(&bin, there, true, 100_000), 10_000_000), "{}", s.copy_us(&bin, there, true, 100_000));
@@ -1102,7 +1218,7 @@ mod test {
         let other = unit("other:1", "other");
         assert!(near(s.copy_us(&other, there, true, 50_000), 5_500_000), "{}", s.copy_us(&other, there, true, 50_000));
         let (mean, mb_per_s) = s.sends(there, true);
-        assert!(mean.is_some() && (10. ..12.).contains(&mb_per_s), "{mb_per_s}");
+        assert!(mean.is_some() && (11. ..11.2).contains(&mb_per_s), "{mb_per_s}");
     }
 
     #[test]
@@ -1132,6 +1248,7 @@ mod test {
         assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 0), COPY_US as u64, "a guess");
         s.record(&unit("a:1", "a"), &sent(300, false));
         s.record(&unit("b:1", "b"), &sent(100, false));
+        s.record(&unit("d:1", "d"), &sent(200, false));
         s.record(&unit("bin:1", "bin"), &sent(9000, true));
         // Each sent 1 kB; so does the next.
         assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 1), 300_000);

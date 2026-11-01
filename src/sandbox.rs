@@ -118,8 +118,10 @@ pub async fn listen(publisher: Publisher, path: NPath, server: Arc<Server>) -> R
 
 /// Serve one remote job on `con`.
 pub async fn serve(server: Arc<Server>, con: Connection) -> Result<()> {
-    let ToServer::Offer { unit, key, target, class } = con.recv_one().await? else {
-        bail!("expected an offer");
+    let (unit, key, target, class) = match con.recv_one().await? {
+        ToServer::Offer { unit, key, target, class } => (unit, key, target, class),
+        ToServer::Heartbeat(_) => return con.send_one(&FromServer::Heartbeat).await,
+        m => bail!("expected an offer, got {m:?}"),
     };
     let Some(tc) = server.toolchains.iter().find(|t| t.toolchain.builds(&key, target.as_deref())) else {
         let why: ArcStr = format_compact!("no toolchain {key}").as_str().into();

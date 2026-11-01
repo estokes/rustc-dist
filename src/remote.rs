@@ -18,7 +18,7 @@ use std::{
     path::{Component, Path, PathBuf},
     pin::pin,
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::time;
 
@@ -60,6 +60,9 @@ pub enum ToServer {
     Manifest { files: Vec<FileEntry>, dirs: Vec<ArcStr>, late: Option<Late> },
     Chunk { hash: Hash, data: Bytes, last: bool },
     Run { args: Vec<ArcStr>, env: Vec<(ArcStr, ArcStr)>, cwd: ArcStr },
+    /// Instead of an offer: bytes to time a send by, which the server
+    /// answers and drops.
+    Heartbeat(Bytes),
 }
 
 #[derive(Debug, Pack)]
@@ -81,6 +84,8 @@ pub enum FromServer {
     /// rlibs.
     Exit { code: i32, ran: Ran, linker_waited_us: u64, measured: Measured },
     Failed(ArcStr),
+    /// A heartbeat arrived.
+    Heartbeat,
 }
 
 /// The files a job reads and the directories it needs, at their absolute
@@ -457,6 +462,30 @@ pub async fn run(
     let kept = staged.crates().chain(built).collect();
     let moved = Moved { bytes: sent.load(Ordering::Relaxed), linker_waited_us, kept };
     Ok(Outcome::Exit { code, ran, measured, moved })
+}
+
+/// Send `kb` of bytes no box holds to the box listening at `jobs`, and
+/// return how many µs that took, connecting included, as sending a job's
+/// files does.
+pub async fn heartbeat(subscriber: &Subscriber, jobs: NPath, kb: u64) -> Result<u64> {
+    let mut x = std::process::id() as u64 ^ (kb << 32) ^ 0x9e37_79b9_7f4a_7c15;
+    let data: Bytes = (0..kb * 1024)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect::<Vec<u8>>()
+        .into();
+    let start = Instant::now();
+    let con = Connection::connect(subscriber, jobs.clone()).await.context("connecting")?;
+    con.send_one(&ToServer::Heartbeat(data))?;
+    con.flush().await?;
+    match next(&con).await? {
+        FromServer::Heartbeat => Ok(start.elapsed().as_micros() as u64),
+        m => bail!("{jobs}: unexpected {m:?}"),
+    }
 }
 
 /// Send the blob `hash`, adding its size to `sent`.

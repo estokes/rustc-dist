@@ -69,6 +69,9 @@ const MEASURE: Duration = Duration::from_millis(250);
 /// Every other job, including one never measured, is heavy and may run on
 /// every CPU.
 const LIGHT_WIDTH_C: u64 = 150;
+/// A box this box has sent nothing to for this long, while jobs wait here,
+/// gets a heartbeat at most this often.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 /// A change in load this large, in hundredths of a task per CPU, is
 /// published even if nothing else changed.
 const LOAD_STEP_C: u32 = 25;
@@ -108,7 +111,17 @@ pub enum Msg {
     Status { reply: oneshot::Sender<Status> },
     Profile { profile: Profile, recalibrate: bool },
     Calibrated { profile: Profile, result: Result<Vec<Class>> },
+    /// A heartbeat moved `kb` to the box `name` in `us`.
+    Heartbeat { name: ArcStr, kb: u64, us: u64 },
     Drain,
+}
+
+/// A heartbeat for the daemon to send: `kb` to the box `name` listening at
+/// `jobs`.
+pub struct Heartbeat {
+    pub name: ArcStr,
+    pub jobs: NPath,
+    pub kb: u64,
 }
 
 pub enum Admission {
@@ -638,6 +651,8 @@ pub struct Setup {
     pub runnable: Box<dyn Fn() -> Result<u32> + Send + Sync>,
     /// The hashes of files jobs sent to other boxes read.
     pub hashes: Arc<Hashes>,
+    /// Where heartbeats to other boxes go to be sent.
+    pub heartbeats: mpsc::UnboundedSender<Heartbeat>,
     pub tokens_per_cpu: f64,
     pub calibration_seconds: u64,
     pub decay: Decay,
@@ -802,6 +817,11 @@ struct RemoteBox {
     /// µs until the first of those jobs is predicted to end.
     unseen_left_us: Option<u64>,
     held: Held,
+    /// When a job from here last ran there or a heartbeat was last sent
+    /// there, and how many heartbeats it has had.
+    used: Option<Instant>,
+    heartbeat: Option<Instant>,
+    heartbeats: u64,
     /// It answered busy, so its state is stale until this version.
     busy_until: Option<u64>,
     /// When its state arrived, which its predictions count from.
@@ -1116,6 +1136,16 @@ impl Sched {
             }
             Msg::Profile { profile, recalibrate } => self.switch_to(profile, recalibrate)?,
             Msg::Calibrated { profile, result } => self.calibrated(profile, result)?,
+            Msg::Heartbeat { name, kb, us } => {
+                if let Some(rb) = self.remotes.iter().find(|r| r.name == name)
+                    && let Some((_, places)) = &rb.state
+                {
+                    let mut at: LPooled<Vec<PlaceId>> = LPooled::take();
+                    at.push(places.all);
+                    at.extend(places.classes.iter().copied());
+                    self.stats.heartbeat(&at, kb, us);
+                }
+            }
             Msg::Drain => return Ok(false),
         }
         Ok(true)
@@ -1179,6 +1209,7 @@ impl Sched {
     fn remote_done(&mut self, job: JobId, unit: &Unit, outcome: RemoteOutcome) {
         let Some(r) = self.take_running(job) else { return };
         let Place::Remote { remote, .. } = r.place else { return };
+        self.remotes[remote].used = Some(Instant::now());
         match outcome {
             RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer, kept }) => {
                 self.mismatches.remove(&unit.exact);
@@ -1209,6 +1240,9 @@ impl Sched {
                     avail: Vec::new(),
                     unseen_left_us: None,
                     held: Held::default(),
+                    used: None,
+                    heartbeat: None,
+                    heartbeats: 0,
                     busy_until: None,
                     seen: Instant::now(),
                 });
@@ -1678,6 +1712,7 @@ impl Sched {
             }
         }
         self.layout.pool.copy_from_slice(&held);
+        self.heartbeats(now, &granted);
         granted.sort_unstable_by_key(|&(i, ..)| std::cmp::Reverse(i));
         for &(i, place, run_us, at) in granted.iter() {
             let w = self.queue.swap_remove(i);
@@ -1695,6 +1730,29 @@ impl Sched {
                 }
                 Place::Remote { remote, class, .. } => self.send_remote(w, remote, class, at, run_us, now),
             }
+        }
+    }
+
+    /// While jobs wait here, send a heartbeat to each box that has a token
+    /// free but has run nothing from here, nor had a heartbeat, for
+    /// `HEARTBEAT_EVERY`, so its transfer stats stay current though its
+    /// recent sends judged it badly: half a MB and a MB in turn.
+    fn heartbeats(&mut self, now: Instant, granted: &[(usize, Place, u64, PlaceId)]) {
+        let waiting = self.queue.len() > granted.len();
+        if !waiting {
+            return;
+        }
+        let quiet = |t: Option<Instant>| t.is_none_or(|t| now.duration_since(t) >= HEARTBEAT_EVERY);
+        for (i, rb) in self.remotes.iter_mut().enumerate() {
+            let busy = self.running.iter().any(|r| matches!(r.place, Place::Remote { remote, .. } if remote == i))
+                || granted.iter().any(|(_, p, ..)| matches!(p, Place::Remote { remote, .. } if *remote == i));
+            if rb.state.is_none() || busy || !rb.avail.iter().any(|&n| n > 0) || !quiet(rb.used) || !quiet(rb.heartbeat) {
+                continue;
+            }
+            rb.heartbeat = Some(now);
+            rb.heartbeats += 1;
+            let kb = if rb.heartbeats % 2 == 1 { 512 } else { 1024 };
+            let _ = self.setup.heartbeats.send(Heartbeat { name: rb.name.clone(), jobs: rb.jobs.clone(), kb });
         }
     }
 
@@ -2183,13 +2241,20 @@ mod test {
         /// Counts the tasks runnable on the box, whatever runs there.
         runnable: Box<dyn Fn() -> Result<u32> + Send + Sync>,
         hashes: Arc<Hashes>,
+        heartbeats: mpsc::UnboundedSender<Heartbeat>,
     }
 
     /// An idle box with `capacity_kb` that nothing else uses, and a token
     /// per CPU.
     fn room(capacity_kb: u64) -> Room {
         let memory = Box::new(move || Ok(BoxMemory { capacity_kb, used_kb: 0 }));
-        Room { memory, tokens_per_cpu: 1., runnable: Box::new(|| Ok(0)), hashes: Arc::new(Hashes::default()) }
+        Room {
+            memory,
+            tokens_per_cpu: 1.,
+            runnable: Box::new(|| Ok(0)),
+            hashes: Arc::new(Hashes::default()),
+            heartbeats: mpsc::unbounded_channel().0,
+        }
     }
 
     /// A scheduler on the state in `dir`, in the default profile.
@@ -2201,6 +2266,7 @@ mod test {
             memory: room.memory,
             runnable: room.runnable,
             hashes: room.hashes,
+            heartbeats: room.heartbeats,
             tokens_per_cpu: room.tokens_per_cpu,
             calibration_seconds: 4,
             decay: Decay::default(),
@@ -2781,6 +2847,35 @@ mod test {
         held.used(&[(h(1), 40)], 100);
         held.used(&[(h(3), 40)], 100);
         assert_eq!(held.missing_kb(&[(Some(h(1)), 40), (Some(h(2)), 40), (Some(h(3)), 40), (None, 5)]), 45);
+    }
+
+    #[tokio::test]
+    async fn an_idle_box_gets_a_heartbeat_only_while_jobs_wait_here() -> Result<()> {
+        let dir = scratch("heartbeat");
+        let (heartbeats, mut sent) = mpsc::unbounded_channel();
+        let room = Room { heartbeats, ..room(u64::MAX) };
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], room, &[], &[])?;
+        // b is a hundred times slower: jobs wait for this box rather than go.
+        s.farm("b".into(), Some(remote_box(100_000, 4, 4, 1)));
+        history(&mut s, "big", 5_000_000, 100);
+        let _first = granted(&mut place(&mut s, &["big"], true)[0]);
+        assert!(sent.try_recv().is_err(), "no job waits");
+        let mut second = place(&mut s, &["big"], true);
+        assert!(second[0].try_recv().is_err(), "it waits here");
+        let hb = sent.try_recv().context("a heartbeat")?;
+        assert_eq!((hb.name.as_str(), hb.kb), ("b", 512));
+        s.dispatch();
+        assert!(sent.try_recv().is_err(), "at most one a minute");
+        s.remotes[0].heartbeat = Some(Instant::now() - HEARTBEAT_EVERY);
+        s.dispatch();
+        assert_eq!(sent.try_recv().context("the next heartbeat")?.kb, 1024);
+        // What it measured is a send there.
+        s.handle(Msg::Heartbeat { name: "b".into(), kb: 1024, us: 50_000 })?;
+        let at = s.remotes[0].state.as_ref().unwrap().1.all;
+        assert_eq!(s.stats.copy_us(&unit("big", &[]), at, false, 1024), 50_000);
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[tokio::test]

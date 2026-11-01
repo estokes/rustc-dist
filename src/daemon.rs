@@ -7,7 +7,7 @@ use crate::{
     protocol::{self, Ask, Job, PROTOCOL, Ran, Reads, Reply, Unit},
     remote::{self, Event, Moved, Outcome, ToServer},
     sandbox::{self, Server},
-    sched::{Admission, Msg, RemoteOutcome, RemoteSlot, Sched, SentRun, Setup, Want},
+    sched::{Admission, Heartbeat, Msg, RemoteOutcome, RemoteSlot, Sched, SentRun, Setup, Want},
     stats::Transfer,
     sys,
     toolchain::{self, Keys},
@@ -70,6 +70,7 @@ pub async fn run() -> Result<()> {
     let state_dir = config::state_dir();
     let profile = classes::current(&state_dir);
     let hashes = triomphe::Arc::new(Hashes::default());
+    let (heartbeats, heartbeat_rx) = mpsc::unbounded_channel();
     let setup = Setup {
         state_dir,
         fifo_dir: dir,
@@ -80,6 +81,7 @@ pub async fn run() -> Result<()> {
         },
         runnable: Box::new(sys::runnable),
         hashes: hashes.clone(),
+        heartbeats,
         tokens_per_cpu: cfg.tokens_per_cpu,
         calibration_seconds: cfg.calibration_seconds,
         decay: cfg.decay(),
@@ -98,6 +100,9 @@ pub async fn run() -> Result<()> {
             }
         },
     };
+    if let Some(subscriber) = subscriber.clone() {
+        tokio::spawn(send_heartbeats(subscriber, heartbeat_rx, tx.clone()));
+    }
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let ctx = Arc::new(Ctx {
         tx: tx.clone(),
@@ -293,6 +298,27 @@ async fn admit(sock: &mut UnixStream, ctx: &Ctx, unit: Unit, build: u32, remote:
                 }
             }
         }
+    }
+}
+
+/// Send each heartbeat the scheduler asks for, and tell it how long each
+/// took.
+async fn send_heartbeats(
+    subscriber: Subscriber,
+    mut asks: mpsc::UnboundedReceiver<Heartbeat>,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
+    while let Some(Heartbeat { name, jobs, kb }) = asks.recv().await {
+        let (subscriber, tx) = (subscriber.clone(), tx.clone());
+        tokio::spawn(async move {
+            match remote::heartbeat(&subscriber, jobs, kb).await {
+                Ok(us) => {
+                    debug!("heartbeat of {kb} kB to {name} took {} ms", us / 1000);
+                    let _ = tx.send(Msg::Heartbeat { name, kb, us });
+                }
+                Err(e) => warn!("heartbeat to {name}: {e:#}"),
+            }
+        });
     }
 }
 

@@ -56,6 +56,7 @@ async fn server(dir: &Path) -> Result<ServerBox> {
         memory: Box::new(|| sys::box_memory(0.5)),
         runnable: Box::new(sys::runnable),
         hashes: triomphe::Arc::new(Hashes::default()),
+        heartbeats: mpsc::unbounded_channel().0,
         tokens_per_cpu: 1.5,
         calibration_seconds: 4,
         decay: Decay::default(),
@@ -344,6 +345,18 @@ fn blob_count(dir: &Path) -> usize {
         .filter(|p| p.file_name().len() == 2)
         .map(|p| fs::read_dir(p.path()).unwrap().count())
         .sum()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_box_answers_a_heartbeat() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("rustc-dist-e2e-heartbeat-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let b = server(&dir.join("box")).await?;
+    let us = remote::heartbeat(&b.subscriber, b.jobs.clone(), 1024).await?;
+    assert!(us > 0 && us < 10_000_000, "{us}");
+    fs::remove_dir_all(&dir)?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

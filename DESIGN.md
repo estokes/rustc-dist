@@ -248,28 +248,32 @@ its front end at the fast rate plus the rest at the rate per CPU over the
 threads it can get, min(width, the place's CPUs for a heavy job), times the
 place's factor at the load there now plus the threads the job adds.
 
+Every estimate is a weighted median of recent samples, weights halving with
+age, so old samples fade but no one sample, however long, moves the middle.
 What a run teaches:
 
-- The unit: its record holds decayed sums per place and load bucket, so its
-  size uses each place's current factor.
+- The unit: its last 16 runs, each its work at its place's calibrated speed
+  and its load. Its size is the weighted median of the size each implies at
+  its place's current factor, and its width the median of their widths.
 - Its place's factor at its load, if the unit also ran elsewhere or under
-  another load: its time against what its size from those other runs
-  predicts at the place's calibrated speed, weighing `n/(n+1)` for `n` other
-  runs. A unit seen at one place and load only says nothing about that place
-  against the others. Long runs weigh the most, since the factor is total time
-  over total calibrated time.
+  another load: a comparison, its time over what its size from those other
+  runs predicts at the place's calibrated speed. It weighs that prediction
+  times `n/(n+1)` for `n` other runs, so long jobs count most. A unit seen at
+  one place and load only says nothing about that place against the others.
+  Each load bucket keeps its last 32 comparisons.
 
-Weights halve every `half_life_s` of wall-clock time, a day by default:
-the curves model load, so what a place learned stays good that long. Each
-bucket starts from the
-calibrated speed, flat up to one task per CPU and then slower in proportion as
-CPUs time-share, at the level the place has learned over all its buckets, so a
-bucket nothing has reached follows the ones that have. That start counts as
-30 s of runs in each bucket and never decays: a place with no recent
-comparisons drifts back to its calibration. A place whose calibration changes
-starts over. Only ratios between factors are fixed by data, since every unit
-could be bigger and every place faster; the calibration's weight anchors the
-scale.
+Weights halve every `half_life_s` of wall-clock time, a day by default: a box's
+speed doesn't change fast, and the curves model load, so what a place learned
+stays good that long. A bucket's factor is the weighted median of its
+comparisons and of the starting curve: the calibrated speed, flat up to one
+task per CPU and then slower in proportion as CPUs time-share. The curve counts
+as a sample of 3 s of runs that never ages, as much as a few typical jobs, so
+a few runs that agree outweigh it, and it outweighs runs grown old: a place
+with no recent comparisons goes back to its calibration. A bucket nothing has
+reached lies between the nearest buckets that have, relative to the curve. A
+place whose calibration changes starts over. Only ratios between factors are
+fixed by data, since every unit could be bigger and every place faster; the
+calibration's weight anchors the scale.
 
 A sent run's time is everything the client waits for, from offering the job to
 its last output. Its part other than compiling (staging and sending inputs,
@@ -285,12 +289,19 @@ box already holds, such as crates it just built, is cheap to send there:
   trimmed least recently used first to the cache size the box publishes, as
   the server trims its store. A file whose hash isn't known counts as
   missing everywhere.
-- The term is the unit's own sends to that place on average, else those of
-  every job there that links as it does or doesn't (a job that links sends
-  every rlib below it), else a guess of 200 ms, adjusted for the kB the box
-  lacks now against the kB those sends moved, at the µs per kB a line through
-  the sends there shows, drawn toward 50 MB/s as much as one send 100 MB from
-  their mean would draw it.
+- The term is the weighted median of the unit's own last 8 sends to that
+  place, else of the last 64 sends there of jobs that link as it does or
+  doesn't (a job that links sends every rlib below it), else a guess of
+  200 ms, each adjusted for the kB the box lacks now against the kB that send
+  moved, at the place's µs per kB: the weighted median of the slopes between
+  pairs of those 64 whose kB differ by at least 256 kB (Theil-Sen), with
+  50 MB/s as one more slope.
+- While jobs wait here, a box with a token free that has run nothing from here
+  and had no heartbeat for a minute gets one: half a MB or a MB, in turn, of
+  bytes no box holds, which the box answers and drops. Its time, connecting
+  included, is a send of each kind there, so a box whose recent sends judged
+  it badly gets fresh samples though no job goes. A heartbeat takes no token
+  and runs nothing.
 
 Its weights halve every `copy_half_life_s`, an hour by default, since the
 network a laptop is on changes as it moves. The server reports the token-µs and
@@ -433,7 +444,7 @@ work, so build times say nothing yet; placement is all that was checked.
 ### Farm
 
 A daemon whose config has `base` (say `/build`) joins the farm. The farm's
-netidx namespace is under the protocol version, `BASE/vN` (`/build/v14`), so
+netidx namespace is under the protocol version, `BASE/vN` (`/build/v15`), so
 boxes of different versions never see each other:
 
 - `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
@@ -835,7 +846,7 @@ nothing, so a send is now priced by the bytes the box lacks (see Cost).
 Open: placing a job also slows the jobs already on the box. The curves could
 predict that too, but at first a prediction covers only the job being placed.
 
-### Stage 6: robust estimates and heartbeats (planned 2026-11-01)
+### Stage 6: robust estimates and heartbeats (built 2026-11-01)
 
 The table's estimates are decayed means and sums, which one bad run moves:
 
@@ -881,11 +892,17 @@ box's sends of each kind, so throughput and the fixed cost of a send stay
 current, and enough fresh heartbeats outweigh old bad sends as those age.
 A heartbeat takes no token and runs nothing.
 
-Open: heartbeats keep a box's transfer stats fresh, but not its speed: a box
-whose factor says it is slow, wrongly, gets no runs to say otherwise, only
-time pulling it back to calibration. Sending it a real job now and then when
-it is idle and jobs wait here would, at some cost to that job. Or the prior's
-pull could be enough once the factor is a median.
+Heartbeats keep a box's transfer stats fresh, not its speed. A box's speed
+doesn't change the way a network does, and the calibration a factor goes back
+to as its runs age is a speed measured on that box, so no job is sent only to
+learn. If a wrong factor holds too long in practice, `half_life_s` is the
+knob.
+
+As built: the calibration counts as 3 s of runs rather than 30, since a median
+moves only once samples outweigh it, and 30 s held a box twenty times slower
+than its calibration at its calibration for over thirty one-second jobs; and
+a bucket nothing has reached lies between its neighbours rather than at a
+level for the whole place, which a median snaps to one side of.
 
 ## Farm test (2026-10-30)
 
@@ -1045,7 +1062,10 @@ Every number below is a guess. None has been tested on an idle box.
 | calibration keys per run (about 0.25 s on a P-core) | 2^15 | `src/calibrate.rs:20` |
 | halve a unit's histograms at | 256 runs | `src/stats.rs` `HALVE_AT` |
 | size of a job with no history at all | 1 G instructions | `src/stats.rs` `UNKNOWN_COST_MI` |
-| a place's calibration counts as, in each load bucket | 30 s of runs | `src/stats.rs` `PRIOR_US` |
+| a place's calibration counts as, in each load bucket | 3 s of runs | `src/stats.rs` `PRIOR_US` |
+| samples kept: a unit's runs, its sends to a place, a place's sends of a kind, a bucket's comparisons | 16, 8, 64, 32 | `src/stats.rs` `*_KEPT` |
+| two sends make a slope if their kB differ by | 256 kB | `src/stats.rs` `SLOPE_MIN_KB` |
+| heartbeat to an idle box while jobs wait, at most every | 60 s | `src/sched.rs` `HEARTBEAT_EVERY` |
 | runs count half toward speed and size after | 1 day | `half_life_s` in the config |
 | sent runs count half toward time moving files after | 1 hour | `copy_half_life_s` in the config |
 | load buckets, runnable tasks per CPU | 0, ¼, ½, ¾, 1, 1½, 2, 3, 4, 6, 8 | `src/stats.rs` `BUCKETS` |
