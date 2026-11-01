@@ -483,13 +483,15 @@ impl Record {
         [&mut self.mem_kb, &mut self.wall_ms, &mut self.copy_ms, &mut self.sent_kb]
     }
 
+    /// Add a send, dropping the oldest at its place past `UNIT_SENDS_KEPT`.
     fn send(&mut self, s: UnitSend) {
         let there = self.sends.iter().filter(|o| o.place == s.place).count();
-        if there >= UNIT_SENDS_KEPT
-            && let Some(i) = self.sends.iter().position(|o| o.place == s.place)
-        {
-            self.sends.remove(i);
-        }
+        let mut excess = (there + 1).saturating_sub(UNIT_SENDS_KEPT);
+        self.sends.retain(|o| {
+            let old = excess > 0 && o.place == s.place;
+            excess -= usize::from(old);
+            !old
+        });
         self.sends.push_back(s);
     }
 
@@ -1046,7 +1048,7 @@ impl Stats {
         Ok(stats)
     }
 
-    // CR claude for claude: [risk/low] This pushes one RunSample per rdstats8 cell, a
+    // XCR claude for claude: [risk/low] This pushes one RunSample per rdstats8 cell, a
     // place and load bucket, so a unit that ran in more than RUNS_KEPT of them loads with
     // runs_kept over the cap. `push` trims only when len == cap, so such a queue never
     // shrinks back and grows by one per run until its samples age out at KEEP_S. Not hit
@@ -1073,6 +1075,14 @@ impl Stats {
     // not 8. Fix: trim in Record::send with a loop (while there >= UNIT_SENDS_KEPT), or
     // load read_sums' sends through Record::send after the sort, and extend the test to
     // cover it.
+    // 2026-11-01 claude: Record::send now drops every send at the new send's place past
+    // UNIT_SENDS_KEPT, oldest first (one retain pass), so a unit loaded from an rdstats8
+    // table with more sends at a place than that is back to the cap after its next send
+    // there. The test is renamed
+    // a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_or_sends_than_any_unit:
+    // each of its 20 cells now also holds a send, the unit loads with 20 sends, and after
+    // one sent run at a/0 it must hold UNIT_SENDS_KEPT (8), oldest first, the oldest 7 s
+    // old. With Record::send dropping one per send it fails at 20 sends (checked).
     /// A table of decayed sums: each sum's mean becomes one sample, kept
     /// oldest first.
     fn read_sums(r: &mut impl Read, decay: Decay) -> Result<Self> {
@@ -1767,7 +1777,7 @@ mod test {
     }
 
     #[test]
-    fn a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_than_any_unit() -> Result<()> {
+    fn a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_or_sends_than_any_unit() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("rustc-dist-stats-sums-{}", std::process::id()));
         fs::create_dir_all(&dir)?;
         let path = dir.join("jobs.hdr");
@@ -1780,8 +1790,8 @@ mod test {
             w.write_all(&rate.to_be_bytes())?;
             write_f64s(&mut w, &[0.; 3 * BUCKETS.len() + 2 * 6])?;
         }
-        // a:1 ran in more cells than a unit keeps runs, written newest
-        // first: two runs of a second in each.
+        // a:1 ran in more cells than a unit keeps runs or sends, written
+        // newest first: two runs of a second and a send of 100 ms in each.
         let now = now_s();
         let cells = RUNS_KEPT + 4;
         w.write_all(&1u32.to_be_bytes())?;
@@ -1790,7 +1800,7 @@ mod test {
         for age in 1..=cells {
             w.write_all(&1u32.to_be_bytes())?;
             w.write_all(&[0u8])?;
-            write_f64s(&mut w, &[now - age as f64, 2., 0., 0., 2000., 2e6, 2e6, 0., 0., 0.])?;
+            write_f64s(&mut w, &[now - age as f64, 2., 0., 0., 2000., 2e6, 2e6, 1., 100_000., 1.])?;
         }
         let mut ser = V2Serializer::new();
         for h in Record::new().each() {
@@ -1802,15 +1812,21 @@ mod test {
         w.write_all(&0u32.to_be_bytes())?;
         drop(w);
         let mut s = Stats::load(&path, Decay::default())?;
-        assert_eq!(s.exact["a:1"].runs_kept.len(), cells);
+        assert_eq!((s.exact["a:1"].runs_kept.len(), s.exact["a:1"].sends.len()), (cells, cells));
         assert_eq!(predict(&s, &unit("a:1", "a")).rest_mi, 1000);
         let a = s.place("a/0", 1000, 1000);
-        s.record(&unit("a:1", "a"), &run(a, 0, 1000));
-        let runs = &s.exact["a:1"].runs_kept;
+        let sent = Run { origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms: 100, links: false }), ..run(a, 0, 1000) };
+        s.record(&unit("a:1", "a"), &sent);
+        let r = &s.exact["a:1"];
+        let runs = &r.runs_kept;
         assert_eq!(runs.len(), RUNS_KEPT);
         let oldest = now - runs[0].at;
         assert!((oldest - (RUNS_KEPT - 1) as f64).abs() < 1e-3, "{oldest}");
         assert!(runs.iter().zip(runs.iter().skip(1)).all(|(a, b)| a.at <= b.at));
+        assert_eq!(r.sends.len(), UNIT_SENDS_KEPT);
+        let oldest = now - r.sends[0].send.at;
+        assert!((oldest - (UNIT_SENDS_KEPT - 1) as f64).abs() < 1e-3, "{oldest}");
+        assert!(r.sends.iter().zip(r.sends.iter().skip(1)).all(|(a, b)| a.send.at <= b.send.at));
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
