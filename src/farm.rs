@@ -273,7 +273,7 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
                     let _ = tx.send(Msg::Farm { name, state });
                 }
             }
-            // CR claude for claude: [bug/high] A resolver error ends the farm for good.
+            // XCR claude for claude: [bug/high] A resolver error ends the farm for good.
             // check_changed and list return Err once netidx's read client gives up on the resolver
             // (four tries with random waits of 1 to 12 s), and `?` ends run: this box's state
             // columns are unpublished as `cells` drops, it stops watching the others, and it stays
@@ -284,11 +284,32 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
             // suspend is enough. Fix: log the error and try again at the next tick, and whenever
             // run returns send `state: None` for each watched box. No test covers a resolver that
             // goes away and comes back. (farm-01)
+            // 2026-11-01 claude: A failed check_changed or list in the list tick is logged as a
+            // warning and tried again at the next tick, and after the loop run sends Msg::Farm {
+            // state: None } for every box it watched.
+            // farm::test::boxes_see_each_others_state_as_it_changes_until_their_farm_task_ends
+            // drops b's load sender and fails if b's scheduler isn't told a is gone (checked). No
+            // test covers a resolver that goes away and comes back: netidx retries for tens of
+            // seconds first. Still standing: while a resolver call retries inside the tick's
+            // handler, the loop neither publishes nor reads states; moving the listing into its own
+            // task would fix that, left out to keep this change to error handling.
             _ = list.tick() => {
-                if !m.subscriber.resolver().check_changed(&mut tracker).await? {
-                    continue;
+                let resolver = m.subscriber.resolver();
+                let listing: Result<Option<_>> = async {
+                    if !resolver.check_changed(&mut tracker).await? {
+                        return Ok(None);
+                    }
+                    Ok(Some(resolver.list(table.clone()).await?))
                 }
-                let listed = m.subscriber.resolver().list(table.clone()).await?;
+                .await;
+                let listed = match listing {
+                    Ok(Some(listed)) => listed,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!("listing the farm's boxes, trying again: {e:#}");
+                        continue;
+                    }
+                };
                 let present: Vec<ArcStr> = listed
                     .iter()
                     .filter_map(|p| Path::basename(p).map(ArcStr::from))
@@ -322,6 +343,9 @@ pub async fn run(m: Member, mut load: watch::Receiver<Load>, tx: mpsc::Unbounded
                 columns.retain(|_, (name, _)| boxes.contains_key(name));
             }
         }
+    }
+    for name in boxes.into_keys() {
+        let _ = tx.send(Msg::Farm { name, state: None });
     }
     Ok(())
 }
@@ -365,7 +389,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn boxes_see_each_others_state_as_it_changes() -> Result<()> {
+    async fn boxes_see_each_others_state_as_it_changes_until_their_farm_task_ends() -> Result<()> {
         let net = InternalOnly::new().await?;
         let base = Path::from("/farm");
         let member = |name: &str| Member {
@@ -383,15 +407,22 @@ mod test {
         let (a_load, a_rx) = watch::channel(load(1, 0));
         let (a_tx, _a_msgs) = mpsc::unbounded_channel();
         tokio::spawn(run(member("a"), a_rx, a_tx));
-        let (_b_load, b_rx) = watch::channel(load(1, 0));
+        let (b_load, b_rx) = watch::channel(load(1, 0));
         let (b_tx, mut b_msgs) = mpsc::unbounded_channel();
-        tokio::spawn(run(member("b"), b_rx, b_tx));
+        let b = tokio::spawn(run(member("b"), b_rx, b_tx));
         let (jobs, s) = state_of_a(&mut b_msgs).await?;
         assert_eq!(jobs, Path::from(format!("/farm/v{PROTOCOL}/api/a/jobs")));
         assert_eq!(s, state(1, 0));
         a_load.send(load(2, 5))?;
         let (_, s) = state_of_a(&mut b_msgs).await?;
         assert_eq!(s, state(2, 5), "the new version and its free tokens arrive together");
+        drop(b_load);
+        b.await??;
+        let mut forgot = false;
+        while let Ok(msg) = b_msgs.try_recv() {
+            forgot = matches!(msg, Msg::Farm { name, state: None } if name == "a");
+        }
+        assert!(forgot, "a scheduler whose farm task ended doesn't place jobs by a's last state");
         Ok(())
     }
 }

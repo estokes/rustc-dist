@@ -1,6 +1,6 @@
 use crate::protocol::{Dep, JobPaths, Reads, Unit};
 use arcstr::{ArcStr, literal};
-use compact_str::format_compact;
+use compact_str::{CompactString, format_compact};
 use std::{ffi::OsStr, path::Path};
 
 pub enum Invocation {
@@ -31,7 +31,9 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     let driver = Path::new(driver.as_ref()).file_name().and_then(OsStr::to_str).unwrap_or("?");
     let mut crate_name = None;
     let mut cg = Codegen::default();
-    let mut emit = "";
+    // Every `--emit` given, comma separated, as rustc takes them all.
+    let mut emit = CompactString::default();
+    let mut print = false;
     let mut test = false;
     let mut out_dir_arg = None;
     let mut target = None;
@@ -42,7 +44,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     let mut args = args[1..].iter().filter_map(|a| a.as_ref().to_str());
     while let Some(arg) = args.next() {
         match arg {
-            // CR claude for claude: [bug/low] Two flags are read as if they came once, or only in
+            // XCR claude for claude: [bug/low] Two flags are read as if they came once, or only in
             // probes. `--print` anywhere makes a probe, but `cargo rustc --crate-type staticlib --
             // --print native-static-libs` (the documented way to get a staticlib's link line) is a
             // real compile, which then runs with no slot, outside the scheduler and memory
@@ -53,16 +55,26 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
             // and reruns here, and a `kind=path` in the earlier `--emit` is missing from
             // paths.outputs. Fix: make `--print` a probe only when no source file is given, and
             // gather every `--emit` value. (argv-02)
+            // 2026-11-01 claude: A --print (either spelling, its value consumed) makes a probe
+            // only when no .rs source is given; a compile that prints stays here, since --print
+            // KIND=PATH writes a file no box sends back. Every --emit is gathered, comma joined,
+            // into the unit key, the outputs and reads. Tests:
+            // argv::test::a_print_with_a_source_file_compiles (classified a probe before) and
+            // argv::test::every_emit_counts (keyed llvm-ir and read Metadata before), plus a
+            // --print row in what_portable_jobs_read. README's What stays local lists --print.
             "-" | "-vV" | "-V" | "--version" => return Invocation::Probe,
-            _ if arg.starts_with("--print") => return Invocation::Probe,
+            "--print" => {
+                print = true;
+                args.next();
+            }
             "--test" => test = true,
             "--crate-name" => crate_name = args.next(),
             "--crate-type" => types.add(args.next().unwrap_or("bin")),
-            "--emit" => emit = args.next().unwrap_or(""),
+            "--emit" => emit_also(&mut emit, args.next()),
             "--out-dir" => out_dir_arg = args.next(),
             "--target" => target = args.next(),
             "--extern" => deps.extend(args.next().and_then(extern_dep)),
-            "-C" => {
+            "-C" | "--codegen" => {
                 if let Some(v) = args.next() {
                     cg.parse(v);
                 }
@@ -81,20 +93,26 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
                 } else if let Some(v) = arg.strip_prefix("--crate-type=") {
                     types.add(v);
                 } else if let Some(v) = arg.strip_prefix("--emit=") {
-                    emit = v;
+                    emit_also(&mut emit, Some(v));
+                } else if arg.starts_with("--print=") {
+                    print = true;
                 } else if let Some(v) = arg.strip_prefix("--out-dir=") {
                     out_dir_arg = Some(v);
                 } else if let Some(v) = arg.strip_prefix("--target=") {
                     target = Some(v);
                 } else if let Some(v) = arg.strip_prefix("--extern=") {
                     deps.extend(extern_dep(v));
-                } else if let Some(v) = arg.strip_prefix("-C") {
+                } else if let Some(v) = arg.strip_prefix("--codegen=").or_else(|| arg.strip_prefix("-C")) {
                     cg.parse(v);
                 }
             }
         }
     }
     let Some(name) = crate_name else { return Invocation::Probe };
+    // `cargo rustc -- --print native-static-libs` compiles too.
+    if print && paths.sources.is_empty() {
+        return Invocation::Probe;
+    }
     let suffix = if test { ":test" } else { "" };
     let metadata = cg.metadata;
     let opt = if cg.opt.is_empty() { "0" } else { cg.opt };
@@ -110,13 +128,17 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
     if let Some(dir) = out_dir.and_then(|d| Path::new(d).parent()) {
         deps.extend(build_group(dir).map(|id| Dep { id, file: None }));
     }
-    // CR claude for claude: [doc-drift/low] README's "What stays local" list misses reasons a job
+    // XCR claude for claude: [doc-drift/low] README's "What stays local" list misses reasons a job
     // stays here: an `@argfile` argument (`argfile` here), a compile with no `--out-dir`, an
     // argument, compiler path or cwd that isn't UTF-8 (wrapper::job), a project `rustc-dist.toml`
     // that fails to parse (wrapper::job prints the error and keeps the job), and a package
     // directory past remote's WALK_LIMIT of 256 MB, which DESIGN mentions. List them, or say the
     // list gives the common ones. (argv-03)
-    let portable = driver == "rustc" && !argfile && !cg.incremental && !cg.native_cpu && !cg.split_debuginfo;
+    // 2026-11-01 claude: README's What stays local now lists an @file, --print, no --out-dir, a
+    // non-UTF-8 argument, compiler path or cwd, a project rustc-dist.toml that doesn't parse, and
+    // a package directory past 256 MB. Doc only, no test.
+    let portable =
+        driver == "rustc" && !argfile && !print && !cg.incremental && !cg.native_cpu && !cg.split_debuginfo;
     let portable = match out_dir_arg {
         Some(out_dir) if portable => {
             paths.dep_info = format_compact!("{out_dir}/{name}{}.d", cg.extra).as_str().into();
@@ -124,7 +146,7 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
             paths.outputs.extend(
                 emit.split(',').filter_map(|e| e.split_once('=')).map(|(_, p)| ArcStr::from(p)),
             );
-            Some(Portable { paths, reads: types.reads(test, emit, &cg, target) })
+            Some(Portable { paths, reads: types.reads(test, &emit, &cg, target) })
         }
         _ => None,
     };
@@ -141,6 +163,14 @@ pub fn classify<S: AsRef<OsStr>>(args: &[S], out_dir: Option<&OsStr>) -> Invocat
         portable,
         target: target.map(ArcStr::from),
     })
+}
+
+fn emit_also(emit: &mut CompactString, kinds: Option<&str>) {
+    let Some(kinds) = kinds else { return };
+    if !emit.is_empty() {
+        emit.push(',');
+    }
+    emit.push_str(kinds);
 }
 
 /// The crate types a job builds. None given means a binary.
@@ -204,7 +234,7 @@ struct Codegen<'a> {
 }
 
 impl<'a> Codegen<'a> {
-    // CR claude for claude: [bug/medium] rustc reads a `-C` option's name with `_` and `-` alike,
+    // XCR claude for claude: [bug/medium] rustc reads a `-C` option's name with `_` and `-` alike,
     // and takes `--codegen V` and `--codegen=V` as `-C V`, but parse matches only the dashed names
     // and classify passes only `-C V` and `-CV` here. So `-C target_cpu=native`, `--codegen
     // target-cpu=native` or `-C split_debuginfo=packed` (from RUSTFLAGS, say) leaves the job
@@ -217,27 +247,32 @@ impl<'a> Codegen<'a> {
     // features, 3 without it. Fix: in classify read `--codegen V` and `--codegen=V` like `-C V`,
     // and here compare the option name with `_` read as `-`. A row per spelling in
     // what_portable_jobs_read's `local` list would pin it. (argv-01)
+    // 2026-11-01 claude: classify reads --codegen V and --codegen=V like -C V, and Codegen::parse
+    // splits NAME=VALUE and reads _ in the name as - before matching. New rows in
+    // what_portable_jobs_read's local list (-C target_cpu=native, --codegen target-cpu=native,
+    // --codegen=target-cpu=native, -C split_debuginfo=packed, --codegen incremental=...) and two
+    // in compile_keys (--codegen codegen_units=4, --codegen=extra_filename=-77) fail without
+    // either half (checked).
+    /// One `-C` option, `NAME` or `NAME=VALUE`. rustc reads `_` in a name
+    /// as `-`.
     fn parse(&mut self, arg: &'a str) {
-        if let Some(v) = arg.strip_prefix("metadata=") {
-            self.metadata = v;
-        } else if let Some(v) = arg.strip_prefix("extra-filename=") {
-            self.extra = v;
-        } else if let Some(v) = arg.strip_prefix("opt-level=") {
-            self.opt = v;
-        } else if let Some(v) = arg.strip_prefix("codegen-units=") {
-            self.units = v.parse().ok();
-        } else if let Some(v) = arg.strip_prefix("linker=") {
-            self.linker = Some(v);
-        } else if arg == "lto" {
-            self.lto = true;
-        } else if let Some(v) = arg.strip_prefix("lto=") {
-            self.lto = !matches!(v, "off" | "no" | "n" | "false");
-        } else if let Some(v) = arg.strip_prefix("split-debuginfo=") {
-            self.split_debuginfo = v != "off";
-        } else if arg == "incremental" || arg.starts_with("incremental=") {
-            self.incremental = true;
-        } else if arg == "target-cpu=native" {
-            self.native_cpu = true;
+        let (name, value) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg, None),
+        };
+        let name: CompactString = name.chars().map(|c| if c == '_' { '-' } else { c }).collect();
+        match (name.as_str(), value) {
+            ("metadata", Some(v)) => self.metadata = v,
+            ("extra-filename", Some(v)) => self.extra = v,
+            ("opt-level", Some(v)) => self.opt = v,
+            ("codegen-units", Some(v)) => self.units = v.parse().ok(),
+            ("linker", Some(v)) => self.linker = Some(v),
+            ("lto", None) => self.lto = true,
+            ("lto", Some(v)) => self.lto = !matches!(v, "off" | "no" | "n" | "false"),
+            ("split-debuginfo", Some(v)) => self.split_debuginfo = v != "off",
+            ("incremental", _) => self.incremental = true,
+            ("target-cpu", Some("native")) => self.native_cpu = true,
+            _ => (),
         }
     }
 }
@@ -298,6 +333,33 @@ mod test {
     }
 
     #[test]
+    fn a_print_with_a_source_file_compiles() {
+        let c = compile(
+            &[
+                "rustc", "--crate-name", "a", "--edition=2021", "src/lib.rs", "--crate-type", "staticlib",
+                "--print", "native-static-libs", "--out-dir", "/t",
+            ],
+            None,
+        );
+        assert!(c.portable.is_none(), "what it prints may go to a file");
+        assert!(matches!(classify(&["rustc", "--crate-name", "a", "--print=cfg"], None), Invocation::Probe));
+    }
+
+    /// rustc takes every `--emit`, as `cargo rustc -- --emit=llvm-ir` adds
+    /// one to cargo's.
+    #[test]
+    fn every_emit_counts() {
+        let c = compile(
+            &["rustc", "--crate-name", "b", "src/main.rs", "--emit=dep-info,link", "--emit", "llvm-ir=/t/b.ll", "--out-dir", "/t"],
+            None,
+        );
+        assert_eq!(c.unit.exact.as_str(), "rustc:b::dep-info,link,llvm-ir=/t/b.ll");
+        let p = c.portable.unwrap();
+        assert_eq!(p.reads, Reads::RlibsToLink { linker: literal!("cc") }, "it still links");
+        assert_eq!(p.paths.outputs, ["/t/b.ll"]);
+    }
+
+    #[test]
     fn compile_keys() {
         let u = unit(
             &[
@@ -316,6 +378,9 @@ mod test {
         assert_eq!(c.exact.as_str(), "clippy-driver:a::");
         assert_eq!(u.codegen_units, 16, "rustc's default");
         assert_eq!(unit(&["rustc", "--crate-name", "a", "-C", "codegen-units=4"], None).codegen_units, 4);
+        assert_eq!(unit(&["rustc", "--crate-name", "a", "--codegen", "codegen_units=4"], None).codegen_units, 4);
+        let e = unit(&["rustc", "--crate-name", "a", "--codegen=extra_filename=-77"], None);
+        assert_eq!(e.id.as_str(), "a-77", "-C read in each spelling");
         assert_eq!(unit(&["rustc", "--crate-name", "a", "-Cincremental=/i"], None).codegen_units, 256);
     }
 
@@ -414,13 +479,20 @@ mod test {
         assert_eq!(with(&["--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu"]), cc);
         for local in [
             &["-C", "incremental=/t/inc"][..],
+            &["--codegen", "incremental=/t/inc"],
             &["-Ctarget-cpu=native"],
+            &["-C", "target_cpu=native"],
+            &["--codegen", "target-cpu=native"],
+            &["--codegen=target-cpu=native"],
             &["@/tmp/args"],
             &["-C", "split-debuginfo=unpacked"],
+            &["-C", "split_debuginfo=packed"],
+            &["src/lib.rs", "--print", "native-static-libs"],
         ] {
             assert_eq!(with(local), None, "{local:?}");
         }
         assert_eq!(with(&["-C", "split-debuginfo=off"]), Some(Reads::Metadata));
+        assert_eq!(with(&["-C", "target-cpu=x86-64-v3"]), Some(Reads::Metadata));
         let cross = ["rustc", "--crate-name", "a", "--target", "aarch64-unknown-linux-gnu", "--out-dir", "/t"];
         assert_eq!(compile(&cross, None).target.as_deref(), Some("aarch64-unknown-linux-gnu"));
         let clippy = ["clippy-driver", "rustc", "--crate-name", "a", "--crate-type", "lib", "--out-dir", "/t"];

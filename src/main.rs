@@ -22,7 +22,7 @@ mod wrapper;
 #[cfg(test)]
 mod e2e_test;
 
-use anyhow::{Result, bail};
+use anyhow::{Error, Result, bail};
 use bytes::BytesMut;
 use clap::{Args, Parser};
 use compact_str::{CompactString, format_compact};
@@ -88,8 +88,10 @@ struct CalibrateArgs {
 }
 
 fn main() {
-    if let Err(e) = dispatch() {
-        // CR claude for claude: [risk/medium] A BrokenPipe anywhere makes rustc-dist exit 0 and
+    let opt = Opt::parse();
+    let prints = opt.prints();
+    if let Err(e) = dispatch(opt) {
+        // XCR claude for claude: [risk/medium] A BrokenPipe anywhere makes rustc-dist exit 0 and
         // print nothing. That suits `rustc-dist status | head`, but for the wrapper exit 0 tells
         // cargo that rustc succeeded. anyhow's downcast_ref sees through context, so a wrapper
         // whose write to the daemon socket fails with EPIPE once client::exchange stops retrying (a
@@ -98,7 +100,12 @@ fn main() {
         // fails later on a missing file far from the cause. Fix: swallow BrokenPipe only for the
         // commands that print to stdout (Opt::Status, Opt::Calibrate), never for Opt::Wrapper.
         // (main-01)
-        if e.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe) {
+        // 2026-11-01 claude: main parses the command first and swallows a BrokenPipe only for one
+        // that prints to stdout (Opt::Status, Opt::Calibrate), through quiet(prints, e); a
+        // wrapper's broken pipe is printed and exits 1.
+        // test::only_a_command_that_prints_ends_quietly_on_a_broken_pipe fails if quiet ignores
+        // prints (checked).
+        if quiet(prints, &e) {
             return;
         }
         eprintln!("rustc-dist: {e:#}");
@@ -106,8 +113,20 @@ fn main() {
     }
 }
 
-fn dispatch() -> Result<()> {
-    match Opt::parse() {
+impl Opt {
+    fn prints(&self) -> bool {
+        matches!(self, Opt::Status | Opt::Calibrate(_))
+    }
+}
+
+/// A broken pipe ends a command that prints quietly, as when `head` stops
+/// reading. For any other, the wrapper above all, it is an error.
+fn quiet(prints: bool, e: &Error) -> bool {
+    prints && e.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
+}
+
+fn dispatch(opt: Opt) -> Result<()> {
+    match opt {
         Opt::Daemon => {
             env_logger::Builder::from_env(env_logger::Env::new().filter_or("RUSTC_DIST_LOG", "info"))
                 .init();
@@ -132,7 +151,7 @@ fn profile(name: &str, recalibrate: bool) -> Result<()> {
     classes::set_current(&config::state_dir(), &profile)?;
     let ask = Ask::Profile { name: profile.name().clone(), recalibrate };
     let mut buf = BytesMut::new();
-    match client::request_running(ask, &mut buf)? {
+    match client::request_running(&ask, &mut buf)? {
         None => {
             let sock = config::socket_path();
             eprintln!("no daemon at {}; the next one will start in profile {}", sock.display(), profile.name());
@@ -146,7 +165,7 @@ fn profile(name: &str, recalibrate: bool) -> Result<()> {
 
 fn status() -> Result<()> {
     let mut buf = BytesMut::new();
-    let Reply::Status(st) = client::request(Ask::Status, false, &mut buf)?.1 else {
+    let Reply::Status(st) = client::request(&Ask::Status, false, &mut buf)?.1 else {
         bail!("unexpected reply from the daemon");
     };
     let mut out = io::stdout().lock();
@@ -274,4 +293,23 @@ fn status() -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn only_a_command_that_prints_ends_quietly_on_a_broken_pipe() {
+        let pipe = || {
+            let e = Err::<(), _>(io::Error::from(io::ErrorKind::BrokenPipe));
+            e.context("talking to the daemon").unwrap_err()
+        };
+        let wrapper = Opt::Wrapper(vec!["rustc".into()]);
+        assert!(!quiet(wrapper.prints(), &pipe()), "a wrapper's broken pipe is a failed compile, not a success");
+        assert!(quiet(Opt::Status.prints(), &pipe()), "seen through context");
+        assert!(quiet(Opt::Calibrate(CalibrateArgs { seconds: 1 }).prints(), &pipe()));
+        assert!(!quiet(Opt::Status.prints(), &anyhow::anyhow!("no daemon")));
+    }
 }

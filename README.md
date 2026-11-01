@@ -93,6 +93,9 @@ Across boxes (a farm):
 cargo install rustc-dist
 ```
 
+After an upgrade, run `rustc-dist install` again, or restart the service: a
+daemon refuses wrappers of another version, and the wrappers say so.
+
 ## Set up one box
 
 1. Install the systemd user service. Do this while the box is idle: the first
@@ -201,6 +204,8 @@ so start with a clean target directory.
 | `tokens_per_cpu` | 1.5 | jobserver tokens per CPU |
 | `compressed_swap_share` | 0.5 | share of compressed swap that predicted job memory may fill beyond RAM |
 | `calibration_seconds` | 60 | how long calibration runs |
+| `half_life_s` | 86400 | seconds after which old runs count half toward how fast each place runs and how big each unit is |
+| `copy_half_life_s` | 3600 | seconds after which old sent runs count half toward how long sending a job takes |
 
 A project can keep crates on the box that builds it, for example proc macros
 that read the network or the local environment. Put a `rustc-dist.toml` at
@@ -230,11 +235,18 @@ A job runs only on the box that started it if it:
 - uses `-C target-cpu=native`;
 - splits debug info into separate files (`-C split-debuginfo` other than `off`);
 - is run by something other than rustc, such as `clippy-driver`;
+- reads arguments from an `@file`, prints something (`--print`), or has no
+  `--out-dir`;
+- has an argument, compiler path or working directory that isn't UTF-8;
 - links, and `remote_links` is off;
 - is named in a project's `local` list, or failed remotely and then built
   locally twice;
+- is in a project whose `rustc-dist.toml` doesn't parse (the wrapper prints
+  why);
 - depends on a crate the daemon never saw compile, so it can't tell what to
   send;
+- is in a package directory holding more than 256 MB, not counting build
+  output, other packages and hidden directories;
 - needs a toolchain no other box has.
 
 The placement log (see above) says which, and a job that fails on another box

@@ -34,30 +34,56 @@ daemon while systemd restarts its own and leave the service failing to take
 the lock; on its own otherwise.
 
 The wrapper never runs rustc without a grant. If it cannot reach or start the
-daemon it fails the compile with a clear message. `RUSTC_DIST=off` is the only
-bypass.
+daemon it fails the compile with a clear message. `RUSTC_DIST=off` bypasses
+it, and so does running as root: the daemon won't run as root, as it runs
+other boxes' proc macros.
 
 ### Wrapper protocol
 
-Wrapper to daemon: `Job { argv, env, cwd, cargo_cwd }`, where `cargo_cwd` is
-`/proc/$PPID/cwd`.
+The wrapper sends `PROTOCOL` as four raw bytes, then one message:
 
-Daemon to wrapper, either:
+- `Ask::Compile { unit, build, job }`: the unit (its keys, its id in the build
+  graph, the jobs whose outputs it reads, its codegen units), cargo's pid,
+  and, when the compile may run on another box, a `Job`: rustc's path,
+  arguments and environment, the working directory, the target, the paths it
+  reads and writes, and what it reads of the crates below it. The wrapper
+  reads the project's `rustc-dist.toml` itself, at or above cargo's cwd
+  (`/proc/$PPID/cwd`), and sends no `Job` for a crate the project keeps local.
+- `Ask::Probe` for `-vV`, `--print` without a source file, or input `-`. The
+  daemon answers `Trivial` and the wrapper runs rustc without a slot.
+- `Ask::Status` and `Ask::Profile`, from the command line.
 
-- `Run { cpus, jobserver, filter_metadata }`: the wrapper sets its CPU
-  affinity, points `CARGO_MAKEFLAGS` at the job's jobserver, forks and execs
-  rustc, sends `Ran { wall, maxrss, front }` (`front` when rustc printed its
-  `.rmeta` line), and exits with rustc's code; or
-- a remote result: `Artifact`/`Stderr`/`Stdout` lines, then `Exit(code)`. If
-  the remote job fails, the daemon sends `Run` instead and the job reruns
-  locally.
+The daemon answers a compile with either:
+
+- `Slot { cpus, jobserver, filter_metadata }`: the wrapper sets its CPU
+  affinity, points `CARGO_MAKEFLAGS` at the job's jobserver, spawns rustc,
+  and exits with rustc's code. If rustc succeeds it first sends `Finished`:
+  its wall time, maxrss, when it printed its `.rmeta` line, and the crate
+  files it wrote, which the daemon hashes for later remote jobs.
+  `filter_metadata` drops rustc's `.rmeta` line, which cargo already has from
+  a remote run that failed; or
+- a remote run's output as `Output` messages, then `Exit(code)`. Artifact
+  lines come as rustc prints them; the rest waits for rustc to exit. If the
+  remote run fails, the daemon sends `Slot` instead and the job reruns here.
 
 The wrapper spawns rustc itself so cargo's stdin, fds and environment reach
 rustc untouched. Socket close ends the job: the slot is freed, and a remote
-job is cancelled if its wrapper died.
+job is stopped on the other box, whether its wrapper hangs up while the job
+waits for a place, while its files are staged, or while it runs there.
 
-Probe invocations (`-vV`, `--print`, input `-`) get `Run` at once and take no
-slot.
+A wrapper follows a daemon that restarts. A daemon that drains answers the
+jobs it holds with `Restarting`; one that dies just hangs up. Either way the
+wrapper connects and asks again, starting the daemon if it must, and gives
+up only once failures that each came within a second of asking have gone on
+for 30 s, so a job that waited long in the queue still follows the restart.
+If a remote run had already passed cargo its `.rmeta` line, the wrapper drops
+that line from the rerun's output, here or on another box.
+
+A daemon refuses a client of another `PROTOCOL`. In place of a reply's length
+it sends `0xFFFFFFFF`, longer than any message, then its own `PROTOCOL`, and
+the client fails, saying which protocol each speaks. The daemon never
+restarts for a client: a deploy restarts it, and `rustc-dist install` stops a
+running daemon of any version by sending `0xFFFFFFFF` in place of `PROTOCOL`.
 
 ## Slots
 
@@ -116,8 +142,9 @@ caps how many wrappers wait. Set it at or above the farm's slot count.
 Boxes overcommit RAM into compressed swap. Capacity is RAM plus half of the
 data compressed swap can still take (`compressed_swap_share`). For zram, that
 is its swap devices' free space; for zswap, the pool limit times the
-compression ratio zswap is getting, or 3:1 until it has stored something, never
-more than the swap behind it, less what the pool holds.
+compression ratio zswap is getting, or 3:1 until it has stored something,
+less what the pool holds, and never more than the free space of the swap
+behind it, since every page zswap holds keeps a slot there.
 
 The daemon measures the box rather than trusting its own bookkeeping, so other
 processes count. Use is what RAM holds (`MemTotal - MemAvailable`), which
@@ -127,8 +154,12 @@ disk has room for them, since the kernel can move them there. A tmpfs that
 holds target directories would otherwise look like jobs' memory. Its pages
 already in zram count at their compressed size: without a writeback device,
 zram never moves them to disk.
-Each job's footprint is the RSS plus swap of its processes: the wrapper and
+Each job's footprint is the anonymous and shared memory its processes hold
+in RAM, plus their swap (`RssAnon + RssShmem + VmSwap`): the wrapper and
 everything under it, or bwrap and everything under it for another box's job.
+File-backed pages are left out, as the box's use leaves out page cache: most
+are rustc's and LLVM's code, which every rustc on the box shares (65 to 93 MB
+of a small rustc's 107 to 124 MB of RSS on washu-chan).
 The daemon walks every thread's children, since rustc starts the linker from
 its compiler thread.
 
@@ -490,9 +521,11 @@ work, so build times say nothing yet; placement is all that was checked.
 
 ### Farm
 
-A daemon whose config has `base` (say `/build`) joins the farm. The farm's
-netidx namespace is under the protocol version, `BASE/vN` (`/build/v18`), so
-boxes of different versions never see each other:
+A daemon whose config has `base` (say `/build`) joins the farm. It answers
+wrappers while it joins, which takes 15 s or more when the resolver is out of
+reach, and keeps their jobs here until it has joined. The farm's netidx
+namespace is under the protocol version, `BASE/vN` (`/build/v18`), so boxes
+of different versions never see each other:
 
 - `BASE/vN/status/NAME/COLUMN`: a row per box, which the netidx browser draws as
   a table.
@@ -509,9 +542,9 @@ boxes of different versions never see each other:
 - `BASE/vN/units/NAME/UNIT/COLUMN`: the units the box has run (see below).
 
 `PROTOCOL` counts versions of every message between boxes and between a
-daemon and its clients: changing any of them bumps it. A daemon that a client
-of another version connects to exits, so systemd starts the binary that
-client came from.
+daemon and its clients: changing any of them bumps it. A daemon refuses a
+client of another version (see "Wrapper protocol"), so after an upgrade the
+daemon must restart before the new version's wrappers can use it.
 
 A box's state is nine columns of its status row, each its own value:
 `profile`, `version` (a counter), `toolchains`, `cache GB` (what its store
@@ -537,7 +570,12 @@ run on, so no client pairs one profile's name with another's rates.
 The scheduler publishes after every event, which includes the 100 ms ticks
 that lend tokens while jobs run. A changed state is republished at most every
 100 ms. The daemon lists `BASE/vN/status` for other
-boxes and subscribes to each one's state columns.
+boxes and subscribes to each one's state columns. A resolver error is logged
+and the listing tried again at the next tick. Netidx retries the resolver
+for up to tens of seconds first, and meanwhile the box neither publishes its
+state nor reads the others'. Whenever the farm task ends, the scheduler is
+told every other box is gone, so it never places jobs by a state that no
+longer changes.
 
 Toolchains are rustup's (`~/.rustup/toolchains/*`). A compiler is matched by
 rustc's commit hash and host, and a job with `--target` also needs that
