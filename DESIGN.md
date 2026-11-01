@@ -6,6 +6,8 @@
   when several agents run cargo on the same box.
 - Use the toolchain installed on each box. Never ship compilers.
 - Produce the same output a local build would: paths, `env!()`, pipelining.
+- Get the most out of the build configuration the user chose. Never change
+  it: flags, linker and linker options stay as cargo passes them.
 - Per-project control over what stays local.
 
 Non-goals: caching compile results (a server keeps the crate files it builds
@@ -672,7 +674,102 @@ libraries and linker, kept so by the sysadmin.
   a free token; until then no other job from here takes that box's tokens,
   since none show free.
 - Still to do: count each job's predicted transfer time rather than a flat
-  200 ms.
+  200 ms (see Stage 5).
+
+### Stage 5: predict wall time (planned 2026-11-01)
+
+The scheduler predicts when a job would finish at each place it could run, but
+every number it predicts from comes from CPU time: a class's rate is
+instructions per CPU-µs, and a job's width is its CPU time over its wall time.
+CPU time isn't time.
+
+- On 2026-11-01 at 06:59 the laptop was at load 246 while ryouko and aieka sat
+  idle. ryouko published 1.69 G instructions per CPU-s (calibrated 5.96; it had
+  learned 7.89 by the evening before), aieka 1.40 (calibrated 2.32), so the
+  laptop sent them almost nothing.
+- Their rates came from the narrow jobs they served, mostly build scripts
+  linking about 355 MB of rlibs with mold. A narrow job there is pinned to all
+  32 CPUs, and mold starts a thread per CPU, which spins while it waits. The
+  same small link on idle ryouko, allowed 1 CPU: 100 ms of CPU in 102 ms, 9.3 G
+  instructions per CPU-s. Allowed 32: 534 ms of CPU in 78 ms, 2.3. lld allowed
+  32: 162 ms of CPU, 5.8. A plain rustc there ran at 9.3, in bwrap or not, and
+  the wide `graphix_tests` runs it served at about 8.8.
+- Wide jobs, most of the time spent, never teach a rate, since they borrow
+  CPUs from several classes.
+- Each box learns from the jobs it happens to run, and clients choose those,
+  so rates learned on different boxes don't compare.
+
+So measure what is predicted: how long each job took where it ran, as the
+client saw it.
+
+A place is a class of a box, where a light job runs, or all of a box's CPUs,
+where a heavy job runs; this box's or another's. A unit's size is how long it
+takes at a reference speed (this box's fastest class, idle): its front end in
+seconds, and the rest in thread-seconds. A place's factor, a curve over the
+load there, scales size to time. A light job's predicted time at a class is
+its size times the class's factor at the load there. A heavy job's is its front
+end times the box's fastest class's factor, plus the rest times the heavy
+place's factor over the threads it can get, min(its width, the box's CPUs).
+
+Load is measured, not counted, since test binaries and fuzzers bypass the
+daemon: at 06:59 the laptop ran five rustc jobs at load 246. A box's load is
+its runnable tasks per CPU (`procs_running` in `/proc/stat`), sampled with
+memory every 250 ms. A run's load is the mean of the samples while it ran. A
+prediction uses the load now plus the threads the job would add. Other boxes
+publish their load, and a server reports the load each job it ran saw.
+
+A factor holds one value per load bucket, interpolated between buckets. Its
+starting curve comes from calibration: the calibrated ratio, flat up to one
+task per CPU, then growing with load past it, as CPUs time-share. That start is
+worth `P` of runs in each bucket and never decays, so a bucket nothing has
+reached yet keeps its shape.
+
+Each run of unit `u` at place `p` and load `l` that took `t` teaches both:
+
+- `u`'s size: the weighted mean of `t` over `p`'s factor at `l`, across `u`'s
+  runs.
+- `p`'s factor at `l`: the weighted total time of runs there over their total
+  size. A unit seen at one place and load only says nothing about it against
+  the others, so a run moves the factor only as far as `u`'s size draws on
+  runs elsewhere or at other loads. ryouko idle and ryouko busy compare on the
+  same units, as ryouko and the laptop do. Long jobs weigh the most, as they
+  take most of the time.
+
+Since the factors no longer average over load, old runs can count for a long
+time: weights halve every `H` of wall-clock time, which only has to follow
+slow changes (a toolchain, a kernel, a box's cooling).
+
+A sent run's time is everything the client waits for, from offering the job to
+its last output: staging and sending inputs, the linker waiting for late rlibs,
+rustc on the server, receiving outputs. The part that isn't compiling (what
+`copy_ms` measures now) counts in full but as its own term, predicted per unit
+and box from that unit's recent sends there. It depends on what the box has
+cached and on the network, not on the box's CPUs, so it stays out of the box's
+factor. This replaces the flat 200 ms. `build_script_build:980e7c5bc3a8806d`
+took 10.2 s on ryouko with nothing to send, and 38.3 s when it sent 345 MB,
+28.2 s of that the linker waiting for rlibs.
+
+Width becomes the tokens a job held after its front end, on average: rustc
+takes a token for each codegen thread, and a spinning linker takes none. Every
+job gets a jobserver FIFO of its own, as heavy jobs have now, lent from its
+class for a light job, so a light job's width is measured too. A server reports
+the token-seconds of each job it runs.
+
+What goes: instructions as the unit of cost (ranks, predictions and `status`
+work in reference seconds), job instruction counters, and class rates learned
+from CPU time (`rates/NAME.toml`). Calibration still counts instructions to
+compare CPUs, and boxes still publish calibrated rates, as starting factors.
+
+Guesses: `H` 1 day, `P` 30 s of runs, load buckets at 0, ¼, ½, ¾, 1, 1½, 2,
+3, 4, 6 and 8 tasks per CPU.
+
+Open: a unit's recent sends mix runs that sent 345 MB with runs that sent
+nothing. The client could instead track what it has sent each box and predict
+from the bytes this run would send and the link's measured throughput. Start
+with the per-unit average and see how far off it is.
+
+Open: placing a job also slows the jobs already on the box. The curves could
+predict that too, but at first a prediction covers only the job being placed.
 
 ## Farm test (2026-10-30)
 
@@ -864,8 +961,9 @@ Experiments, roughly in order:
 1. One user per box is assumed. Several users would need a system daemon, and
    the wrapper would have to read input files, since it runs as the user.
 2. Should a box prefer its own users' jobs over remote ones?
-3. Link jobs: mold uses every CPU. Should a link job take more than one slot,
-   or should mold's threads be capped?
+3. Link jobs: mold uses every CPU it may. Should a link job take more than one
+   slot? Capping mold's threads would change the user's configuration (see
+   Goals).
 4. Does cargo tolerate a second metadata artifact line? If so,
    `filter_metadata` can go.
 5. The daemon only governs rustc. Test binaries and fuzzers, which caused the
