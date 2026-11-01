@@ -120,12 +120,11 @@ impl Board {
         let speeds =
             |f: fn(&ClassStatus) -> u32| Value::from(st.classes.iter().map(|c| hundredths(f(c))).collect::<Vec<_>>());
         let sum = |f: fn(&ClassStatus) -> u32| st.classes.iter().map(f).sum::<u32>();
-        let figures: [(&'static str, Value); 17] = [
+        let figures: [(&'static str, Value); 16] = [
             ("switching", switching),
             ("waiting", st.waiting.into()),
             ("running", (sum(|c| c.running) + st.spread.running).into()),
             ("serving", (sum(|c| c.serving) + st.spread.serving).into()),
-            ("load", hundredths(st.load_c).into()),
             ("class speed", speeds(|c| c.speed_c)),
             ("class idle speed", speeds(|c| c.idle_speed_c)),
             ("heavy threads", st.spread.threads.into()),
@@ -223,13 +222,17 @@ mod test {
     async fn figures_go_in_the_boxes_row_and_units_in_their_own_table() -> Result<()> {
         let net = InternalOnly::new().await?;
         let publisher = net.publisher().clone();
+        // The row already holds the state columns other boxes read.
+        let _state = crate::farm::STATE
+            .iter()
+            .map(|col| Cell::publish(&publisher, Path::from(format!("/farm/status/a/{col}")), Value::Null))
+            .collect::<Result<Vec<_>>>()?;
         let mut board = Board::new(Path::from("/farm/status/a"), Path::from("/farm/units/a"));
         let serde = "/farm/units/a/rustc:serde:1:link";
         let both = vec![unit("rustc:serde:1:link", 2500, Some((1500, 3072))), unit("rustc:syn:2:link", 13760, None)];
         show(&mut board, &publisher, &status(both)).await?;
         assert_eq!(value(&net, "/farm/status/a/waiting").await?, Value::from(7u32));
         assert_eq!(value(&net, "/farm/status/a/running").await?, Value::from(2u32));
-        assert_eq!(value(&net, "/farm/status/a/load").await?, Value::from(0.75));
         assert_eq!(value(&net, "/farm/status/a/class speed").await?, Value::from(vec![0.9, 0.35]));
         for column in net.subscriber().resolver().list(Path::from("/farm/status/a")).await?.iter() {
             let below = net.subscriber().resolver().list(column.clone()).await?;
