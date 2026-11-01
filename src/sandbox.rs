@@ -362,6 +362,9 @@ async fn job(server: &Arc<Server>, reply: &Reply, mut inbox: Inbox, tc: &Install
             };
             futures::try_join!(sent, others).map(|_| ())
         });
+        if !tc.unchanged() {
+            bail!("rustup changed the toolchain {} before the job ran", tc.toolchain.key);
+        }
         run(reply, store, cmd, &root.0, slot, arrive, server.level).await
     };
     let worked = work.await;

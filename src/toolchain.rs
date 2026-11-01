@@ -90,7 +90,7 @@ fn parse_key(vv: &str) -> Result<ArcStr> {
     Ok(format_compact!("{} {}", field("commit-hash: ")?, field("host: ")?).as_str().into())
 }
 
-// CR claude for claude: [bug/high] The toolchains are read once, when the daemon joins the farm,
+// XCR claude for claude: [bug/high] The toolchains are read once, when the daemon joins the farm,
 // and a toolchain is found by key but run by path (Installed::rustc). After a `rustup update` while
 // the daemon runs, this box goes on advertising the old commit (farm::Member's toolchains) and runs
 // the new rustc for jobs that ask for the old one (sandbox::take finds `tc` by the old key). Leaf
@@ -125,6 +125,17 @@ fn parse_key(vv: &str) -> Result<ArcStr> {
 // after the run turned off, all 170 tests still pass (checked). A test that runs a Server on a fake
 // rustup home and swaps its rustc between two offers would cover it; Toolchains::read is private,
 // so it needs a pub(crate) constructor.
+// 2026-11-01 claude: sandbox::job checks tc.unchanged() just before run() starts the sandbox, after
+// the inputs are in and the tree is built, and fails the job 'before the job ran' so no output
+// reaches the client; take keeps the check after the run. Toolchains::read is pub(crate), and
+// toolchain::test's fake rustup home now keeps each rustc as a hard link in its sysroot (so the
+// sandbox can run it), printing '<commit> ran', c1 waiting until its sysroot's rustc is no longer
+// c1. e2e_test::a_toolchain_rustup_changes_is_refused_at_the_offer_before_the_run_and_after_it runs
+// a Server on it: rustc swapped between two offers (the second must get 'no toolchain'), between
+// offer and Run (nothing may print, and the job fails), and while c1 runs (the job fails rather
+// than exit 0). It fails with the refresh in Server::toolchain removed, with the check before run
+// removed, and with the check after the run removed (each checked). DESIGN's toolchain paragraph
+// says so.
 /// rustup's toolchains on this box, as they were when read.
 pub struct Toolchains {
     home: PathBuf,
@@ -137,7 +148,7 @@ pub struct Toolchains {
 impl Toolchains {
     /// The toolchains under rustup's `home`, each stamped before its rustc
     /// is asked its key, so a rustc that changes meanwhile is read again.
-    fn read(home: PathBuf) -> Self {
+    pub(crate) fn read(home: PathBuf) -> Self {
         let mut dirs: Vec<(PathBuf, Stamp)> = match fs::read_dir(home.join("toolchains")) {
             Ok(entries) => entries
                 .flatten()
@@ -164,8 +175,6 @@ impl Toolchains {
     /// Whether rustup's toolchains are as they were read: none added,
     /// removed or changed.
     pub fn current(&self) -> bool {
-
-
         let Ok(entries) = fs::read_dir(self.home.join("toolchains")) else { return self.dirs.is_empty() };
         let mut n = 0;
         for e in entries.flatten() {
@@ -306,7 +315,7 @@ impl Keys {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -326,15 +335,25 @@ mod test {
     }
 
     /// A rustup home whose rustcs answer `-vV` as commit `c1` or `c2` on
-    /// host `h`. A sysroot's rustc is a link to one of them, so changing it
-    /// writes no file a process may be running.
-    fn fake_rustup_home(name: &str) -> PathBuf {
+    /// host `h`. Run as a compiler, each prints `<commit> ran` on stderr and
+    /// exits 0, c1 once its sysroot's rustc is no longer c1. A sysroot's
+    /// rustc is a link to one of them, so changing it writes no file a
+    /// process may be running.
+    pub(crate) fn fake_rustup_home(name: &str) -> PathBuf {
         let home = std::env::temp_dir().join(format!("rustc-dist-rustup-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(home.join("rustcs")).unwrap();
         for commit in ["c1", "c2"] {
             let rustc = home.join("rustcs").join(commit);
-            fs::write(&rustc, format!("#!/bin/sh\necho 'commit-hash: {commit}'\necho 'host: h'\n")).unwrap();
+            let wait = match commit {
+                "c1" => "while [ \"$(readlink \"$0\")\" = rustc-c1 ]; do sleep 0.05; done\n",
+                _ => "",
+            };
+            let script = format!(
+                "#!/bin/sh\nif [ \"$1\" = -vV ]; then echo 'commit-hash: {commit}'; echo 'host: h'; exit 0; fi\n\
+                 echo '{commit} ran' >&2\n{wait}"
+            );
+            fs::write(&rustc, script).unwrap();
             fs::set_permissions(&rustc, fs::Permissions::from_mode(0o755)).unwrap();
         }
         // Another thread's fork may still hold a script open for writing.
@@ -342,13 +361,20 @@ mod test {
         home
     }
 
-    /// Install `name` at `home`, its rustc answering as `commit`.
-    fn install(home: &Path, name: &str, commit: &str) {
+    /// Install `name` at `home`, its rustc answering as `commit`: a link to
+    /// a hard link of that rustc in the sysroot, so a sandbox that has the
+    /// sysroot can run it.
+    pub(crate) fn install(home: &Path, name: &str, commit: &str) {
         let sysroot = home.join("toolchains").join(name);
         fs::create_dir_all(sysroot.join("bin")).unwrap();
         fs::create_dir_all(sysroot.join("lib/rustlib/h/lib")).unwrap();
+        let rustc = format!("rustc-{commit}");
+        let linked = sysroot.join("bin").join(&rustc);
+        if !linked.exists() {
+            fs::hard_link(home.join("rustcs").join(commit), &linked).unwrap();
+        }
         let new = sysroot.join("bin/rustc.new");
-        std::os::unix::fs::symlink(home.join("rustcs").join(commit), &new).unwrap();
+        std::os::unix::fs::symlink(&rustc, &new).unwrap();
         fs::rename(&new, sysroot.join("bin/rustc")).unwrap();
     }
 

@@ -605,8 +605,9 @@ toolchain's rustc (mtime, inode and size) and `lib/rustlib` before asking
 its key. Before it takes a job it looks again, and reads its toolchains
 afresh if one was added, removed or updated, logging a warning for a rustc
 whose key changed, so a job for a key it no longer has gets "no toolchain"
-and its client builds it. A job whose rustc changes while it runs fails the
-same way. The box republishes its toolchains when they change, looking
+and its client builds it. It looks at the job's rustc again just before the
+sandbox starts, since uploading inputs can take minutes, and once more after
+rustc exits: a job whose rustc changed by then fails the same way. The box republishes its toolchains when they change, looking
 every 10 s.
 
 A server admits a remote job only into a free token of the class asked for,
