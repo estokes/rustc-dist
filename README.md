@@ -93,6 +93,9 @@ Across boxes (a farm):
 cargo install rustc-dist
 ```
 
+After an upgrade, run `rustc-dist install` again, or restart the service: a
+daemon refuses wrappers of another version, and the wrappers say so.
+
 ## Set up one box
 
 1. Install the systemd user service. Do this while the box is idle: the first

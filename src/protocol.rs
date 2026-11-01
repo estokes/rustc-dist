@@ -5,13 +5,49 @@ use compact_str::{CompactString, format_compact};
 use netidx_core::pack::Pack;
 use netidx_derive::Pack;
 use serde::Deserialize;
-use std::io::{Read, Write};
+use std::{
+    fmt,
+    io::{Read, Write},
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Sent as four raw bytes ahead of the first message, so a daemon can
 /// recognize a client from another version whatever its encoding.
 pub const PROTOCOL: u32 = 18;
+/// Sent in place of PROTOCOL, it asks a daemon of any version to exit.
+pub const STOP: u32 = u32::MAX;
+/// What a daemon sends a client of another PROTOCOL in place of a reply's
+/// length, followed by its own PROTOCOL, before it hangs up. No message is
+/// that long, so a client of any version tells it from a reply.
+const OTHER_PROTOCOL: u32 = u32::MAX;
 const MAX_MSG: usize = 1 << 24;
+
+/// A daemon of another protocol refused this client.
+#[derive(Debug)]
+pub struct OtherProtocol {
+    pub daemon: u32,
+}
+
+impl fmt::Display for OtherProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "this rustc-dist speaks protocol {PROTOCOL} and the running daemon {}: use the rustc-dist the \
+             daemon runs, or restart the daemon from this one",
+            self.daemon
+        )
+    }
+}
+
+impl std::error::Error for OtherProtocol {}
+
+/// What a daemon sends a client of another PROTOCOL.
+pub fn refusal() -> [u8; 8] {
+    let mut r = [0u8; 8];
+    r[..4].copy_from_slice(&OTHER_PROTOCOL.to_be_bytes());
+    r[4..].copy_from_slice(&PROTOCOL.to_be_bytes());
+    r
+}
 
 /// What the scheduler knows a compile by. Job history is kept under
 /// `exact`, one cargo unit, and `coarse`, shared by every unit of that
@@ -81,13 +117,18 @@ pub struct JobPaths {
 
 #[derive(Debug, Pack)]
 #[allow(clippy::large_enum_variant)]
-// CR claude for claude: [doc-drift/low] DESIGN's "Wrapper protocol" describes messages that are
+// XCR claude for claude: [doc-drift/low] DESIGN's "Wrapper protocol" describes messages that are
 // gone. The wrapper sends Ask::Compile (a Unit, cargo's pid, and an optional Job of rustc, args,
 // env, cwd, target, paths and reads), not `Job { argv, env, cwd, cargo_cwd }`; cargo's cwd isn't
 // sent, as the wrapper reads the project config itself. It reports Finished, which also lists the
 // crate files written, not `Ran { wall, maxrss, front }`, and remote output comes as Reply::Output,
 // not `Artifact`/`Stderr`/`Stdout` lines. DESIGN's "Process model" also says RUSTC_DIST=off is the
 // only bypass, but wrapper::run runs rustc directly as root too, as README says. (protocol-01)
+// 2026-11-01 claude: DESIGN's Wrapper protocol now describes Ask::Compile with its Unit and
+// optional Job, Ask::Probe, Slot with filter_metadata, Finished with the crate files, Output and
+// Exit, the follow-through-restarts rules (client-01, wrapper-01) and the refusal of another
+// PROTOCOL (daemon-02); Process model says running as root bypasses the daemon too. Doc only, no
+// test.
 pub enum Ask {
     /// `rustc -vV`, `--print`, stdin input. Runs at once without a slot.
     Probe,
@@ -95,7 +136,6 @@ pub enum Ask {
     /// present when the compile may run on another box.
     Compile { unit: Unit, build: u32, job: Option<Job> },
     Status,
-    Shutdown,
     /// The laptop switched power profile. The daemon calibrates a profile
     /// the first time it sees it, or again if asked.
     Profile { name: ArcStr, recalibrate: bool },
@@ -430,6 +470,22 @@ pub fn send<T: Pack>(w: &mut impl Write, buf: &mut BytesMut, v: &T) -> Result<()
 pub fn recv<T: Pack>(r: &mut impl Read, buf: &mut BytesMut) -> Result<T> {
     let mut header = [0u8; 4];
     r.read_exact(&mut header)?;
+    recv_body(r, buf, header)
+}
+
+/// The daemon's answer to an ask: a reply, or [`OtherProtocol`] from a
+/// daemon of another version.
+pub fn recv_reply(r: &mut impl Read, buf: &mut BytesMut) -> Result<Reply> {
+    let mut header = [0u8; 4];
+    r.read_exact(&mut header)?;
+    if u32::from_be_bytes(header) == OTHER_PROTOCOL {
+        r.read_exact(&mut header)?;
+        return Err(OtherProtocol { daemon: u32::from_be_bytes(header) }.into());
+    }
+    recv_body(r, buf, header)
+}
+
+fn recv_body<T: Pack>(r: &mut impl Read, buf: &mut BytesMut, header: [u8; 4]) -> Result<T> {
     buf.clear();
     buf.resize(body_len(header)?, 0);
     r.read_exact(buf)?;

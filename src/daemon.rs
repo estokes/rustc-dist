@@ -4,7 +4,7 @@ use crate::{
     classes::{self, Profile},
     config::{self, Config},
     farm::{self, Load, Member},
-    protocol::{self, Ask, Finished, Job, PROTOCOL, Reads, Reply, Unit},
+    protocol::{self, Ask, Finished, Job, PROTOCOL, Reads, Reply, STOP, Unit},
     remote::{self, Event, Links, Moved, Outcome, ToServer},
     sandbox::{self, Server},
     sched::{Admission, Heartbeat, Msg, RemoteOutcome, RemoteSlot, Sched, SentRun, Setup, Want},
@@ -21,26 +21,30 @@ use netidx::{
     config::Config as NetConfig,
     path::Path as NPath,
     publisher::{Publisher, PublisherBuilder},
-    subscriber::{Subscriber, SubscriberBuilder},
+    subscriber::SubscriberBuilder,
 };
 use std::{
     fs::{self, File, OpenOptions},
+    mem,
     io::{self, ErrorKind},
     os::{
         fd::AsRawFd,
         unix::fs::{FileTypeExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
+    io::{AsyncReadExt, AsyncWriteExt, copy, sink},
+    net::{UnixListener, UnixStream, unix::WriteHalf},
     signal::unix::{SignalKind, signal},
     sync::{mpsc, oneshot, watch},
     task, time,
 };
+
+/// How long a refused client may take to hang up.
+const REFUSED_READ: Duration = Duration::from_secs(5);
 
 /// What every connection needs.
 struct Ctx {
@@ -48,10 +52,17 @@ struct Ctx {
     stop: mpsc::Sender<()>,
     keys: Keys,
     hashes: triomphe::Arc<Hashes>,
-    /// Present when this box is part of a farm.
-    links: Option<Arc<Links>>,
+    /// Set once this box has joined a farm.
+    farm: OnceLock<Farm>,
     remote_links: bool,
     compression_level: i32,
+}
+
+/// This box's part in the farm.
+struct Farm {
+    links: Arc<Links>,
+    /// Shutting it down leaves the farm.
+    publisher: Publisher,
 }
 
 pub async fn run() -> Result<()> {
@@ -97,7 +108,7 @@ pub async fn run() -> Result<()> {
     let (load_tx, load) = watch::channel(Load::default());
     let sched = Sched::new(setup, profile, load_tx, tx.clone())?;
     let mut sched = tokio::spawn(sched.run(rx));
-    // CR claude for claude: [risk/low] The farm is joined before the accept loop starts, so no
+    // XCR claude for claude: [risk/low] The farm is joined before the accept loop starts, so no
     // wrapper is answered until join returns, and join waits on the network: sandbox::listen awaits
     // publisher.flushed(), which with the resolver unreachable (a laptop away from home, the
     // resolver's box down) returns only once netidx's write client gives up on connecting, 15 s
@@ -105,29 +116,33 @@ pub async fn run() -> Result<()> {
     // worker. Wrappers connect meanwhile and wait in client::open with no word of why. Fix: start
     // the accept loop first and join in a spawned task that hands Ctx its Links when done (a
     // OnceLock, say), with Store::open in spawn_blocking. (daemon-03)
-    let (subscriber, publisher) = match &cfg.base {
-        None => (None, None),
-        Some(base) => match join(&cfg, base, load, tx.clone()).await {
-            Ok((sub, publisher)) => (Some(sub), Some(publisher)),
-            Err(e) => {
-                error!("working alone, could not join the farm at {base}: {e:#}");
-                (None, None)
-            }
-        },
-    };
-    let links = subscriber.map(|s| Arc::new(Links::new(s)));
-    if let Some(links) = links.clone() {
-        tokio::spawn(send_heartbeats(links, heartbeat_rx, tx.clone(), cfg.compression_level));
-    }
+    // 2026-11-01 claude: run starts the accept loop without waiting for the farm: join runs in a
+    // spawned task that sets Ctx::farm (a OnceLock<Farm> holding the Links and the Publisher) when
+    // done, and starts the heartbeat sender itself; Store::open runs in spawn_blocking. Until then
+    // compile sees no farm and keeps jobs here. At shutdown a join still under way is aborted, and
+    // a joined farm's publisher is shut down as before. No test: run reads the user's config and
+    // binds the user's socket.
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     let ctx = Arc::new(Ctx {
         tx: tx.clone(),
         stop: stop_tx,
         keys: Keys::default(),
         hashes,
-        links,
+        farm: OnceLock::new(),
         remote_links: cfg.remote_links,
         compression_level: cfg.compression_level,
+    });
+    // Wrappers are answered meanwhile, their jobs kept here until it's done.
+    let joining = cfg.base.clone().map(|base| {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            match join(&cfg, &base, load, heartbeat_rx, ctx.tx.clone()).await {
+                Ok(farm) => {
+                    let _ = ctx.farm.set(farm);
+                }
+                Err(e) => error!("working alone, could not join the farm at {base}: {e:#}"),
+            }
+        })
     });
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -156,8 +171,11 @@ pub async fn run() -> Result<()> {
     }
     info!("shutting down");
     drop(listener);
-    if let Some(publisher) = publisher
-        && time::timeout(Duration::from_secs(2), publisher.shutdown()).await.is_err()
+    if let Some(joining) = joining {
+        joining.abort();
+    }
+    if let Some(farm) = ctx.farm.get()
+        && time::timeout(Duration::from_secs(2), farm.publisher.clone().shutdown()).await.is_err()
     {
         warn!("leaving the farm timed out; other boxes may see this one until the resolver forgets it");
     }
@@ -169,14 +187,15 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Publish this box under `base`, watch the others, and take their jobs.
-/// Shutting down the publisher leaves the farm.
+/// Publish this box under `base`, watch the others, take their jobs, and
+/// send them the heartbeats the scheduler asks for.
 async fn join(
     cfg: &Config,
     base: &str,
     load: watch::Receiver<Load>,
+    heartbeats: mpsc::UnboundedReceiver<Heartbeat>,
     tx: mpsc::UnboundedSender<Msg>,
-) -> Result<(Subscriber, Publisher)> {
+) -> Result<Farm> {
     let net = NetConfig::load_default().context("loading the netidx config")?;
     let publisher = PublisherBuilder::new(net.clone()).bind_cfg(cfg.bind).build().await?;
     let subscriber = SubscriberBuilder::new(net).build()?;
@@ -188,7 +207,8 @@ async fn join(
     }
     let toolchains = installed.iter().map(|t| t.toolchain.clone()).collect();
     config::make_private_dir(&cfg.cache_dir)?;
-    let store = Store::open(cfg.cache_dir.join("blobs"), cfg.cache_gb << 30)?;
+    let (blobs, cap) = (cfg.cache_dir.join("blobs"), cfg.cache_gb << 30);
+    let store = task::spawn_blocking(move || Store::open(blobs, cap)).await??;
     let server = Arc::new(Server::new(store, cfg.cache_dir.join("jobs"), installed, tx.clone(), cfg.compression_level)?);
     tokio::spawn(sandbox::listen(publisher.clone(), farm::jobs_path(&base, &name), server).await?);
     let status = browser::run(
@@ -210,12 +230,14 @@ async fn join(
         toolchains,
         cache_gb: cfg.cache_gb,
     };
+    let links = Arc::new(Links::new(subscriber));
+    tokio::spawn(send_heartbeats(links.clone(), heartbeats, tx.clone(), cfg.compression_level));
     tokio::spawn(async move {
         if let Err(e) = farm::run(member, load, tx).await {
             error!("left the farm: {e:#}");
         }
     });
-    Ok((subscriber, publisher))
+    Ok(Farm { links, publisher })
 }
 
 fn hostname() -> String {
@@ -270,7 +292,7 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
     let mut version = [0u8; 4];
     sock.read_exact(&mut version).await?;
     let version = u32::from_be_bytes(version);
-    // CR claude for claude: [risk/medium] Any client of another PROTOCOL makes the daemon exit, so
+    // XCR claude for claude: [risk/medium] Any client of another PROTOCOL makes the daemon exit, so
     // that systemd starts the binary the client came from. That holds only when the client is the
     // binary the unit's ExecStart names. An older or newer rustc-dist anywhere else (a checkout's
     // target/debug/rustc-dist status, a lane testing a protocol bump, a second install) restarts
@@ -285,10 +307,33 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
     // 2026-11-01 claude: Eric ruled (2026-11-01): never restart for a client of another PROTOCOL:
     // the protocol is in the netidx path anyway, it should basically never happen, and if it does
     // it is the client's fault. Refuse that client, saying which protocol each speaks.
-    if version != PROTOCOL {
-        warn!("a client speaks protocol {version}, this daemon {PROTOCOL}; restarting");
-        let _ = ctx.stop.try_send(());
-        return Ok(());
+    // 2026-11-01 claude: Per Eric's ruling the daemon never stops for a client of another
+    // PROTOCOL. serve answers it with protocol::refusal() (0xFFFFFFFF, longer than any message,
+    // then its own PROTOCOL), takes what the client sends until it hangs up (5 s at most) so the
+    // client's write can't fail first, and goes on. The client's protocol::recv_reply turns that
+    // into OtherProtocol, which client::follow returns at once, saying which protocol each speaks.
+    // client::shutdown, for rustc-dist install, now sends protocol::STOP (0xFFFFFFFF) in place of
+    // PROTOCOL, which any daemon stops on, an older one too as it exits on any other version;
+    // Ask::Shutdown is gone. Tests:
+    // daemon::test::a_client_of_another_protocol_is_refused_and_the_daemon_stays (fails if serve
+    // stops, checked) and client::test::a_daemon_of_another_protocol_fails_the_ask_at_once (fails
+    // if the refusal is retried, checked). DESIGN's Wrapper protocol and Farm sections and
+    // README's Install say so.
+    match version {
+        PROTOCOL => (),
+        STOP => {
+            info!("asked to stop");
+            let _ = ctx.stop.try_send(());
+            return Ok(());
+        }
+        other => {
+            warn!("refused a client that speaks protocol {other}; this daemon speaks {PROTOCOL}");
+            sock.write_all(&protocol::refusal()).await?;
+            // Take what it sends until it hangs up, so that its write
+            // doesn't fail before it reads why.
+            let _ = time::timeout(REFUSED_READ, copy(&mut sock, &mut sink())).await;
+            return Ok(());
+        }
     }
     let mut buf = BytesMut::new();
     match protocol::recv_async::<Ask>(&mut sock, &mut buf).await? {
@@ -299,10 +344,6 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
             ctx.tx.send(Msg::Status { reply }).map_err(|_| anyhow!("scheduler stopped"))?;
             let status = status.await?;
             protocol::send_async(&mut sock, &mut buf, &Reply::Status(status)).await
-        }
-        Ask::Shutdown => {
-            let _ = ctx.stop.try_send(());
-            protocol::send_async(&mut sock, &mut buf, &Reply::Restarting).await
         }
         Ask::Profile { name, recalibrate } => {
             let reply = match Profile::new(&name) {
@@ -322,22 +363,29 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
 /// Wait for the scheduler to place a job. None if cargo killed the
 /// wrapper meanwhile.
 async fn admit(
-    sock: &mut UnixStream,
+    sock: &UnixStream,
     ctx: &Ctx,
     unit: Unit,
     build: u32,
     remote: Result<Want, &'static str>,
 ) -> Result<Option<Admission>> {
-    let (reply, mut admitted) = oneshot::channel();
+    let (reply, admitted) = oneshot::channel();
     ctx.tx.send(Msg::Submit { unit, build, remote, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
+    unless_hung_up(sock, admitted).await?.map(|a| a.context("scheduler stopped")).transpose()
+}
+
+/// `work`'s output, or None if the wrapper hangs up first. A wrapper sends
+/// nothing while it waits for a slot or for a job on another box.
+async fn unless_hung_up<T>(sock: &UnixStream, work: impl Future<Output = T>) -> Result<Option<T>> {
+    tokio::pin!(work);
     loop {
         tokio::select! {
-            admission = &mut admitted => return Ok(Some(admission.context("scheduler stopped")?)),
+            done = &mut work => return Ok(Some(done)),
             readable = sock.readable() => {
                 readable?;
                 match sock.try_read(&mut [0u8; 1]) {
                     Ok(0) => return Ok(None),
-                    Ok(_) => bail!("wrapper sent data while waiting for a slot"),
+                    Ok(_) => bail!("the wrapper sent data while it waited"),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
                     Err(e) => return Err(e.into()),
                 }
@@ -376,8 +424,9 @@ async fn compile(
     build: u32,
     job: Option<Job>,
 ) -> Result<()> {
+    let job = job.map(triomphe::Arc::new);
     // Where it may go besides here, or why nowhere.
-    let mut want = match (&job, &ctx.links) {
+    let mut want = match (&job, ctx.farm.get()) {
         (None, _) => Err("the wrapper keeps it here"),
         (_, None) => Err("this box isn't in a farm"),
         (Some(job), _) if job.reads != Reads::Metadata && !ctx.remote_links => Err("remote_links is off"),
@@ -397,7 +446,7 @@ async fn compile(
     let mut filter_metadata = false;
     let mut failed_remotely = false;
     loop {
-        let Some(admission) = admit(&mut sock, ctx, unit.clone(), build, want.clone()).await? else {
+        let Some(admission) = admit(&sock, ctx, unit.clone(), build, want.clone()).await? else {
             return Ok(());
         };
         match admission {
@@ -429,7 +478,7 @@ async fn compile(
                     // Hashed now, while no job waits on them, they are
                     // priced and staged without reading them when a job
                     // that reads them goes to another box.
-                    if ctx.links.is_some() && !crates.is_empty() {
+                    if ctx.farm.get().is_some() && !crates.is_empty() {
                         let hashes = ctx.hashes.clone();
                         task::spawn_blocking(move || {
                             for c in &crates {
@@ -446,6 +495,10 @@ async fn compile(
                 let job = job.as_ref().expect("only portable jobs go remote");
                 match run_remote(&mut sock, &mut buf, ctx, job, r).await {
                     Ok(Remote::Done) => return Ok(()),
+                    Ok(Remote::Gone) => {
+                        debug!("{}: the wrapper went away; stopped it", unit.exact);
+                        return Ok(());
+                    }
                     Ok(Remote::Busy) => (),
                     Ok(Remote::Failed { forwarded_metadata }) => {
                         filter_metadata |= forwarded_metadata;
@@ -467,18 +520,25 @@ enum Remote {
     Busy,
     /// It failed there; build it here.
     Failed { forwarded_metadata: bool },
+    /// The wrapper hung up, so the job was stopped.
+    Gone,
 }
 
 async fn run_remote(
     sock: &mut UnixStream,
     buf: &mut BytesMut,
     ctx: &Ctx,
-    job: &Job,
-    r: RemoteSlot,
+    job: &triomphe::Arc<Job>,
+    mut r: RemoteSlot,
 ) -> Result<Remote> {
-    let links = ctx.links.as_ref().context("not in a farm")?;
+    let links = &ctx.farm.get().context("not in a farm")?.links;
     let start = Instant::now();
-    let staged = task::block_in_place(|| remote::stage(job, &r.crates, &ctx.hashes))?;
+    let staging = task::spawn_blocking({
+        let (job, crates, hashes) = (job.clone(), mem::take(&mut r.crates), ctx.hashes.clone());
+        move || remote::stage(&job, &crates, &hashes)
+    });
+    let Some(staged) = unless_hung_up(sock, staging).await? else { return Ok(Remote::Gone) };
+    let staged = staged??;
     let stage_us = start.elapsed().as_micros() as u64;
     let offer = ToServer::Offer { unit: r.unit().clone(), key: r.key.clone(), target: r.target.clone(), class: r.class };
     let (etx, mut events) = mpsc::unbounded_channel();
@@ -498,7 +558,7 @@ async fn run_remote(
     // cargo to see twice.
     let mut held: Vec<(bool, Bytes)> = Vec::new();
     let mut forwarded_metadata = false;
-    let mut handle = async |ev: Event, sock: &mut UnixStream, buf: &mut BytesMut| -> Result<()> {
+    let mut handle = async |ev: Event, sock: &mut WriteHalf<'_>, buf: &mut BytesMut| -> Result<()> {
         match ev {
             Event::Accepted { version } => {
                 r.accepted(version);
@@ -518,7 +578,7 @@ async fn run_remote(
             }
         }
     };
-    // CR claude for claude: [bug/medium] Nothing here watches the wrapper while the job runs on the
+    // XCR claude for claude: [bug/medium] Nothing here watches the wrapper while the job runs on the
     // other box: admit polls the socket for EOF, this loop doesn't, and `handle` writes to it only
     // on artifact lines. So a wrapper that dies (cargo interrupted) is noticed only at the job's
     // next artifact line: for a binary or test, the end of its link, as its dep-info line comes
@@ -531,23 +591,40 @@ async fn run_remote(
     // awaiting `running`; dropping it drops the exchange, whose Drop (remote::In) sends the server
     // Stop. Staging under block_in_place can't notice either, for up to tens of seconds on a busy
     // box. (daemon-01)
-    let outcome = loop {
-        tokio::select! {
-            outcome = &mut running => break outcome,
-            Some(ev) = events.recv() => handle(ev, sock, buf).await?,
+    // 2026-11-01 claude: admit and run_remote now wait through unless_hung_up, which returns None
+    // on the wrapper's EOF: staging runs in spawn_blocking under it, and the relay of a remote
+    // run's events is wrapped in it (the socket split so events can still be written). Returning
+    // Remote::Gone drops running and so the exchange, whose Drop sends Stop; the RemoteSlot drops
+    // as Failed, which records nothing. A failed write to the wrapper also ends the relay as Gone,
+    // and a run that succeeded is finished as Done before its held output and Exit are written.
+    // Test: daemon::test::waiting_ends_when_the_wrapper_hangs_up pins unless_hung_up; nothing
+    // drives run_remote itself, as a RemoteSlot can only be made by the scheduler with a farm
+    // behind it, so dropping the helper from run_remote would go unnoticed by the tests.
+    let (from_wrapper, mut to_wrapper) = sock.split();
+    let relay = async {
+        loop {
+            tokio::select! {
+                outcome = &mut running => break Some(outcome),
+                Some(ev) = events.recv() => {
+                    if handle(ev, &mut to_wrapper, buf).await.is_err() {
+                        break None;
+                    }
+                }
+            }
         }
     };
+    let Some(Some(outcome)) = unless_hung_up(from_wrapper.as_ref(), relay).await? else {
+        // Dropping `running` drops its exchange, which stops the job there.
+        return Ok(Remote::Gone);
+    };
+    let mut gone = false;
     while let Ok(ev) = events.try_recv() {
-        handle(ev, sock, buf).await?;
+        gone = gone || handle(ev, &mut to_wrapper, buf).await.is_err();
     }
     drop(handle);
     match outcome {
         Ok((link_us, Outcome::Exit { code: 0, ran, measured, moved })) => {
             let Moved { bytes, wire_bytes, linker_waited_us, kept, steps } = moved;
-            for (stderr, data) in held {
-                protocol::send_async(sock, buf, &Reply::Output { stderr, data }).await?;
-            }
-            protocol::send_async(sock, buf, &Reply::Exit(0)).await?;
             let copy_us = (start.elapsed().as_micros() as u64).saturating_sub(ran.wall_us) + linker_waited_us;
             let links = job.reads != Reads::Metadata;
             let transfer = Transfer { sent_kb: bytes / 1024, copy_ms: copy_us / 1000, links };
@@ -572,6 +649,15 @@ async fn run_remote(
                 ms(linker_waited_us)
             );
             r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer, kept }));
+            let sent = async {
+                for (stderr, data) in held {
+                    protocol::send_async(&mut to_wrapper, buf, &Reply::Output { stderr, data }).await?;
+                }
+                protocol::send_async(&mut to_wrapper, buf, &Reply::Exit(0)).await
+            };
+            if gone || sent.await.is_err() {
+                return Ok(Remote::Gone);
+            }
             Ok(Remote::Done)
         }
         Ok((_, Outcome::Busy { version })) => {
@@ -603,7 +689,55 @@ async fn run_remote(
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::{ffi::CString, os::unix::ffi::OsStrExt, process};
+    use crate::protocol::OtherProtocol;
+    use std::{ffi::CString, future, io::Write, os::unix::ffi::OsStrExt, process};
+
+    /// A connection's context, how it stops the daemon, and what it tells the
+    /// scheduler.
+    fn ctx() -> (Ctx, mpsc::Receiver<()>, mpsc::UnboundedReceiver<Msg>) {
+        let (tx, msgs) = mpsc::unbounded_channel();
+        let (stop, stopped) = mpsc::channel(1);
+        let hashes = triomphe::Arc::new(Hashes::default());
+        let keys = Keys::default();
+        let ctx = Ctx { tx, stop, keys, hashes, farm: OnceLock::new(), remote_links: true, compression_level: 1 };
+        (ctx, stopped, msgs)
+    }
+
+    #[tokio::test]
+    async fn a_client_of_another_protocol_is_refused_and_the_daemon_stays() -> Result<()> {
+        let (ctx, mut stopped, _msgs) = ctx();
+        let (daemon, client) = UnixStream::pair()?;
+        let mut client = client.into_std()?;
+        client.set_nonblocking(false)?;
+        let asked = task::spawn_blocking(move || {
+            let mut buf = BytesMut::new();
+            client.write_all(&(PROTOCOL + 1).to_be_bytes())?;
+            protocol::send(&mut client, &mut buf, &Ask::Status)?;
+            protocol::recv_reply(&mut client, &mut buf)
+        });
+        serve(daemon, &ctx).await?;
+        let e = asked.await?.unwrap_err();
+        assert_eq!(e.downcast_ref::<OtherProtocol>().map(|o| o.daemon), Some(PROTOCOL), "{e:#}");
+        assert!(stopped.try_recv().is_err(), "the daemon keeps running");
+        let (daemon, mut client) = UnixStream::pair()?;
+        client.write_all(&STOP.to_be_bytes()).await?;
+        serve(daemon, &ctx).await?;
+        assert!(stopped.try_recv().is_ok(), "STOP stops a daemon of any version");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waiting_ends_when_the_wrapper_hangs_up() -> Result<()> {
+        let (daemon, wrapper) = UnixStream::pair()?;
+        assert_eq!(unless_hung_up(&daemon, async { 7 }).await?, Some(7));
+        let hangs_up = async move {
+            time::sleep(Duration::from_millis(50)).await;
+            drop(wrapper);
+        };
+        let (waited, ()) = tokio::join!(unless_hung_up(&daemon, future::pending::<()>()), hangs_up);
+        assert_eq!(waited?, None, "a wait for a slot, or for a job on another box, ends with its wrapper");
+        Ok(())
+    }
 
     fn scratch(name: &str) -> Result<PathBuf> {
         let dir = std::env::temp_dir().join(format!("rustc-dist-{name}-{}", process::id()));

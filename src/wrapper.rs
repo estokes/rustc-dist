@@ -43,39 +43,91 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         }
     };
     let mut buf = BytesMut::new();
-    let (mut sock, mut reply) = client::request(ask, true, &mut buf)?;
-    loop {
-        match reply {
-            Reply::Trivial => return Err(exec(&args)),
-            Reply::Slot { cpus, jobserver, filter_metadata } => {
-                sys::pin(&cpus)?;
-                let out = &mut io::stderr().lock();
-                let status = compile(&mut sock, &mut buf, &args, &jobserver, filter_metadata, out)?;
-                exit_as(status)
-            }
-            Reply::Output { stderr: true, data } => io::stderr().write_all(&data)?,
-            Reply::Output { stderr: false, data } => io::stdout().write_all(&data)?,
-            Reply::Exit(code) => process::exit(code),
-            Reply::Refused(why) => bail!("the rustc-dist daemon can't run this compile: {why}"),
-            Reply::Status(_) | Reply::Restarting | Reply::Done => {
-                bail!("unexpected reply from the daemon")
-            }
+    let request = |ask: &Ask, buf: &mut BytesMut| client::request(ask, true, buf);
+    match answer(&ask, &mut buf, request, &mut io::stderr(), &mut io::stdout())? {
+        Answer::Trivial => Err(exec(&args)),
+        Answer::Slot { mut sock, cpus, jobserver, filter_metadata } => {
+            sys::pin(&cpus)?;
+            let out = &mut io::stderr().lock();
+            let status = compile(&mut sock, &mut buf, &args, &jobserver, filter_metadata, out)?;
+            exit_as(status)
         }
-        // CR claude for claude: [bug/medium] Once the first reply is in, the wrapper can't follow a
-        // daemon restart. A remote job whose daemon exits while it streams (main's shutdown_timeout
-        // drops the connection tasks once daemon::run returns) ends here with "the daemon went away
-        // mid-job", and one that failed on another box after forwarding its rmeta line, then met a
-        // draining scheduler, gets Reply::Restarting, which this loop calls "unexpected reply from
-        // the daemon". Either way cargo sees a failed compile, so any daemon restart (a deploy,
-        // systemctl restart, a client of another version: daemon::serve) fails the builds that have
-        // jobs on other boxes. The wrapper knows whether it printed an rmeta line already
-        // (protocol::is_metadata_line on each Output), so it could ask again through
-        // client::request and OR that into the Slot's filter_metadata. Rerun or fail is a policy
-        // choice, hence for eric; see client-01 for the same failure before the first reply.
-        // (wrapper-01)
-        // 2026-11-01 claude: Eric ruled (2026-11-01): rerun (a): reconnect and ask again, filtering
-        // the rmeta line if it was already printed.
-        reply = protocol::recv(&mut sock, &mut buf).context("the daemon went away mid-job")?;
+        Answer::Exited(code) => process::exit(code),
+    }
+}
+
+/// What the daemon said to do with a compile.
+enum Answer {
+    /// Run rustc as it is, without a slot.
+    Trivial,
+    /// Run it here, holding the slot `sock` stands for.
+    Slot { sock: UnixStream, cpus: Vec<u32>, jobserver: ArcStr, filter_metadata: bool },
+    /// It ran on another box and exited with this code.
+    Exited(i32),
+}
+
+/// Ask with `request` until a daemon answers, printing a remote run's
+/// output to `err` and `out` meanwhile. A daemon that goes away mid-job, or
+/// sends the job back while it restarts, is asked again through `request`,
+/// which follows the restart. Cargo gets one rmeta line, however many runs
+/// print one.
+fn answer(
+    ask: &Ask,
+    buf: &mut BytesMut,
+    mut request: impl FnMut(&Ask, &mut BytesMut) -> Result<(UnixStream, Reply)>,
+    err: &mut impl Write,
+    out: &mut impl Write,
+) -> Result<Answer> {
+    let mut printed_metadata = false;
+    loop {
+        let (mut sock, mut reply) = request(ask, buf)?;
+        loop {
+            match reply {
+                Reply::Trivial => return Ok(Answer::Trivial),
+                Reply::Slot { cpus, jobserver, filter_metadata } => {
+                    let filter_metadata = filter_metadata || printed_metadata;
+                    return Ok(Answer::Slot { sock, cpus, jobserver, filter_metadata });
+                }
+                Reply::Output { stderr: true, data } => {
+                    let metadata = protocol::is_metadata_line(&data);
+                    if !(metadata && printed_metadata) {
+                        err.write_all(&data)?;
+                    }
+                    printed_metadata |= metadata;
+                }
+                Reply::Output { stderr: false, data } => out.write_all(&data)?,
+                Reply::Exit(code) => return Ok(Answer::Exited(code)),
+                Reply::Refused(why) => bail!("the rustc-dist daemon can't run this compile: {why}"),
+                Reply::Restarting => break,
+                Reply::Status(_) | Reply::Done => bail!("unexpected reply from the daemon"),
+            }
+            // XCR claude for claude: [bug/medium] Once the first reply is in, the wrapper can't follow a
+            // daemon restart. A remote job whose daemon exits while it streams (main's shutdown_timeout
+            // drops the connection tasks once daemon::run returns) ends here with "the daemon went away
+            // mid-job", and one that failed on another box after forwarding its rmeta line, then met a
+            // draining scheduler, gets Reply::Restarting, which this loop calls "unexpected reply from
+            // the daemon". Either way cargo sees a failed compile, so any daemon restart (a deploy,
+            // systemctl restart, a client of another version: daemon::serve) fails the builds that have
+            // jobs on other boxes. The wrapper knows whether it printed an rmeta line already
+            // (protocol::is_metadata_line on each Output), so it could ask again through
+            // client::request and OR that into the Slot's filter_metadata. Rerun or fail is a policy
+            // choice, hence for eric; see client-01 for the same failure before the first reply.
+            // (wrapper-01)
+            // 2026-11-01 claude: Eric ruled (2026-11-01): rerun (a): reconnect and ask again, filtering
+            // the rmeta line if it was already printed.
+            // 2026-11-01 claude: Per Eric's ruling (a): wrapper::answer asks again through
+            // client::request when the daemon sends Restarting after the first reply or the socket
+            // fails with an io::Error mid-job; a decode error still fails. It notes when it printed an
+            // rmeta line and then drops a later one, from a remote rerun's Output or, through
+            // filter_metadata, from a run here.
+            // wrapper::test::a_daemon_gone_mid_job_is_asked_again_and_cargo_gets_one_rmeta_line fails
+            // without the reconnect or without the filtering (checked both).
+            reply = match protocol::recv(&mut sock, buf) {
+                Ok(reply) => reply,
+                Err(e) if e.downcast_ref::<io::Error>().is_some() => break,
+                Err(e) => return Err(e.context("reading the daemon's reply")),
+            };
+        }
     }
 }
 
@@ -186,6 +238,7 @@ fn exit_as(status: ExitStatus) -> ! {
 #[cfg(test)]
 mod test {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn a_compile_reports_its_time_and_front_end() -> Result<()> {
@@ -224,6 +277,45 @@ mod test {
         let Finished { ran, .. } = protocol::recv(&mut daemon, &mut buf)?;
         assert!(!forwarded(&out) && ran.front.is_some());
         fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Daemons that each send their replies, in turn, and hang up.
+    fn daemons(said: Vec<Vec<Reply>>) -> impl FnMut(&Ask, &mut BytesMut) -> Result<(UnixStream, Reply)> {
+        let mut said = said.into_iter();
+        move |_, buf| {
+            let mut replies = said.next().context("asked once too often")?.into_iter();
+            let first = replies.next().context("no reply")?;
+            let (ours, mut theirs) = UnixStream::pair()?;
+            for reply in replies {
+                protocol::send(&mut theirs, buf, &reply)?;
+            }
+            Ok((ours, first))
+        }
+    }
+
+    fn line(text: &str) -> Reply {
+        Reply::Output { stderr: true, data: Bytes::from(format!("{text}\n")) }
+    }
+
+    const RMETA: &str = r#"{"$message_type":"artifact","artifact":"/t/liba.rmeta","emit":"metadata"}"#;
+    const RLIB: &str = r#"{"$message_type":"artifact","artifact":"/t/liba.rlib","emit":"link"}"#;
+
+    #[test]
+    fn a_daemon_gone_mid_job_is_asked_again_and_cargo_gets_one_rmeta_line() -> Result<()> {
+        let ask = Ask::Probe;
+        let (mut err, mut out) = (Vec::new(), Vec::new());
+        let gone_mid_job = daemons(vec![vec![line(RMETA)], vec![line(RMETA), line(RLIB), Reply::Exit(0)]]);
+        let after_gone = answer(&ask, &mut BytesMut::new(), gone_mid_job, &mut err, &mut out)?;
+        assert!(matches!(after_gone, Answer::Exited(0)));
+        assert_eq!(String::from_utf8(err)?, format!("{RMETA}\n{RLIB}\n"));
+        let slot = Reply::Slot { cpus: vec![0], jobserver: "/j".into(), filter_metadata: false };
+        let sent_back = daemons(vec![vec![line(RMETA), Reply::Restarting], vec![slot]]);
+        let after_restart = answer(&ask, &mut BytesMut::new(), sent_back, &mut Vec::new(), &mut out)?;
+        assert!(
+            matches!(after_restart, Answer::Slot { filter_metadata: true, .. }),
+            "a rerun here after a restart drops the rmeta line cargo already has"
+        );
         Ok(())
     }
 }

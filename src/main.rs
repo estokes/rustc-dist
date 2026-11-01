@@ -151,7 +151,7 @@ fn profile(name: &str, recalibrate: bool) -> Result<()> {
     classes::set_current(&config::state_dir(), &profile)?;
     let ask = Ask::Profile { name: profile.name().clone(), recalibrate };
     let mut buf = BytesMut::new();
-    match client::request_running(ask, &mut buf)? {
+    match client::request_running(&ask, &mut buf)? {
         None => {
             let sock = config::socket_path();
             eprintln!("no daemon at {}; the next one will start in profile {}", sock.display(), profile.name());
@@ -165,7 +165,7 @@ fn profile(name: &str, recalibrate: bool) -> Result<()> {
 
 fn status() -> Result<()> {
     let mut buf = BytesMut::new();
-    let Reply::Status(st) = client::request(Ask::Status, false, &mut buf)?.1 else {
+    let Reply::Status(st) = client::request(&Ask::Status, false, &mut buf)?.1 else {
         bail!("unexpected reply from the daemon");
     };
     let mut out = io::stdout().lock();

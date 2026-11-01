@@ -1,33 +1,48 @@
 use crate::{
     config, sys,
-    protocol::{self, Ask, PROTOCOL, Reply},
+    protocol::{self, Ask, OtherProtocol, PROTOCOL, Reply, STOP},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use std::{
     env,
     fs::OpenOptions,
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::{net::UnixStream, process::CommandExt},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
+/// How long a run of failures to get an answer may go on, from its first.
+const GIVE_UP: Duration = Duration::from_secs(30);
+/// An ask the daemon held this long before failing was queued there, so
+/// the failures before it don't count toward giving up.
+const HELD: Duration = Duration::from_secs(1);
+const RETRY: Duration = Duration::from_millis(50);
+
 /// Send `ask` and return the daemon's reply, following the daemon
 /// through restarts. With `spawn`, start the daemon if none is running.
-pub fn request(ask: Ask, spawn: bool, buf: &mut BytesMut) -> Result<(UnixStream, Reply)> {
-    exchange(&ask, spawn, buf)?.context("the rustc-dist daemon is not running")
+pub fn request(ask: &Ask, spawn: bool, buf: &mut BytesMut) -> Result<(UnixStream, Reply)> {
+    follow(|| connect(spawn), ask, buf, GIVE_UP)?.context("the rustc-dist daemon is not running")
 }
 
 /// Send `ask` to the daemon if one is running, and return its reply.
-pub fn request_running(ask: Ask, buf: &mut BytesMut) -> Result<Option<Reply>> {
-    Ok(exchange(&ask, false, buf)?.map(|(_, reply)| reply))
+pub fn request_running(ask: &Ask, buf: &mut BytesMut) -> Result<Option<Reply>> {
+    Ok(follow(|| connect(false), ask, buf, GIVE_UP)?.map(|(_, reply)| reply))
 }
 
-/// None if no daemon is running and `spawn` is false.
-fn exchange(ask: &Ask, spawn: bool, buf: &mut BytesMut) -> Result<Option<(UnixStream, Reply)>> {
-    // CR claude for claude: [bug/high] The 30 s deadline starts before the first attempt, and an
+/// Ask through each connection `connect` makes until a daemon answers.
+/// It gives up once failures have gone on for `give_up`, counting from the
+/// first since an ask the daemon held, so a restart is followed however
+/// long the ask waited before it. None if `connect` finds no daemon.
+fn follow(
+    mut connect: impl FnMut() -> Result<Option<UnixStream>>,
+    ask: &Ask,
+    buf: &mut BytesMut,
+    give_up: Duration,
+) -> Result<Option<(UnixStream, Reply)>> {
+    // XCR claude for claude: [bug/high] The 30 s deadline starts before the first attempt, and an
     // attempt (open) lasts until the daemon answers, which for a compile means until it has a slot,
     // or a remote job's first output. So a wrapper that queued for over 30 s and then gets
     // Reply::Restarting, which Sched::run sends every queued job when the daemon drains, or EOF
@@ -38,25 +53,37 @@ fn exchange(ask: &Ask, spawn: bool, buf: &mut BytesMut) -> Result<Option<(UnixSt
     // and again after any attempt the daemon held for a while (longer than the 50 ms retry, say),
     // so only a run of quick failures gives up. A test with a fake daemon that answers Restarting
     // after the deadline would catch it. (client-01)
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // 2026-11-01 claude: client::follow (was exchange) gives up only once failures have gone on for
+    // GIVE_UP (30 s) counting from the first after the last ask the daemon held for HELD (1 s) or
+    // more, so a long-queued wrapper follows a restart. Tests with a fake daemon:
+    // client::test::an_ask_queued_past_the_give_up_time_follows_a_restart (held 1.2 s, then
+    // Restarting, with give_up 300 ms; fails with a deadline from the start, checked) and
+    // client::test::a_run_of_quick_failures_gives_up.
+    let mut failing_since = None;
     loop {
-        let Some(mut sock) = connect(spawn)? else { return Ok(None) };
-        // A daemon from another version closes without replying and restarts.
-        match open(&mut sock, buf, ask) {
-            Ok(Reply::Restarting) | Err(_) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(50))
-            }
-            Ok(Reply::Restarting) => bail!("the rustc-dist daemon kept restarting"),
-            Err(e) => return Err(e.context("talking to the rustc-dist daemon")),
+        let Some(mut sock) = connect()? else { return Ok(None) };
+        let asked = Instant::now();
+        let failed = match open(&mut sock, buf, ask) {
+            Ok(Reply::Restarting) => anyhow!("the rustc-dist daemon kept restarting"),
             Ok(reply) => return Ok(Some((sock, reply))),
+            Err(e) if e.downcast_ref::<OtherProtocol>().is_some() => return Err(e),
+            Err(e) => e.context("talking to the rustc-dist daemon"),
+        };
+        let now = Instant::now();
+        if now - asked >= HELD {
+            failing_since = None;
         }
+        if now - *failing_since.get_or_insert(now) >= give_up {
+            return Err(failed);
+        }
+        thread::sleep(RETRY);
     }
 }
 
 fn open(sock: &mut UnixStream, buf: &mut BytesMut, ask: &Ask) -> Result<Reply> {
     sock.write_all(&PROTOCOL.to_be_bytes())?;
     protocol::send(sock, buf, ask)?;
-    protocol::recv(sock, buf)
+    protocol::recv_reply(sock, buf)
 }
 
 /// A connection to the daemon, if one is running.
@@ -68,11 +95,13 @@ fn running() -> Result<Option<UnixStream>> {
     }
 }
 
-/// Ask a running daemon to exit. Returns false if none was running.
+/// Ask a running daemon of any version to exit. Returns false if none was
+/// running.
 pub fn shutdown() -> Result<bool> {
     let Some(mut sock) = running()? else { return Ok(false) };
-    // Any daemon stops on this, even one from another version that can't reply.
-    let _ = open(&mut sock, &mut BytesMut::new(), &Ask::Shutdown);
+    sock.write_all(&STOP.to_be_bytes()).context("asking the daemon to stop")?;
+    // It hangs up once it has read that.
+    let _ = sock.read(&mut [0u8; 1]);
     Ok(true)
 }
 
@@ -122,4 +151,79 @@ fn spawn_daemon() -> Result<()> {
     }
     cmd.spawn().context("starting the rustc-dist daemon")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::iter;
+
+    enum Says {
+        Reply(Reply),
+        HangsUp,
+        Refuses,
+    }
+
+    /// A daemon that answers each connection with the next of `answers`,
+    /// after holding the ask for its time.
+    fn daemon(
+        answers: impl Iterator<Item = (Duration, Says)> + Send + 'static,
+    ) -> impl FnMut() -> Result<Option<UnixStream>> {
+        let mut answers = answers;
+        move || {
+            let (hold, says) = answers.next().context("asked once too often")?;
+            let (ours, mut theirs) = UnixStream::pair()?;
+            thread::spawn(move || {
+                let mut buf = BytesMut::new();
+                let mut version = [0u8; 4];
+                theirs.read_exact(&mut version)?;
+                let _: Ask = protocol::recv(&mut theirs, &mut buf)?;
+                thread::sleep(hold);
+                match says {
+                    Says::Reply(reply) => protocol::send(&mut theirs, &mut buf, &reply)?,
+                    Says::HangsUp => (),
+                    Says::Refuses => theirs.write_all(&protocol::refusal())?,
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            Ok(Some(ours))
+        }
+    }
+
+    #[test]
+    fn an_ask_queued_past_the_give_up_time_follows_a_restart() -> Result<()> {
+        let answers = [
+            (HELD + Duration::from_millis(200), Says::Reply(Reply::Restarting)),
+            (Duration::ZERO, Says::HangsUp),
+            (Duration::ZERO, Says::Reply(Reply::Done)),
+        ];
+        let reply = follow(daemon(answers.into_iter()), &Ask::Status, &mut BytesMut::new(), Duration::from_millis(300))?;
+        assert!(matches!(reply, Some((_, Reply::Done))), "{reply:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_run_of_quick_failures_gives_up() {
+        let give_up = Duration::from_millis(300);
+        let start = Instant::now();
+        let hangs_up = daemon(iter::repeat_with(|| (Duration::ZERO, Says::HangsUp)));
+        let e = follow(hangs_up, &Ask::Status, &mut BytesMut::new(), give_up).unwrap_err();
+        assert!(start.elapsed() >= give_up && start.elapsed() < HELD, "gave up after {:?}: {e:#}", start.elapsed());
+        let start = Instant::now();
+        let restarting = daemon(iter::repeat_with(|| (Duration::ZERO, Says::Reply(Reply::Restarting))));
+        let e = follow(restarting, &Ask::Status, &mut BytesMut::new(), give_up).unwrap_err();
+        assert!(start.elapsed() >= give_up, "{e:#}");
+        assert_eq!(e.to_string(), "the rustc-dist daemon kept restarting");
+    }
+
+    #[test]
+    fn a_daemon_of_another_protocol_fails_the_ask_at_once() {
+        let start = Instant::now();
+        let refuses = daemon(iter::repeat_with(|| (Duration::ZERO, Says::Refuses)));
+        let e = follow(refuses, &Ask::Status, &mut BytesMut::new(), Duration::from_secs(5)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(1), "retried for {:?}", start.elapsed());
+        let other = e.downcast_ref::<OtherProtocol>().expect("the daemon's protocol");
+        assert_eq!(other.daemon, PROTOCOL);
+        assert!(e.to_string().contains(&format!("protocol {PROTOCOL}")), "{e}");
+    }
 }
