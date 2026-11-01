@@ -70,7 +70,10 @@ pub async fn run() -> Result<()> {
     remove_stale_fifos(&dir);
     let state_dir = config::state_dir();
     let profile = classes::current(&state_dir);
-    let hashes = triomphe::Arc::new(Hashes::default());
+    let hashes = triomphe::Arc::new(Hashes::load(&state_dir.join("hashes")).unwrap_or_else(|e| {
+        warn!("starting with no file hashes: {e:#}");
+        Hashes::default()
+    }));
     let (heartbeats, heartbeat_rx) = mpsc::unbounded_channel();
     let setup = Setup {
         state_dir,
@@ -504,13 +507,15 @@ async fn run_remote(
             let transfer = Transfer { sent_kb: bytes / 1024, copy_ms: copy_us / 1000, links };
             let ms = |us: u64| us / 1000;
             info!(
-                "{} on {}: compiled in {} ms, moving files took {} ms: staging {}, link {}, offer {}, manifest {}, \
-                 sending {} kB as {} kB {}, setup and outputs {} ms, linker waited {} ms",
+                "{} on {}: compiled in {} ms, moving files took {} ms: staging {} (hashing {} MB {}), link {}, \
+                 offer {}, manifest {}, sending {} kB as {} kB {}, setup and outputs {} ms, linker waited {} ms",
                 r.unit().exact,
                 r.jobs,
                 ms(ran.wall_us),
                 transfer.copy_ms,
                 ms(stage_us),
+                staged.hashed.0 >> 20,
+                ms(staged.hashed.1),
                 ms(link_us),
                 ms(steps.offer_us),
                 ms(steps.manifest_us),

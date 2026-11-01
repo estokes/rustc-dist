@@ -331,6 +331,9 @@ pub struct Staged {
     pub outputs: Vec<PathBuf>,
     /// Where to read each blob the server may ask for.
     blobs: HashMap<Hash, ArcStr>,
+    /// The bytes staging hashed, those it already knew aside, and µs it
+    /// spent on them.
+    pub hashed: (u64, u64),
 }
 
 impl Staged {
@@ -441,6 +444,7 @@ struct Collect<'a> {
     dirs: HashSet<PathBuf>,
     seen: HashSet<PathBuf>,
     walked: u64,
+    hashed: (u64, u64),
 }
 
 impl<'a> Collect<'a> {
@@ -453,14 +457,18 @@ impl<'a> Collect<'a> {
             dirs: HashSet::new(),
             seen: HashSet::new(),
             walked: 0,
+            hashed: (0, 0),
         }
     }
 
     fn blob(&mut self, path: &Path) -> Result<(ArcStr, Hash)> {
         let s = utf8(path)?;
-        let (hash, _) = self.hashes.get(path)?;
-        self.blobs.insert(hash, s.clone());
-        Ok((s, hash))
+        let named = self.hashes.name(path)?;
+        if let Some(us) = named.hashed_us {
+            self.hashed = (self.hashed.0 + named.len, self.hashed.1 + us);
+        }
+        self.blobs.insert(named.hash, s.clone());
+        Ok((s, named.hash))
     }
 
     fn file(&mut self, path: PathBuf) -> Result<()> {
@@ -581,7 +589,7 @@ pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
         Reads::RlibsToLink { linker } if !c.rlibs.is_empty() => Some(Late { linker: linker.clone(), rlibs: c.rlibs }),
         _ => None,
     };
-    Ok(Staged { files: c.files, dirs, late, outputs, blobs: c.blobs })
+    Ok(Staged { files: c.files, dirs, late, outputs, blobs: c.blobs, hashed: c.hashed })
 }
 
 pub enum Event {

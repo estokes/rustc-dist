@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, BufMut};
 use compact_str::format_compact;
 use log::{info, warn};
@@ -8,13 +8,17 @@ use xxhash_rust::xxh3::Xxh3;
 use poolshark::local::LPooled;
 use std::{
     collections::{HashMap, hash_map::Entry},
+    ffi::OsStr,
     fmt,
     fs::{self, File, Metadata},
     io::{self, ErrorKind, Read, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::SystemTime,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::{Instant, SystemTime},
 };
 use tokio::sync::watch;
 
@@ -127,18 +131,29 @@ impl Stamp {
     }
 }
 
-/// A file's hash as of its stamp, locked while a job hashes it.
-type Known = triomphe::Arc<Mutex<Option<(Stamp, Hash)>>>;
+/// A file's hash as of its stamp.
+type Taken = (Stamp, Hash);
 
-/// Hashes of the files jobs read, each kept until its file changes. A job
-/// that needs a file another job is hashing waits for that hash rather than
+/// A file's hash once taken, locked while a job hashes it.
+type Known = triomphe::Arc<Mutex<Option<Taken>>>;
+
+/// What `Hashes::save` writes.
+const HASHES_MAGIC: &[u8; 8] = b"rdhash01";
+
+/// Hashes of the files jobs read, each kept until its file changes, and
+/// saved, so a restart needn't read files again to name them. A job that
+/// needs a file another job is hashing waits for that hash rather than
 /// hash it too.
 #[derive(Default)]
-pub struct Hashes(Mutex<HashMap<PathBuf, Known>>);
+pub struct Hashes {
+    known: Mutex<HashMap<PathBuf, Known>>,
+    /// Some hash was taken since the last save.
+    dirty: AtomicBool,
+}
 
 impl Hashes {
     fn entry(&self, path: &Path) -> Known {
-        let mut map = self.0.lock();
+        let mut map = self.known.lock();
         match map.get(path) {
             Some(k) => k.clone(),
             None => map.entry(path.to_path_buf()).or_default().clone(),
@@ -146,6 +161,11 @@ impl Hashes {
     }
 
     pub fn get(&self, path: &Path) -> Result<(Hash, u64)> {
+        self.name(path).map(|n| (n.hash, n.len))
+    }
+
+    /// The file at `path` named, hashing it if it changed since it last was.
+    pub fn name(&self, path: &Path) -> Result<Named> {
         let meta = fs::metadata(path).with_context(|| format_compact!("stat {}", path.display()))?;
         if !meta.is_file() {
             bail!("{} is not a file", path.display());
@@ -153,14 +173,16 @@ impl Hashes {
         let stamp = Stamp::of(&meta);
         let known = self.entry(path);
         let mut known = known.lock();
-        if let Some((s, h)) = *known
+        if let Some((s, hash)) = *known
             && s == stamp
         {
-            return Ok((h, stamp.len));
+            return Ok(Named { hash, len: stamp.len, hashed_us: None });
         }
+        let start = Instant::now();
         let hash = hash_file(path)?;
         *known = Some((stamp, hash));
-        Ok((hash, stamp.len))
+        self.dirty.store(true, Ordering::Relaxed);
+        Ok(Named { hash, len: stamp.len, hashed_us: Some(start.elapsed().as_micros() as u64) })
     }
 
     /// The size of the file at `path` and, if it was hashed since it last
@@ -169,7 +191,7 @@ impl Hashes {
     pub fn known(&self, path: &Path) -> Option<(Option<Hash>, u64)> {
         let meta = fs::metadata(path).ok().filter(|m| m.is_file())?;
         let stamp = Stamp::of(&meta);
-        let known = self.0.lock().get(path).cloned();
+        let known = self.known.lock().get(path).cloned();
         let hash = known.and_then(|k| *k.try_lock()?).filter(|(s, _)| *s == stamp).map(|(_, h)| h);
         Some((hash, stamp.len))
     }
@@ -178,8 +200,84 @@ impl Hashes {
     pub fn insert(&self, path: &Path, hash: Hash) -> Result<()> {
         let meta = fs::metadata(path).with_context(|| format_compact!("stat {}", path.display()))?;
         *self.entry(path).lock() = Some((Stamp::of(&meta), hash));
+        self.dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
+
+    /// The hashes saved at `path`; none if nothing was.
+    pub fn load(path: &Path) -> Result<Self> {
+        let data = match fs::read(path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e).with_context(|| format_compact!("reading {}", path.display())),
+        };
+        let mut buf = &data[..];
+        if buf.len() < 16 || &buf[..8] != HASHES_MAGIC {
+            bail!("{} is not a hash table", path.display());
+        }
+        buf.advance(8);
+        let n = buf.get_u64();
+        let mut known = HashMap::with_capacity(n as usize);
+        for _ in 0..n {
+            let short = || anyhow!("{} is cut short", path.display());
+            let len = buf.try_get_u32().map_err(|_| short())? as usize;
+            if buf.len() < len + 8 + 8 + 8 + 16 {
+                return Err(short());
+            }
+            let file = PathBuf::from(OsStr::from_bytes(&buf[..len]));
+            buf.advance(len);
+            let stamp = Stamp { len: buf.get_u64(), mtime_ns: buf.get_i64(), ino: buf.get_u64() };
+            let mut h = [0u8; 16];
+            buf.copy_to_slice(&mut h);
+            known.insert(file, triomphe::Arc::new(Mutex::new(Some((stamp, Hash(h))))));
+        }
+        Ok(Self { known: Mutex::new(known), dirty: AtomicBool::new(false) })
+    }
+
+    /// Save the hashes of files still as they were hashed, if a hash was
+    /// taken since the last save, and forget the rest, but those being
+    /// hashed.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut entries: LPooled<Vec<(PathBuf, Option<Taken>)>> = LPooled::take();
+        entries.extend(self.known.lock().iter().filter_map(|(p, k)| Some((p.clone(), *k.try_lock()?))));
+        let current = |(p, k): &(PathBuf, Option<Taken>)| {
+            k.is_some_and(|(s, _)| fs::metadata(p).is_ok_and(|m| Stamp::of(&m) == s))
+        };
+        let (keep, stale): (LPooled<Vec<_>>, LPooled<Vec<_>>) = entries.drain(..).partition(current);
+        {
+            let mut map = self.known.lock();
+            for (p, _) in stale.iter() {
+                map.remove(p);
+            }
+        }
+        let tmp = path.with_extension("tmp");
+        let mut w = io::BufWriter::new(File::create(&tmp).with_context(|| format_compact!("creating {}", tmp.display()))?);
+        w.write_all(HASHES_MAGIC)?;
+        w.write_all(&(keep.len() as u64).to_be_bytes())?;
+        for (p, k) in keep.iter() {
+            let (s, h) = k.expect("kept entries are known");
+            let b = p.as_os_str().as_bytes();
+            w.write_all(&(b.len() as u32).to_be_bytes())?;
+            w.write_all(b)?;
+            w.write_all(&s.len.to_be_bytes())?;
+            w.write_all(&s.mtime_ns.to_be_bytes())?;
+            w.write_all(&s.ino.to_be_bytes())?;
+            w.write_all(&h.0)?;
+        }
+        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        fs::rename(&tmp, path).with_context(|| format_compact!("writing {}", path.display()))
+    }
+}
+
+/// A file as `Hashes::name` found it: its hash and size, and how long
+/// hashing it took if it had to.
+pub struct Named {
+    pub hash: Hash,
+    pub len: u64,
+    pub hashed_us: Option<u64>,
 }
 
 /// A server's blobs, named by hash and read only, so job trees can be
@@ -494,6 +592,36 @@ mod test {
         assert!(store.has(&blob));
         assert!(!dir.join("ab").join(&old).exists(), "a blake3 name is gone");
         assert_eq!(store.used.load(Ordering::Relaxed), 4, "and isn't counted");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hashes_outlive_a_restart_until_their_files_change() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-hashes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let (kept, changed, gone, table) = (dir.join("kept"), dir.join("changed"), dir.join("gone"), dir.join("hashes"));
+        for f in [&kept, &changed, &gone] {
+            fs::write(f, f.to_str().unwrap())?;
+        }
+        let hashes = Hashes::default();
+        for f in [&kept, &changed, &gone] {
+            assert!(hashes.name(f)?.hashed_us.is_some());
+        }
+        hashes.save(&table)?;
+        let loaded = Hashes::load(&table)?;
+        let named = loaded.name(&kept)?;
+        assert_eq!((named.hash, named.hashed_us), (Hash::of(kept.to_str().unwrap().as_bytes()), None), "not read again");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&changed, "new contents")?;
+        assert_eq!(loaded.name(&changed)?.hash, Hash::of(b"new contents"), "hashed again");
+        fs::remove_file(&gone)?;
+        loaded.save(&table)?;
+        let again = Hashes::load(&table)?;
+        assert_eq!(again.known.lock().len(), 2, "the gone file is forgotten");
+        assert!(again.name(&changed)?.hashed_us.is_none());
+        assert!(Hashes::load(&dir.join("none"))?.known.lock().is_empty());
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

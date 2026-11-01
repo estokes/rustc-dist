@@ -602,7 +602,12 @@ by default; a tmpfs keeps it in memory), evicting the least recently used past
 `cache_gb` down to 90% of it, except blobs a running job reads, which are
 pinned from its manifest until it ends. The client hashes the files a job
 reads when it sends the job, keeping each hash until the file's size, mtime
-or inode changes. Most are known by then: the wrapper tells the daemon the
+or inode changes, and saving them with the cost table (`hashes` in the state
+directory) so a restart needn't read files again to name them. On washu-chan
+the lanes' target directories are on a tmpfs larger than RAM, so a file
+built a while ago is often in swap (zram or a swap file on disk), and the
+first read of it after a restart ran at about 110 MB/s. The remote job's log
+line says how many MB staging hashed and how long that took. Most are known by then: the wrapper tells the daemon the
 crate files a compile here wrote, which the daemon hashes in the background
 once it ends, and crate files built on another box come back with their
 hash. Placement prices a send only by hashes already known. A job that needs
