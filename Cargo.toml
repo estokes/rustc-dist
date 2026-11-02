@@ -1,6 +1,6 @@
 [package]
 name = "rustc-dist"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Schedules rustc on the right cores of each box, and shares builds across boxes over netidx"
 license = "MIT"
