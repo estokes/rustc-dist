@@ -2099,6 +2099,7 @@ impl Sched {
                 Basis::Box => "box",
                 Basis::Size => "est",
                 Basis::Pairs => "pairs",
+                Basis::Similar => "similar",
             };
             let _ = write!(line, " {:.2}+{:.2}+{:.2} [{basis}]", s(c.start_us), s(c.copy_us), s(c.run_us));
             if let (Some(table_us), Some(fit)) = (c.table_us, &self.pairs) {

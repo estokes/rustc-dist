@@ -502,7 +502,8 @@ place `p` is
 - `b(p)`, the place's effect, is the log of µs per million instructions
   there.
 - `s(p)` is how much the place slows with its load, the mean runnable tasks
-  per CPU while the run ran, the job's own included: none up to one task
+  per CPU, weighted by nice level (Cost), while the run ran, the job's own
+  included: none up to one task
   per CPU, since until then nothing waits for a CPU. It is fitted for every
   place, starting from 1, time growing with load as when tasks share the
   CPUs, which counts as 2 slopes. On 2026-11-02, when ryouko and aieka
@@ -549,6 +550,49 @@ A unit with no runs falls back to its coarse key, then to the median unit.
 Each profile keeps its own places, as now; one never used starts at its
 calibration.
 
+### Predicting (since 2026-11-02, after the soak)
+
+The place effects say how a unit's time at one place becomes its time at
+another; a unit's own runs at the place say it better. So a unit's runs at a
+place predict it there: their weighted median, each run taken back to no
+load by the place's slope, then the slope at the load predicted for. At a
+place it never ran at, units like it predict it: for each place it ran at,
+the 16 units nearest it in time there that also ran at the place, whose
+median difference between the two is added to its time there; over the
+places it ran at, the weighted median, each weighing its runs there up to 4.
+With fewer than 16 such units the place effects translate it, `a(unit) +
+b(p)`; a unit never run is its coarse key's effect, then the median unit's,
+plus the place's. Placement lines show `[own]`, `[similar]`, `[pairs]` and
+`[est]` for these.
+
+A place effect is one ratio for every unit, and under the soak each job paid
+a cost of its own beside its work: the effects fitted ryouko against this
+box at ×0.85, mostly from small units, against ×2.0 for jobs of 0.08 s and
+×0.57 for jobs of 6 s. Units like the one predicted carry such a cost at the
+size it weighs. Replayed on the soak's runs (bias as actual over predicted,
+then median error, p90, share within 25%):
+
+| | place effects | own runs, then units like it |
+|---|---|---|
+| all runs of at least 0.5 s | ×1.27, ×1.96, 47% | ×1.25, ×1.95, 50% |
+| other boxes, own runs, bias | ×0.97 | ×1.00 |
+| this box, own runs, bias | ×1.16 | ×1.07 |
+| new to the place, other boxes | ×1.32, ×2.07, 41% | ×1.25, ×1.81, 50% |
+| new to the place, other boxes, bias from the smallest to the largest | ×2.33 to ×0.77 | ×0.98 to ×1.11 |
+| new to the place, this box | ×1.38, bias ×1.13 | ×1.38, bias ×1.12 |
+
+What is left here is this box's load: its times jump just past one task per
+CPU, which one slope can't follow. Matching load instead of adjusting by the
+slope, a unit's own runs at a load within ×1.28 and units like it at loads
+near those compared, took this box's bias for units new to the place from
+×1.11 to ×0.98 but its p90 from ×2.23 to ×2.49, as each prediction rests on
+fewer runs, and a unit had runs at a load that near for only 38% of its
+predictions here. Load bands of a place taken as places of their own would
+learn the curve from every unit there; that is the next thing to try.
+
+A fit of 32,293 runs takes 42 to 50 ms (23 to 38 before), and a prediction
+less than a µs.
+
 The daemon refits on a blocking thread every minute and after a calibration
 or profile switch, and placement reads the latest fit. In Python a fit of
 25,000 runs takes half a second.
@@ -557,7 +601,7 @@ Width, the tokens a job holds after its front end, is still measured per
 unit: it decides light or heavy and the load a job adds. It no longer enters
 a job's time, which the place effect carries. The placement log's bases
 become `[own]` (the unit ran at the place), `[pairs]` (it ran elsewhere) and
-`[est]` (it never ran). The table (`rdstat12`) drops the curves; an rdstat11
+`[est]` (it never ran), and since the soak `[similar]` (Predicting). The table (`rdstat12`) drops the curves; an rdstat11
 table loads its runs and sends without them.
 
 ### Exploring (second stage)

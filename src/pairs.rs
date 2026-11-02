@@ -1,14 +1,18 @@
-//! Place speeds from pairs of runs of the same unit (DESIGN.md, "Speeds from
-//! pairs of runs"): log time = unit + place + slope × log(max(1, load)). A
-//! place's effect comes only from the differences between units' times
-//! there and at other places, so a unit's size cancels and can't feed back
-//! into the places' speeds. For now it only predicts beside the cost table,
-//! for the placement log.
+//! Predicted times from units' runs (DESIGN.md, "Speeds from pairs of
+//! runs"). A unit's runs at a place predict it there. At a place it never
+//! ran at, units like it do: those nearest it in time at a place it ran at
+//! that ran at both, by their median difference between the two, so a cost
+//! every job pays alike is carried at the size it weighs. Each run's time is
+//! first taken back to no load by its place's slope in log time against
+//! log(max(1, load)). Each place's effect, fitted from the differences
+//! between units' times there and at other places so that a unit's size
+//! cancels, translates a unit too few units are like, and with units'
+//! effects predicts one never run by its crate or as the median unit.
 
 use crate::stats::{Basis, PlaceId, keep};
 use arcstr::ArcStr;
 use poolshark::local::LPooled;
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
 
 /// Rounds of fitting places, then units, then load slopes.
 const ROUNDS: usize = 4;
@@ -27,6 +31,13 @@ const SLOPE_POINTS: usize = 200;
 /// Two runs make a load slope only if `log(max(1, load))` differs this much
 /// between them.
 const SLOPE_MIN_DX: f64 = 0.2;
+/// The units like a unit whose times translate its time at a place it ran
+/// at to one it never ran at: this many that ran at both, nearest it in time
+/// at the first.
+const SIMILAR: usize = 16;
+/// The most a place a unit ran at weighs, in runs, among the places its
+/// time is translated from.
+const SOURCE_RUNS: f64 = 4.;
 
 /// A run of a unit, by its index in `Snapshot::units`.
 pub struct Sample {
@@ -54,14 +65,18 @@ pub struct Snapshot {
 }
 
 /// Each unit's effect, the log of its work in millions of instructions at
-/// the reference, with the places it ran at, and each place's effect and
-/// load slope.
+/// the reference, and where its times at the places it ran at are in `at`;
+/// each place's effect and load slope; and for each ordered pair of places,
+/// `p * places + q`, every unit that ran at both: its time at `p` and its
+/// difference at `q`, by its time at `p`.
 pub struct Fit {
-    units: HashMap<ArcStr, (f64, Ran)>,
+    units: HashMap<ArcStr, (f64, Range<usize>)>,
+    at: Vec<At>,
     coarse: HashMap<ArcStr, f64>,
     /// For a unit with neither.
     median: Option<f64>,
     places: Vec<(f64, f64)>,
+    similar: Vec<Vec<(f64, f64)>>,
 }
 
 /// The weighted median of `samples`, each a value and its weight, or the
@@ -87,23 +102,6 @@ fn median(samples: &mut [(f64, f64)]) -> Option<f64> {
     samples.last().map(|(v, _)| *v)
 }
 
-/// The places a unit ran at, as bits by their index; a place past the 64th
-/// counts as one it never ran at.
-#[derive(Clone, Copy, Default)]
-struct Ran(u64);
-
-impl Ran {
-    fn add(&mut self, place: PlaceId) {
-        if let Some(bit) = 1u64.checked_shl(place.index() as u32) {
-            self.0 |= bit;
-        }
-    }
-
-    fn at(self, place: PlaceId) -> bool {
-        1u64.checked_shl(place.index() as u32).is_some_and(|bit| self.0 & bit != 0)
-    }
-}
-
 /// How loaded a run was: none up to a runnable task per CPU, the job's own
 /// included, since until then nothing waits for a CPU.
 fn x(load_c: u32) -> f64 {
@@ -117,21 +115,27 @@ fn log_us(s: &Sample) -> f64 {
 /// Values, each with its weight.
 type Weighed = LPooled<Vec<(f64, f64)>>;
 
-/// The pairs of places, each with every unit's difference between its
-/// times at the two, weighing what the less-run side weighs.
-struct Pairs {
-    n: usize,
-    diffs: LPooled<Vec<Weighed>>,
+/// A unit's time at a place: the median of its runs' log µs there, less the
+/// load each ran under by the place's slope, and what they weigh.
+#[derive(Clone, Copy)]
+struct At {
+    place: usize,
+    log_us: f64,
+    weight: f64,
 }
 
-impl Pairs {
-    /// From every unit's median time at each place it ran at, less the
-    /// load each place's slope says it ran under.
+/// Every unit's time at each place it ran at, in order of place: unit `u`'s
+/// are `at[spans[u]]`.
+struct Times {
+    at: Vec<At>,
+    spans: Vec<Range<usize>>,
+}
+
+impl Times {
     fn new(snap: &Snapshot, by_unit: &[LPooled<Vec<usize>>], weight: &[f64], slope: &[f64]) -> Self {
-        let n = snap.priors.len();
-        let mut diffs: LPooled<Vec<Weighed>> = (0..n * n).map(|_| LPooled::take()).collect();
+        let mut at = Vec::new();
+        let mut spans = Vec::with_capacity(by_unit.len());
         let mut runs: LPooled<Vec<(usize, f64, f64)>> = LPooled::take();
-        let mut at: LPooled<Vec<(usize, f64, f64)>> = LPooled::take();
         let mut scratch: Weighed = LPooled::take();
         for ix in by_unit {
             runs.clear();
@@ -140,18 +144,55 @@ impl Pairs {
                 (p, log_us(s) - slope[p] * x(s.load_c), weight[i])
             }));
             runs.sort_by_key(|r| r.0);
-            at.clear();
+            let start = at.len();
             for group in runs.chunk_by(|a, b| a.0 == b.0) {
                 scratch.clear();
                 scratch.extend(group.iter().map(|&(_, y, w)| (y, w)));
-                let w = group.iter().map(|r| r.2).sum();
-                if let Some(m) = median(&mut scratch) {
-                    at.push((group[0].0, m, w));
+                if let Some(log_us) = median(&mut scratch) {
+                    at.push(At { place: group[0].0, log_us, weight: group.iter().map(|r| r.2).sum() });
                 }
             }
-            for (i, &(p, mp, wp)) in at.iter().enumerate() {
-                for &(q, mq, wq) in &at[i + 1..] {
-                    diffs[p * n + q].push((mp - mq, wp.min(wq)));
+            spans.push(start..at.len());
+        }
+        Self { at, spans }
+    }
+
+    fn units(&self) -> impl Iterator<Item = &[At]> {
+        self.spans.iter().map(|span| &self.at[span.clone()])
+    }
+
+    /// For each ordered pair of places, `p * n + q`, every unit that ran at
+    /// both: its time at `p` and its difference at `q`, by its time at `p`.
+    fn similar(&self, n: usize) -> Vec<Vec<(f64, f64)>> {
+        let mut similar: Vec<Vec<(f64, f64)>> = (0..n * n).map(|_| Vec::new()).collect();
+        for at in self.units() {
+            for a in at {
+                for b in at.iter().filter(|b| b.place != a.place) {
+                    similar[a.place * n + b.place].push((a.log_us, b.log_us - a.log_us));
+                }
+            }
+        }
+        for s in &mut similar {
+            s.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
+        similar
+    }
+}
+
+/// The pairs of places, each with every unit's difference between its
+/// times at the two, weighing what the less-run side weighs.
+struct Pairs {
+    n: usize,
+    diffs: LPooled<Vec<Weighed>>,
+}
+
+impl Pairs {
+    fn new(n: usize, times: &Times) -> Self {
+        let mut diffs: LPooled<Vec<Weighed>> = (0..n * n).map(|_| LPooled::take()).collect();
+        for at in times.units() {
+            for (i, a) in at.iter().enumerate() {
+                for b in &at[i + 1..] {
+                    diffs[a.place * n + b.place].push((a.log_us - b.log_us, a.weight.min(b.weight)));
                 }
             }
         }
@@ -206,8 +247,10 @@ impl Fit {
         let mut unit: LPooled<Vec<f64>> = (0..snap.units.len()).map(|_| 0.).collect();
         let mut scratch: LPooled<Vec<(f64, f64)>> = LPooled::take();
         let mut place = LPooled::take();
+        let mut times = Times { at: Vec::new(), spans: Vec::new() };
         for round in 0..=ROUNDS {
-            place = Pairs::new(snap, &by_unit, &weight, &slope).places(snap);
+            times = Times::new(snap, &by_unit, &weight, &slope);
+            place = Pairs::new(n, &times).places(snap);
             for (u, ix) in by_unit.iter().enumerate() {
                 scratch.clear();
                 scratch.extend(ix.iter().map(|&i| {
@@ -231,36 +274,79 @@ impl Fit {
             median(&mut scratch)
         };
         let coarse = snap.coarse.iter().filter_map(|(k, runs)| Some((k.clone(), effect(runs)?))).collect();
-        let units: HashMap<ArcStr, (f64, Ran)> = by_unit
+        let units: HashMap<ArcStr, (f64, Range<usize>)> = by_unit
             .iter()
             .enumerate()
             .filter(|(_, ix)| !ix.is_empty())
-            .map(|(u, ix)| {
-                let mut ran = Ran::default();
-                for &i in ix.iter() {
-                    ran.add(snap.samples[i].place);
-                }
-                (snap.units[u].clone(), (unit[u], ran))
-            })
+            .map(|(u, _)| (snap.units[u].clone(), (unit[u], times.spans[u].clone())))
             .collect();
-        let mut all: LPooled<Vec<(f64, f64)>> = units.values().map(|&(a, _)| (a, 1.)).collect();
+        let mut all: LPooled<Vec<(f64, f64)>> = units.values().map(|(a, _)| (*a, 1.)).collect();
         let median = median(&mut all);
         let places = (0..n).map(|p| (place[p], slope[p])).collect();
-        Self { units, coarse, median, places }
+        let similar = times.similar(n);
+        Self { units, at: times.at, coarse, median, places, similar }
     }
 
-    /// Predicted µs of `exact`, or its `coarse` key, or the median unit, at
-    /// `place` under `load_c`, and what it comes from; `loaded` false leaves
-    /// out the place's load slope. None for a place the fit doesn't know.
+    /// Predicted µs of `exact` at `place` under `load_c`, and what it comes
+    /// from: its runs there; else units like it (`translate`); else its
+    /// effect and the place's; and for a unit never run, its `coarse` key's
+    /// effect or the median unit's. `loaded` false leaves out the place's
+    /// load slope. None for a place the fit doesn't know.
     pub fn predict_us(&self, exact: &str, coarse: &str, place: PlaceId, load_c: u32, loaded: bool) -> Option<(u64, Basis)> {
-        let &(effect, slope) = self.places.get(place.index())?;
-        let (unit, basis) = match self.units.get(exact) {
-            Some(&(unit, ran)) if ran.at(place) => (unit, Basis::Place),
-            Some(&(unit, _)) => (unit, Basis::Pairs),
-            None => (self.coarse.get(coarse).copied().or(self.median)?, Basis::Size),
+        let p = place.index();
+        let &(effect, slope) = self.places.get(p)?;
+        let (log_us, basis) = match self.units.get(exact) {
+            Some((unit, span)) => {
+                let at = &self.at[span.clone()];
+                match at.iter().find(|a| a.place == p) {
+                    Some(a) => (a.log_us, Basis::Place),
+                    None => match self.translate(at, p) {
+                        Some(log_us) => (log_us, Basis::Similar),
+                        None => (unit + effect, Basis::Pairs),
+                    },
+                }
+            }
+            None => (self.coarse.get(coarse).copied().or(self.median)? + effect, Basis::Size),
         };
         let load = if loaded { slope * x(load_c) } else { 0. };
-        Some(((unit + effect + load).exp() as u64, basis))
+        Some(((log_us + load).exp() as u64, basis))
+    }
+
+    /// A unit's time at `p`, where it never ran, from its times `at` the
+    /// places it ran at: from each, its time there plus the median
+    /// difference at `p` of the `SIMILAR` units nearest it in time there
+    /// that ran at both; over those places, the weighted median, each
+    /// weighing its runs up to `SOURCE_RUNS`. None if no place it ran at
+    /// shares that many units with `p`.
+    fn translate(&self, at: &[At], p: usize) -> Option<f64> {
+        let n = self.places.len();
+        let mut guesses: LPooled<Vec<(f64, f64)>> = LPooled::take();
+        for a in at {
+            let units = &self.similar[a.place * n + p];
+            if units.len() < SIMILAR {
+                continue;
+            }
+            let mut diffs = [0f64; SIMILAR];
+            let mut hi = units.partition_point(|u| u.0 < a.log_us);
+            let mut lo = hi;
+            for d in &mut diffs {
+                let below = match (lo.checked_sub(1), units.get(hi)) {
+                    (Some(i), Some(u)) => a.log_us - units[i].0 <= u.0 - a.log_us,
+                    (below, _) => below.is_some(),
+                };
+                if below {
+                    lo -= 1;
+                    *d = units[lo].1;
+                } else {
+                    *d = units[hi].1;
+                    hi += 1;
+                }
+            }
+            diffs.sort_by(f64::total_cmp);
+            let diff = (diffs[SIMILAR / 2 - 1] + diffs[SIMILAR / 2]) / 2.;
+            guesses.push((a.log_us + diff, a.weight.min(SOURCE_RUNS)));
+        }
+        median(&mut guesses)
     }
 }
 
@@ -327,6 +413,16 @@ mod test {
         got.abs_diff(want) * 50 <= want
     }
 
+    /// How many times as fast as `from` the fit has `to`.
+    fn speedup(fit: &Fit, from: PlaceId, to: PlaceId) -> f64 {
+        (fit.places[from.index()].0 - fit.places[to.index()].0).exp()
+    }
+
+    fn basis(fit: &Fit, name: &str, at: PlaceId) -> Basis {
+        let u = unit(name);
+        fit.predict_us(&u.exact, &u.coarse, at, 0, true).unwrap().1
+    }
+
     #[test]
     fn a_place_is_as_fast_as_pairs_say_whatever_the_units_sizes() {
         let (mut s, [a, b, _]) = table();
@@ -341,6 +437,7 @@ mod test {
         // A unit seen only on a takes half as long on b.
         ran(&mut s, "new:1", a, 0, 3000);
         let fit = Fit::new(&s.pair_snapshot(a));
+        assert!((1.96..2.04).contains(&speedup(&fit, a, b)), "{}", speedup(&fit, a, b));
         let got = predict(&fit, "new:1", b, 0);
         assert!(near(got, 1_500_000), "{got}");
         assert!(near(predict(&fit, "u2:1", a, 0), 200_000));
@@ -411,8 +508,8 @@ mod test {
         }
         // Past the first hour, when each unit has run at one pair of places.
         for fit in &fits[1..] {
-            let ratio = |at| predict(fit, "u7:1", a, 0) as f64 / predict(fit, "u7:1", at, 0) as f64;
-            assert!((2.85..3.15).contains(&ratio(b)) && (1.42..1.58).contains(&ratio(c)), "{} {}", ratio(b), ratio(c));
+            let (b, c) = (speedup(fit, a, b), speedup(fit, a, c));
+            assert!((2.85..3.15).contains(&b) && (1.42..1.58).contains(&c), "{b} {c}");
         }
         // The scale holds: the median unit stays the size it was.
         let median = |fit: &Fit| predict(fit, "new:1", a, 0);
@@ -447,6 +544,50 @@ mod test {
         // times as long.
         let fit = Fit::new(&s.pair_snapshot(a));
         assert!(near(predict(&fit, "u:1", c, 100), 1_000_000) && near(predict(&fit, "u:1", c, 300), 3_000_000));
+    }
+
+    #[test]
+    fn a_unit_is_its_own_runs_at_a_place_it_ran_at() {
+        let (mut s, [a, b, _]) = table();
+        for i in 0..20 {
+            ran(&mut s, &format!("u{i}:1"), a, 0, 1000 + 100 * i);
+            ran(&mut s, &format!("u{i}:1"), b, 0, (1000 + 100 * i) / 2);
+        }
+        // Twice as fast on b as the others are, it is that fast there.
+        ran(&mut s, "odd:1", a, 0, 2000);
+        ran(&mut s, "odd:1", b, 0, 500);
+        let fit = Fit::new(&s.pair_snapshot(a));
+        assert!(near(predict(&fit, "odd:1", b, 0), 500_000), "{}", predict(&fit, "odd:1", b, 0));
+        assert_eq!(basis(&fit, "odd:1", b), Basis::Place);
+    }
+
+    #[test]
+    fn a_unit_new_to_a_place_takes_what_units_like_it_take_there() {
+        let (mut s, [a, b, _]) = table();
+        // On b every job pays 400 ms, then runs twice as fast as on a: a
+        // ratio near 5 for a job of 100 ms on a, near 0.5 for one of 10 s.
+        let on_b = |ms: f64| 400. + ms / 2.;
+        for i in 0..200 {
+            let ms = 50. * (400f64.ln() * i as f64 / 199.).exp();
+            ran(&mut s, &format!("u{i}:1"), a, 0, ms as u64);
+            ran(&mut s, &format!("u{i}:1"), b, 0, on_b(ms) as u64);
+        }
+        ran(&mut s, "small:1", a, 0, 300);
+        ran(&mut s, "big:1", a, 0, 5000);
+        let fit = Fit::new(&s.pair_snapshot(a));
+        for (name, ms) in [("small:1", 300.), ("big:1", 5000.)] {
+            let got = predict(&fit, name, b, 0);
+            assert!(near(got, (on_b(ms) * 1000.) as u64), "{name}: {got}");
+            assert_eq!(basis(&fit, name, b), Basis::Similar);
+        }
+        // With fewer units like it than it takes, the places' effects.
+        let (mut s, [a, b, _]) = table();
+        for i in 0..SIMILAR - 1 {
+            ran(&mut s, &format!("u{i}:1"), a, 0, 1000);
+            ran(&mut s, &format!("u{i}:1"), b, 0, 500);
+        }
+        ran(&mut s, "new:1", a, 0, 1000);
+        assert_eq!(basis(&Fit::new(&s.pair_snapshot(a)), "new:1", b), Basis::Pairs);
     }
 
     #[test]

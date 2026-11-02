@@ -590,9 +590,11 @@ pub enum Basis {
     /// place's factor; or for the pairs model, its crate's effect or the
     /// median unit's.
     Size,
-    /// The pairs model: its runs elsewhere, and other units' runs both
-    /// there and where it ran.
+    /// The pairs model: its runs elsewhere, by the places' effects.
     Pairs,
+    /// The pairs model: its runs elsewhere, by the units nearest it in time
+    /// there that ran both there and at the place.
+    Similar,
 }
 
 /// What `status` shows of a unit.
