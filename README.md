@@ -4,42 +4,37 @@ Build Rust on every machine you own.
 
 rustc-dist is a cargo `rustc-wrapper` plus a small daemon on each box. The
 daemon decides where each rustc cargo starts should run: which cores on this
-box, or, when another box would finish it sooner, a different machine
-entirely. Boxes find each other and trade work over
-[netidx](https://github.com/netidx/netidx). Work on a laptop and let the
-desktops in the house do the compiling, with the biggest jobs going to the
-fastest machine.
+box, or another machine when that one would finish it sooner. Boxes find each
+other and trade work over [netidx](https://github.com/netidx/netidx). Work on
+a laptop and let the desktops in the house do the compiling.
 
 It is not a cache. Every job is compiled, just on the core or machine where
 it finishes soonest.
 
 ## Results
 
-The point isn't to make one build faster. How much a single build gains
-depends on its crate graph: a chain of crates that each wait on the last runs
-no faster on more machines. The point is having the capacity, and using it
-well, when many builds want it at once: eight coding agents, each in its own
-checkout, all compiling at the same moment.
+The point isn't one faster build: how much that gains depends on the crate
+graph, and a chain of crates that each wait on the last runs no faster on
+more machines. The point is capacity, used well, when many builds want it at
+once, such as eight coding agents in their own checkouts all compiling
+together.
 
 Cargo alone doesn't handle that. Each cargo sizes its jobserver to the whole
 box and knows nothing of the others. Builds that share a target directory
-wait on its lock. Builds in separate target directories run side by side,
-with up to eight times as many rustc threads as the box has CPUs, and the
-memory to match. (Cargo can share a jobserver inherited from a parent `make`,
-but agents started separately don't have one.) With rustc-dist, every rustc
-on the box, from any cargo, holds a token from the one daemon: 1.5 per CPU
-(`tokens_per_cpu`), admitted by predicted memory, critical path first. Work
-beyond that goes to boxes with capacity to spare.
+wait on its lock; builds in separate ones run side by side, with up to eight
+times as many rustc threads as the box has CPUs, and the memory to match.
+(A jobserver inherited from a parent `make` would be shared, but separately
+started agents have none.) With rustc-dist, every rustc on the box, from any
+cargo, holds one of the daemon's tokens, 1.5 per CPU, admitted by predicted
+memory, critical path first. Work beyond that goes to other boxes.
 
-In daily use, with several agents each building its own checkout of
-[graphix](https://github.com/graphix-lang/graphix), the farm settled into a
-pattern: the fastest desktop does most of the compiling, the laptop runs the
-tests, and the other desktop takes the surges when three or more agents build
-at once. Our estimate is that agentic work got at least twice as fast.
+In daily use, with several agents building their own checkouts of
+[graphix](https://github.com/graphix-lang/graphix), the fastest desktop does
+most of the compiling, the laptop runs the tests, and the other desktop takes
+the surges. Our estimate is that agentic work got at least twice as fast.
 
-One build on its own: a clean dev build of graphix (about 650 crates),
-launched from a laptop. The farm was the laptop plus two desktops on the same
-LAN:
+One clean dev build of graphix (about 650 crates), from a laptop with two
+desktops on the same LAN:
 
 | | wall time |
 |---|---|
@@ -48,70 +43,52 @@ LAN:
 | laptop on battery at a 12 W SoC limit + farm | 1m 23s |
 | fastest desktop alone, plain cargo | 1m 19s |
 
-The laptop's own speed hardly matters any more. A build from the laptop
-finishes about as fast as logging into the fastest box and building there.
+The laptop's own speed hardly matters: a build from it finishes about as fast
+as one on the fastest box.
 
 ## What it does
 
 On one box:
 
-- **Core classes.** It calibrates the box's cores (performance, efficiency
-  and low-power cores on hybrid CPUs) separately for each power profile, and
-  shares each class's jobserver tokens out to the jobs on it. SMT siblings
-  join their core's class.
-- **It learns from wall time.** Each unit's size comes from how long it took
-  where it ran, and each class and box learns how much slower than its
-  calibration it runs, at each load, from units that ran in more than one
-  place.
-- **The critical path goes first.** It records the build graph, so it knows
-  how much work waits on each job. The jobs most work waits on get the fast cores. Jobs with time
-  to spare go to slow cores, but never wait for one while a faster core sits
-  idle.
-- **Heavy jobs spread.** A job that holds several jobserver tokens runs on
-  every core, borrowing them from the classes.
+- **Core classes.** It calibrates each class of cores (performance,
+  efficiency, low-power) for each power profile, and hands out each class's
+  jobserver tokens.
+- **Critical path first.** It records the build graph, so the jobs most work
+  waits on get the fast cores. Jobs with time to spare take slow cores, but
+  never wait for one while a faster core sits idle. Jobs that use several
+  threads spread over every core.
 - **Memory.** Jobs are admitted by predicted peak memory, counting a share of
-  compressed swap (zram or zswap).
-- **It learns.** Each class's speed is corrected by the jobs that actually run
-  there, and what it learns survives restarts.
+  compressed swap.
+- **It learns.** Each unit's size, and how much each class and box slows
+  under load, come from the wall times of real jobs, and survive restarts.
 
 Across boxes (a farm):
 
-- Each daemon publishes its state to netidx. A job goes wherever it is
-  predicted to finish first, including waiting for a busy box that is much
-  faster.
+- A job goes wherever it is predicted to finish first, even to wait for a
+  busy box that is much faster.
 - Libraries, binaries, tests, proc macros and build scripts can all go
-  remote. The server runs rustc in a [bubblewrap](https://github.com/containers/bubblewrap)
+  remote, into a [bubblewrap](https://github.com/containers/bubblewrap)
   sandbox with no network and no home directory.
 - Servers keep the files they receive and the crates they build in a
-  content-addressed cache with an LRU size cap, so repeat builds send little.
-  The cache can live on a tmpfs.
-- A job that links starts compiling before its dependencies' rlibs arrive. It
-  builds against metadata-only stand-ins, and a stand-in linker waits for the
-  real rlibs.
-- A job that fails remotely because it reads a file it wasn't sent is sent
-  again with it. Any other remote failure reruns locally, and cargo never sees
-  diagnostics twice.
-- `rustc-dist status` shows a box's classes, queue and job history. Every box
-  also publishes a status table to netidx, which the
-  [netidx browser](https://netidx.github.io/netidx-book/) shows as one row
-  per box.
+  size-capped cache, so repeat builds send little.
+- A job that fails remotely reruns locally, or remotely again if it only
+  lacked a file it wasn't sent. Cargo never sees diagnostics twice.
+- `rustc-dist status` shows a box's classes, queue and job history, and the
+  [netidx browser](https://netidx.github.io/netidx-book/) shows the whole
+  farm as a table.
 
 ## Requirements
 
-- Linux. It uses `/proc`, CPU affinity, FIFO jobservers and `perf_event_open`.
-- Toolchains installed with [rustup](https://rustup.rs). In a farm, a job only
-  goes to a box with the same toolchain, matched by rustc's commit hash and
-  host, and with the target's standard library for `--target` builds. A
-  box serves toolchains rustup installs or updates while it runs, and stops
-  serving the ones they replace.
+- Linux.
+- Toolchains installed with [rustup](https://rustup.rs). A job only goes to a
+  box with the same toolchain (rustc's commit hash and host), and with the
+  target's standard library for `--target` builds.
 - A systemd user session, for `rustc-dist install`. Without one, the wrapper
   starts the daemon itself.
 - On boxes that take other boxes' jobs: `bwrap`, the linker your cargo config
-  names (`cc` by default, or for example `clang` with `mold`), and any system
-  libraries your `-sys` crates link against.
+  names, and any system libraries your `-sys` crates link against.
 - Optional: hardware instruction counters (`perf_event_paranoid` of 2 or
-  lower), which calibration uses to compare cores. Without them, each
-  calibration run is taken to retire a fixed count.
+  lower), which calibration uses to compare cores.
 
 ## Install
 
@@ -119,15 +96,13 @@ Across boxes (a farm):
 cargo install rustc-dist
 ```
 
-After an upgrade, run `rustc-dist install` again, or restart the service: a
-daemon refuses wrappers of another version. They wait up to 10 s for it to
-restart, then fail and say so.
+After an upgrade, run `rustc-dist install` again or restart the service: a
+daemon refuses wrappers of another version.
 
 ## Set up one box
 
-1. Install the systemd user service. Do this while the box is idle: the first
-   start runs a 60 second calibration load on every core, and builds wait
-   until it finishes.
+1. Install the systemd user service while the box is idle: the first start
+   runs a 60 second calibration on every core, and builds wait for it.
 
    ```sh
    rustc-dist install
@@ -142,78 +117,45 @@ restart, then fail and say so.
    incremental = false
    ```
 
-   - `jobs` only caps how many rustc processes cargo starts; the daemon
-     decides how many actually run. Cargo holds about four open files per
-     job, so 128 fits the usual limit of 1024. Go higher only if you've
-     raised that limit.
-   - Incremental jobs always stay on the box that has the incremental cache.
-     With incremental off, workspace crates can be sent to other boxes too.
+   The daemon, not `jobs`, decides how many compiles run; 128 keeps cargo's open
+   files (about four per job) under the usual limit of 1024. With incremental
+   off, workspace crates can go to other boxes too.
 
-3. Profiles are names you choose, switched with `rustc-dist profile NAME`:
-   for example from a script when a laptop's power profile changes, or when a
-   long-running load starts on the box. The daemon calibrates each new
-   profile name the first time it sees it, once running jobs finish, and
-   switches to a known one at once. If no daemon is running, the command
-   records the profile for the next start. To calibrate a profile ahead of
-   time, on an idle box:
+3. Optionally, switch profiles with `rustc-dist profile NAME`, for example
+   when a laptop's power profile changes. A new name is calibrated the first
+   time; `--recalibrate` does it again. Run it as the daemon's user, with that
+   user's `HOME`; from a root script, for example,
+   `sudo -u alice /home/alice/.cargo/bin/rustc-dist profile power-saver`.
 
-   ```sh
-   rustc-dist profile power-saver --recalibrate
-   ```
-
-   The command must run as the user the daemon runs as, with that user's
-   `HOME`. From a root script, for example:
-
-   ```sh
-   sudo -u alice /home/alice/.cargo/bin/rustc-dist profile power-saver
-   ```
-
-4. Build as usual. `rustc-dist status` shows what it's doing, and
-   `RUSTC_DIST=off cargo build` runs rustc directly.
+4. Build as usual. `RUSTC_DIST=off cargo build` runs rustc directly.
 
 ## Set up a farm
 
-1. **A netidx domain.** Every box needs a netidx resolver it can reach, and
-   working authentication. The [netidx book](https://netidx.github.io/netidx-book/)
-   covers setting up a resolver and its security
-   ([crate](https://crates.io/crates/netidx), [docs](https://docs.rs/netidx)).
-   rustc-dist uses each box's default netidx client config (`NETIDX_CFG`, or
-   netidx's default paths).
+1. **A netidx domain.** Every box needs a netidx resolver it can reach and
+   working authentication; the
+   [netidx book](https://netidx.github.io/netidx-book/) covers both.
+   rustc-dist uses each box's default netidx client config.
 
-2. **A base path.** Pick a path for the farm, such as `/build`, and give every
-   box's identity permission to publish, subscribe, list and write under it.
-   rustc-dist uses, under its protocol version `vN` so boxes of different
-   versions never meet:
-
-   - `BASE/vN/status/NAME/...`: one row per box. The browser shows it as a
-     table of the whole farm.
-   - `BASE/vN/api/NAME/jobs`: where the box takes jobs.
-   - `BASE/vN/units/NAME/...`: the units the box has run.
+2. **A base path**, such as `/build`, under which every box's identity may
+   publish, subscribe, list and write. rustc-dist works under `BASE/vN`, where
+   `N` is its protocol version, so boxes of different versions never meet.
 
 3. **Configure each box** in `~/.config/rustc-dist.toml`:
 
    ```toml
    base = "/build"
-   # Where other boxes reach this one, in netidx bind syntax. netidx's
-   # default is often loopback only.
+   # Where other boxes reach this one; netidx's default is often loopback.
    bind = "192.168.1.0/24"
-   # Where other boxes' inputs and builds are kept. A tmpfs keeps them in
-   # memory.
-   cache_dir = "/tmp/rustc-dist-cache"
-   cache_gb = 16
    ```
 
-4. **Start it on each box** with `rustc-dist install`, on an idle box. On boxes
-   that serve builds without anyone logged in, also run
-   `loginctl enable-linger $USER`, so the user service keeps running.
+4. **Start it on each box** with `rustc-dist install`. On boxes that serve
+   builds with no one logged in, also run `loginctl enable-linger $USER`.
 
-5. **Check** that `netidx resolver list /build/status` shows every box, and
-   that `rustc-dist status` lists the others.
+5. **Check** that `rustc-dist status` lists the other boxes.
 
-Then build from any box. The first build of a project teaches rustc-dist its
-build graph and each unit's cost, and later builds use them. A job whose
-dependencies were built before rustc-dist first saw the project stays local,
-so start with a clean target directory.
+The first build of a project teaches rustc-dist its build graph and costs. A
+job whose dependencies built before rustc-dist first saw the project stays
+local, so start with a clean target directory.
 
 ## Configuration
 
@@ -231,68 +173,51 @@ so start with a clean target directory.
 | `tokens_per_cpu` | 1.5 | jobserver tokens per CPU |
 | `compressed_swap_share` | 0.5 | share of compressed swap that predicted job memory may fill beyond RAM |
 | `calibration_seconds` | 60 | how long calibration runs |
-| `half_life_s` | 86400 | seconds after which old runs count half toward how fast each place runs and how big each unit is |
-| `copy_half_life_s` | 3600 | seconds after which old sent runs count half toward how long sending a job takes |
+| `half_life_s` | 86400 | half-life of past runs, for speeds and unit sizes |
+| `copy_half_life_s` | 3600 | half-life of past sends, for transfer times |
 
-A project can keep crates on the box that builds it, for example proc macros
-that read the network or the local environment. Put a `rustc-dist.toml` at
-or above the directory you run cargo in:
+A project can keep crates on the box that builds it, such as proc macros that
+read the network or the local environment, with a `rustc-dist.toml` at or
+above the directory you run cargo in:
 
 ```toml
 local = ["sqlx-macros"]
 ```
 
-Calibrations and history live in `~/.local/state/rustc-dist`. A history file
-the daemon can't read, for example after going back to an older version, is
-moved aside as `NAME.unreadable`, and the daemon starts without it. The daemon logs
-to the journal (`journalctl --user -u rustc-dist`), at the level set by
-`RUSTC_DIST_LOG` (`info` by default). `RUSTC_DIST_LOG=info,placement=debug`
-adds a line per job saying where it went: whether it ran before and its time
-on one thread of this box's fastest class; each place it could have gone,
-with the seconds until a slot, moving its files and running there, and what
-that run time comes from (`[own]` its runs there, `[box]` its runs on that
-box, `[est]` an estimate from its size); the one it took starred; and why the
-boxes it couldn't go to were out.
+Calibrations and history live in `~/.local/state/rustc-dist`. The daemon logs
+to the journal (`journalctl --user -u rustc-dist`) at the level
+`RUSTC_DIST_LOG` sets; `RUSTC_DIST_LOG=info,placement=debug` adds where each
+job went, the predicted times everywhere it could have gone, and why other
+boxes were out.
 
 ## What stays local
 
 A job runs only on the box that started it if it:
 
-- is incremental;
-- uses `-C target-cpu=native`;
-- splits debug info into separate files (`-C split-debuginfo` other than `off`);
-- is run by something other than rustc, such as `clippy-driver`;
-- reads arguments from an `@file`, prints something (`--print`), or has no
+- is incremental, uses `-C target-cpu=native`, or splits debug info
+  (`-C split-debuginfo` other than `off`);
+- is run by something other than rustc, such as `clippy-driver`, reads
+  arguments from an `@file`, prints something (`--print`), or has no
   `--out-dir`;
 - has an argument, compiler path or working directory that isn't UTF-8;
 - links, and `remote_links` is off;
-- is named in a project's `local` list, or failed remotely and then built
-  locally twice;
-- is in a project whose `rustc-dist.toml` doesn't parse (the wrapper prints
-  why);
-- depends on a crate the daemon never saw compile, so it can't tell what to
-  send;
-- is in a package directory holding more than 256 MB, not counting build
-  output, other packages and hidden directories;
+- is in a project's `local` list, or one whose `rustc-dist.toml` doesn't
+  parse, or failed remotely and then built locally twice;
+- depends on a crate the daemon never saw compile;
+- is in a package directory of over 256 MB, build output aside;
 - needs a toolchain no other box has.
 
-The placement log (see above) says which, and a job that fails on another box
-is logged as a warning with the box and its first error.
+The placement log says which.
 
 ## Security
 
-Anyone who can open a job channel can run code as the server's user, because
-proc macros are client-supplied shared libraries. The daemon won't run as
-root, and the wrapper runs rustc directly when cargo runs as root. Three things limit that:
-netidx permissions on the base path, a bubblewrap sandbox with no network
-and no home directory, and checks on every path a client sends. Only run a
-farm within a netidx domain whose members you trust.
-
-The farm is trusted, not adversarial: clients already run the code servers
-compile for them. So the sandbox keeps honest jobs apart; it does not stop a
-hostile one. A job can plant symlinks in its own tree that the server then
-follows when it reads outputs, and it can rewrite the store blobs its inputs
-are hard links to, which later jobs from every client would use.
+Anyone who can open a job channel can run code as the server's user, since
+proc macros are shared libraries the client sends. The daemon won't run as
+root. netidx permissions, the sandbox and checks on every path a client sends
+keep honest jobs apart, but don't stop a hostile one, which could for example
+rewrite cached files that later jobs read. Clients already run the code
+servers compile for them, so run a farm only within a netidx domain whose
+members you trust.
 
 ## How it works
 
