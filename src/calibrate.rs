@@ -116,6 +116,7 @@ struct Speed {
 /// after `warm` uses its earlier runs; every CPU finishes at least one.
 fn worker(cpu: u32, t0: Instant, warm: Duration, stop: &AtomicBool) -> Result<Speed> {
     sys::pin(&[cpu])?;
+    sys::job_priority().context("calibrating at a job's priority")?;
     let keys = keys();
     let counter = perf::Counter::start();
     let count = || counter.as_ref().map_or(Ok(0), |c| c.read());

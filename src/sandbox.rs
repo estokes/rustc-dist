@@ -645,6 +645,7 @@ async fn run(
     unsafe {
         cmd.pre_exec(move || {
             sys::pin(&cpus).map_err(io::Error::other)?;
+            sys::job_priority()?;
             gate_fd.map_or(Ok(()), Gate::inherit)
         });
     }

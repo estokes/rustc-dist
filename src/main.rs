@@ -117,6 +117,9 @@ fn dispatch(opt: Opt) -> Result<()> {
         Opt::Daemon => {
             env_logger::Builder::from_env(env_logger::Env::new().filter_or("RUSTC_DIST_LOG", "info"))
                 .init();
+            // Before the runtime starts its threads, which inherit it.
+            let nice = sys::prioritize()?;
+            log::info!("the daemon runs at nice {nice}, jobs at {}", sys::JOB_NICE);
             let rt = tokio::runtime::Runtime::new()?;
             let res = rt.block_on(daemon::run());
             // Don't wait out a calibration that is still running.
@@ -167,7 +170,7 @@ fn status() -> Result<()> {
     }
     writeln!(
         out,
-        "load {:.2} runnable tasks per cpu. Speeds are relative to class 0 idle, learned from the jobs that \
+        "load {:.2} runnable tasks per cpu, weighted by nice level. Speeds are relative to class 0 idle, learned from the jobs that \
          ran each place; work and times are seconds.",
         hundredths(st.load_c)
     )?;

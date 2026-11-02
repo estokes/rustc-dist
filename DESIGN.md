@@ -33,6 +33,12 @@ systemd if its user service is installed, so a wrapper can't start a second
 daemon while systemd restarts its own and leave the service failing to take
 the lock; on its own otherwise.
 
+The daemon runs at the lowest nice level its `RLIMIT_NICE` allows without
+privileges (-11 where `limits.conf` gives the user's groups -11), set before
+its runtime starts threads, so placing, publishing and moving files keep up
+on a busy box. Jobs it runs for other boxes and calibration run at nice 0;
+the wrapper's own jobs run at cargo's.
+
 The wrapper never runs rustc without a grant. If it cannot reach or start the
 daemon it fails the compile with a clear message. `RUSTC_DIST=off` bypasses
 it, and so does running as root: the daemon won't run as root, as it runs
@@ -281,11 +287,15 @@ CPU. A place's factor scales calibrated time to time there. It is a curve over
 load: one value per bucket at 0, ¼, ½, ¾, 1, 1½, 2, 3, 4, 6 and 8 runnable
 tasks per CPU, interpolated between them and growing with load past the last.
 
-A box's load is its runnable tasks per CPU (`procs_running` in `/proc/stat`),
-so test binaries and other work the daemon doesn't run count. The count swings
-from one moment to the next, so it is sampled every 250 ms into a moving
-average in which a sample counts `1/e` as much after 10 s, and placement,
-publishing and the samples a run takes all use the average. A run's load is
+A box's load is its runnable tasks per CPU, each counted by its nice level's
+weight against a job's, the proportions in which the kernel shares a CPU:
+work at nice 19 counts 1/68 of a task at nice 0, since it hardly slows a
+job. The daemon's own tasks don't count; test binaries and other work it
+doesn't run do. Counting reads every task's `stat` under `/proc`, 45 to
+125 ms on a server running 5,000 tasks, so the box is counted every 2 s,
+into a moving average in which a count weighs `1/e` as much after 10 s.
+Placement, publishing and the samples a run takes, every 250 ms, all use
+the average. A run's load is
 the mean of the samples taken since its rustc started, or the latest sample
 for a run too short to be sampled. Boxes publish their load.
 
@@ -635,6 +645,35 @@ moves only the units' effects; a place's effect comes from pairs whatever
 the units' sizes; a place with few pairs stays near its calibration;
 refitting unchanged runs moves nothing; an rdstat11 table loads without its
 curves.
+
+A soak on 2026-11-02 ran ten graphix builds, staggered, from 14:27, with
+ryouko and aieka under 80 busy processes each at nice 19 (in their own
+profile, `soak`). The journal kept only 14:52 to 15:23 and the table only
+each unit's last 16 runs, so how the fit settled isn't recorded; by 14:52 it
+had, and windows of 5 minutes stayed at ×1.25 to ×1.35. Over 15,957 runs of
+at least 0.5 s the pairs and the cost table both had a median of ×1.27 (p90
+×1.95 and ×2.09); 91% of predictions came from the unit's own runs at the
+place. Other boxes' places were unbiased (×0.91 to ×1.00) and near the noise
+floor, the error of predicting each run by the median of its unit's other
+runs at the place (×1.17 on ryouko, ×1.21 on aieka). This box's ran ×1.11 to
+×1.27 slower than predicted. The soak showed two things:
+
+- Runnable tasks counted the soak: 6 to 8 per CPU, in a band too narrow
+  (7.9 to 8.9 on ryouko) to fit a slope from. Refits put ryouko's slope
+  anywhere from 1.3 to 2.8, and its speed with no load at 15 to 400 times
+  this box's, while predictions at the loads seen stayed right. Weighted by
+  nice level the same boxes were at 0.10 to 0.15 tasks per CPU, mostly the
+  farm's own jobs: the weighting above.
+- Each job paid a startup cost that a ratio per place can't hold: a unit's
+  time on ryouko was about 0.13 s plus 0.57 times its time here, on aieka
+  about 0.4 s plus 0.8 times. Small jobs ran ×1.6 to ×1.9 slower than
+  predicted there, and jobs of 0.3 to 10 s, whose sizes come mostly from
+  their runs there, ×1.15 slower than predicted here. It isn't bwrap (11 to
+  21 ms) but rustc starting slowly among nice 19 work: an empty crate took
+  68 and 112 ms against 18 here, 16 small modules 98 and 239 ms against 35.
+  The default profile showed none. A fixed cost per place, fitted offline
+  from units' times at two places, took this box's bias from ×1.16 to
+  ×1.07; one set to the empty crate's time, to ×1.14.
 
 ## Build graph
 

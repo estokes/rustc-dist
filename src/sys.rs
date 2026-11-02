@@ -6,7 +6,65 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     mem,
+    path::Path,
 };
+
+/// The nice level jobs and calibration run at, whatever the daemon's.
+pub const JOB_NICE: i32 = 0;
+
+/// The kernel's weight for a task at each nice level from -20 to 19
+/// (`sched_prio_to_weight`): it shares a CPU among the tasks runnable there
+/// in these proportions.
+const NICE_WEIGHTS: [u32; 40] = [
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501,
+    1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+];
+
+fn nice_weight(nice: i32) -> f64 {
+    NICE_WEIGHTS[(nice + 20).clamp(0, 39) as usize] as f64
+}
+
+/// The calling thread's nice level.
+fn nice() -> io::Result<i32> {
+    // -1 is a nice level as well as the error return.
+    unsafe { *libc::__errno_location() = 0 };
+    let n = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    match io::Error::last_os_error() {
+        e if n == -1 && e.raw_os_error() != Some(0) => Err(e),
+        _ => Ok(n),
+    }
+}
+
+/// Set the calling thread's nice level; threads and processes it starts
+/// from then on inherit it.
+fn set_nice(n: i32) -> io::Result<()> {
+    match unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, n) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Raise the calling thread, and what it starts from then on, to the
+/// highest priority the process may take without privileges: the lowest
+/// nice level its `RLIMIT_NICE` allows. Returns the level it runs at.
+pub fn prioritize() -> Result<i32> {
+    let mut lim: libc::rlimit = unsafe { mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NICE, &mut lim) } != 0 {
+        return Err(io::Error::last_os_error()).context("getrlimit RLIMIT_NICE");
+    }
+    let lowest = 20 - lim.rlim_cur.min(40) as i32;
+    if lowest < nice().context("getpriority")? {
+        set_nice(lowest).with_context(|| format_compact!("setting nice {lowest}"))?;
+    }
+    nice().context("getpriority")
+}
+
+/// Run the calling thread, or a child about to exec, at no higher priority
+/// than a job: nice `JOB_NICE` or above. Raising the nice level needs no
+/// privilege.
+pub fn job_priority() -> io::Result<()> {
+    if nice()? < JOB_NICE { set_nice(JOB_NICE) } else { Ok(()) }
+}
 
 /// Pin the calling thread, and the processes it spawns, to `cpus`.
 pub fn pin(cpus: &[u32]) -> Result<()> {
@@ -215,14 +273,58 @@ pub fn children_maxrss_kb() -> u64 {
     ru.ru_maxrss as u64
 }
 
-/// Tasks runnable on the box now, from `/proc/stat`.
-pub fn runnable() -> Result<u32> {
-    let stat = fs::read_to_string("/proc/stat").context("reading /proc/stat")?;
-    procs_running(&stat).context("no procs_running in /proc/stat")
+/// Tasks runnable on the box now other than this process's, each counted
+/// by its nice level's weight against a job's, as the kernel shares a CPU
+/// between them: work at nice 19 hardly slows a job, and counts 1/68 of a
+/// task.
+pub fn runnable() -> Result<f64> {
+    runnable_in(Path::new("/proc"), std::process::id())
 }
 
-fn procs_running(stat: &str) -> Option<u32> {
-    stat.lines().find_map(|l| l.strip_prefix("procs_running")?.trim().parse().ok())
+fn runnable_in(proc: &Path, skip: u32) -> Result<f64> {
+    let mut path = proc.to_path_buf();
+    let mut buf = [0u8; 1024];
+    let mut total = 0.;
+    for entry in fs::read_dir(proc).with_context(|| format_compact!("listing {}", proc.display()))?.flatten() {
+        let name = entry.file_name();
+        if name.to_str().and_then(|s| s.parse::<u32>().ok()).is_none_or(|pid| pid == skip) {
+            continue;
+        }
+        path.push(&name);
+        path.push("task");
+        // A process or task that exits meanwhile is skipped.
+        if let Ok(tasks) = fs::read_dir(&path) {
+            for task in tasks.flatten() {
+                path.push(task.file_name());
+                path.push("stat");
+                if let Ok(n) = File::open(&path).and_then(|mut f| f.read(&mut buf)) {
+                    total += weight(&buf[..n]).with_context(|| format_compact!("reading {}", path.display()))?;
+                }
+                path.pop();
+                path.pop();
+            }
+        }
+        path.pop();
+        path.pop();
+    }
+    Ok(total / nice_weight(JOB_NICE))
+}
+
+/// The weight a task's `stat` line adds to the box's load: its nice
+/// level's if it is runnable, else none. None if the line can't be read,
+/// and nothing for an empty one, a task that exited.
+fn weight(stat: &[u8]) -> Option<f64> {
+    if stat.is_empty() {
+        return Some(0.);
+    }
+    // The command name, in parentheses, may hold spaces and parentheses.
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    let mut fields = stat.get(close + 2..)?.split(|&b| b == b' ');
+    if fields.next()? != b"R" {
+        return Some(0.);
+    }
+    let nice = std::str::from_utf8(fields.nth(15)?).ok()?.parse().ok()?;
+    Some(nice_weight(nice))
 }
 
 #[cfg(test)]
@@ -313,12 +415,60 @@ mod test {
         Ok(())
     }
 
+    /// A task's `stat` line: `pid (comm) state`, then fields up to `nice`.
+    fn stat(comm: &str, state: char, nice: i32) -> String {
+        format!("42 ({comm}) {state} 1 42 42 0 -1 4194304 100 0 0 0 5 1 0 0 {} {nice} 1 0 100 1000 50\n", 20 + nice)
+    }
+
     #[test]
-    fn runnable_tasks_come_from_proc_stat() -> Result<()> {
-        let stat = "cpu  1 2 3\nctxt 99\nprocs_running 7\nprocs_blocked 1\n";
-        assert_eq!(procs_running(stat), Some(7));
-        assert!(runnable()? >= 1, "this thread is running");
+    fn a_runnable_task_weighs_what_its_nice_level_does() {
+        assert_eq!(weight(stat("rustc", 'R', 0).as_bytes()), Some(1024.));
+        assert_eq!(weight(stat("exe", 'R', 19).as_bytes()), Some(15.));
+        assert_eq!(weight(stat("a (b) c", 'R', -11).as_bytes()), Some(11916.));
+        assert_eq!(weight(stat("rustc", 'S', 0).as_bytes()), Some(0.));
+        assert_eq!(weight(b""), Some(0.), "it exited");
+        assert_eq!(weight(b"42 (rustc"), None);
+        assert_eq!(weight(b"42 (rustc) R 1 2"), None);
+        // This thread is running, at the test's nice level.
+        let own = fs::read(format!("/proc/self/task/{}/stat", unsafe { libc::gettid() })).unwrap();
+        assert_eq!(weight(&own), Some(nice_weight(nice().unwrap())));
+    }
+
+    #[test]
+    fn the_load_weighs_every_runnable_task_but_this_processs() -> Result<()> {
+        let proc = std::env::temp_dir().join(format!("rustc-dist-proc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&proc);
+        let task = |pid: u32, tid: u32, line: String| -> Result<()> {
+            let dir = proc.join(format!("{pid}/task/{tid}"));
+            fs::create_dir_all(&dir)?;
+            Ok(fs::write(dir.join("stat"), line)?)
+        };
+        task(10, 10, stat("rustc", 'R', 0))?;
+        task(10, 11, stat("rustc", 'S', 0))?;
+        task(20, 20, stat("exe", 'R', 19))?;
+        task(30, 30, stat("rustc-dist", 'R', -11))?;
+        fs::create_dir_all(proc.join("sys/task/1"))?;
+        let load = runnable_in(&proc, 30)?;
+        fs::remove_dir_all(&proc)?;
+        assert!((load - (1. + 15. / 1024.)).abs() < 1e-9, "{load}");
+        assert!(runnable()? >= 0.);
         Ok(())
+    }
+
+    #[test]
+    fn jobs_run_no_higher_than_job_nice() -> Result<()> {
+        // A thread of its own: the nice level is the thread's.
+        std::thread::spawn(|| -> Result<()> {
+            let before = nice()?;
+            let raised = prioritize()?;
+            assert!(raised <= before);
+            assert_eq!(nice()?, raised);
+            job_priority()?;
+            assert_eq!(nice()?, raised.max(JOB_NICE));
+            Ok(())
+        })
+        .join()
+        .unwrap()
     }
 
     #[test]

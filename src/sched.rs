@@ -62,10 +62,13 @@ const SAMPLE: Duration = Duration::from_millis(100);
 /// A unit that failed remotely and then built locally this many times is
 /// kept local.
 const PIN_AFTER: u8 = 2;
-/// Sample the box's memory, its load and the footprints of jobs running
-/// here this often. Placing a job samples again if the last sample is
-/// older.
+/// Sample the box's memory, the footprints of jobs running here and the
+/// load each job runs under this often. Placing a job samples again if the
+/// last sample is older.
 const MEASURE: Duration = Duration::from_millis(250);
+/// Count the box's runnable tasks this often: a count reads every task's
+/// state, tens of ms on a box running thousands.
+const COUNT_LOAD: Duration = Duration::from_secs(2);
 /// A job measured to hold fewer than this many hundredths of a token on
 /// average after its front end is light: it runs pinned to one class.
 /// Every other job, including one never measured, is heavy and may run on
@@ -731,8 +734,9 @@ pub struct Setup {
     pub allowed: Vec<u32>,
     /// Measures the box's memory.
     pub memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
-    /// Counts the tasks runnable on the box.
-    pub runnable: Box<dyn Fn() -> Result<u32> + Send + Sync>,
+    /// Counts the tasks runnable on the box, each by its weight against a
+    /// job's.
+    pub runnable: Box<dyn Fn() -> Result<f64> + Send + Sync>,
     /// The hashes of files jobs sent to other boxes read.
     pub hashes: Arc<Hashes>,
     /// Where heartbeats to other boxes go to be sent.
@@ -1159,9 +1163,10 @@ pub struct Sched {
     /// that finished since.
     mem: BoxMemory,
     /// Runnable tasks per CPU, in hundredths: their average over the
-    /// samples, and that rounded, which decisions use.
+    /// counts, and that rounded, which decisions use.
     runnable: Ewma,
     load_c: u32,
+    counted: Option<Instant>,
     measured: Option<Instant>,
     queue: Vec<Waiting>,
     starved: bool,
@@ -1217,6 +1222,7 @@ impl Sched {
             mem: BoxMemory::default(),
             runnable: Ewma::new(LOAD_TAU),
             load_c: 0,
+            counted: None,
             measured: None,
             queue: Vec::new(),
             starved: false,
@@ -1713,19 +1719,22 @@ impl Sched {
         self.running.iter().any(Running::here)
     }
 
-    /// Sample the box's memory and load, and the footprint of each job
-    /// running here.
+    /// Sample the box's memory, the footprint of each job running here and
+    /// the load it runs under, counting the load again every `COUNT_LOAD`.
     fn measure(&mut self, now: Instant) {
         match (self.setup.memory)() {
             Ok(mem) => self.mem = mem,
             Err(e) => warn!("measuring memory: {e:#}"),
         }
-        match (self.setup.runnable)() {
-            Ok(n) => {
-                self.runnable.add(n as f64 * 100. / self.setup.allowed.len().max(1) as f64, now);
-                self.load_c = self.runnable.value.round() as u32;
+        if self.counted.is_none_or(|t| now.duration_since(t) >= COUNT_LOAD) {
+            match (self.setup.runnable)() {
+                Ok(n) => {
+                    self.runnable.add(n * 100. / self.setup.allowed.len().max(1) as f64, now);
+                    self.load_c = self.runnable.value.round() as u32;
+                }
+                Err(e) => warn!("counting runnable tasks: {e:#}"),
             }
-            Err(e) => warn!("counting runnable tasks: {e:#}"),
+            self.counted = Some(now);
         }
         for lease in std::iter::once(&self.layout).chain(&self.retired).flat_map(|l| &l.leases) {
             lease.meter.sample(self.load_c);
@@ -2648,7 +2657,7 @@ mod test {
         memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
         tokens_per_cpu: f64,
         /// Counts the tasks runnable on the box, whatever runs there.
-        runnable: Box<dyn Fn() -> Result<u32> + Send + Sync>,
+        runnable: Box<dyn Fn() -> Result<f64> + Send + Sync>,
         hashes: Arc<Hashes>,
         heartbeats: mpsc::UnboundedSender<Heartbeat>,
     }
@@ -2660,7 +2669,7 @@ mod test {
         Room {
             memory,
             tokens_per_cpu: 1.,
-            runnable: Box::new(|| Ok(0)),
+            runnable: Box::new(|| Ok(0.)),
             hashes: Arc::new(Hashes::default()),
             heartbeats: mpsc::unbounded_channel().0,
         }
@@ -2833,7 +2842,7 @@ mod test {
         // times as long.
         for runnable in [0, 16] {
             let dir = scratch(&format!("slack-{runnable}"));
-            let room = Room { runnable: Box::new(move || Ok(runnable)), ..room(u64::MAX) };
+            let room = Room { runnable: Box::new(move || Ok(runnable as f64)), ..room(u64::MAX) };
             let classes = vec![class(1000, &[0, 1]), class(2000, &[2, 3])];
             let (mut s, _rx, _load) = sched(&dir, classes, room, &[("big", 3000, 1), ("leaf", 1000, 1)], &[])?;
             let mut rx = place(&mut s, &["big", "leaf"], false);
@@ -3067,22 +3076,24 @@ mod test {
     }
 
     #[tokio::test]
-    async fn decisions_use_the_load_averaged_over_samples() -> Result<()> {
+    async fn decisions_use_the_load_averaged_over_counts() -> Result<()> {
         let dir = scratch("load-average");
         let tasks = std::sync::Arc::new(AtomicU64::new(0));
         let seen = tasks.clone();
-        let room = Room { runnable: Box::new(move || Ok(seen.load(Ordering::Relaxed) as u32)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(move || Ok(seen.load(Ordering::Relaxed) as f64)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         let t0 = Instant::now();
         s.measure(t0);
         assert_eq!(s.load_c, 0);
-        // One sample of 100 tasks per cpu barely moves it.
         tasks.store(400, Ordering::Relaxed);
         s.measure(t0 + MEASURE);
-        assert!(s.load_c < 300, "{}", s.load_c);
+        assert_eq!(s.load_c, 0, "too soon to count again");
+        // One count of 100 tasks per cpu moves it 1 - e^(-2 s / 10 s) of the way.
+        s.measure(t0 + COUNT_LOAD);
+        assert!((1700..1900).contains(&s.load_c), "{}", s.load_c);
         // Kept up for one time constant, it gets about 63% of the way.
-        for i in 2..=40 {
-            s.measure(t0 + MEASURE * i);
+        for i in 2..=5 {
+            s.measure(t0 + COUNT_LOAD * i);
         }
         assert!((6000..6700).contains(&s.load_c), "{}", s.load_c);
         drop(s);
@@ -3095,7 +3106,7 @@ mod test {
         let dir = scratch("status-speeds");
         // 4 tasks per cpu runnable; the second class is calibrated at half
         // speed, and b at five times.
-        let room = Room { runnable: Box::new(|| Ok(16)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|| Ok(16.)), ..room(u64::MAX) };
         let classes = vec![class(1000, &[0, 1]), class(2000, &[2, 3])];
         let (mut s, _rx, _load) = sched(&dir, classes, room, &[("a", 3_000_000, 1)], &[])?;
         s.farm("b".into(), Some(remote_box(200, 4, 4, 1)));
@@ -3166,7 +3177,7 @@ mod test {
         let memory =
             Box::new(move || Ok(BoxMemory { capacity_kb: 1000, used_kb: used.load(Ordering::Relaxed) }));
         let costs = [("small", 10, 100), ("big", 10, 600)];
-        let room = Room { memory, runnable: Box::new(|| Ok(0)), ..room(0) };
+        let room = Room { memory, runnable: Box::new(|| Ok(0.)), ..room(0) };
         let h = Harness::start_with("others", vec![class(1000, &[0, 1, 2, 3])], room, &costs, &[])?;
         let small = slot(h.submit("small")).await?;
         let mut big = h.submit("big");
@@ -3977,7 +3988,7 @@ mod test {
     async fn a_wave_is_timed_as_dispatch_placed_it() -> Result<()> {
         let dir = scratch("wave-timed");
         // 2 tasks per cpu runnable; each job placed adds a quarter of one.
-        let room = Room { runnable: Box::new(|| Ok(8)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|| Ok(8.)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         history(&mut s, "narrow", 1_000_000, 100);
         let mut rx = place(&mut s, &["narrow"; 4], false);
@@ -4005,7 +4016,7 @@ mod test {
         // times its calibrated 1 s, and more as more run. b is as fast and
         // idle but full: a token frees in 1.5 s, and each job takes 1.2 s
         // there, moving files included.
-        let room = Room { runnable: Box::new(|| Ok(50)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|| Ok(50.)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         s.farm("b".into(), Some(busy_box(1000, 1, 0, 1500, 1)));
         history(&mut s, "narrow", 1_000_000, 100);
@@ -4028,7 +4039,7 @@ mod test {
     async fn a_job_with_no_history_goes_where_it_runs_fastest_now() -> Result<()> {
         let dir = scratch("unknown-load");
         // A token is free here, but tests keep 12.5 tasks per cpu runnable.
-        let room = Room { runnable: Box::new(|| Ok(50)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|| Ok(50.)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         s.farm("b".into(), Some(remote_box(1000, 4, 4, 1)));
         // What other units take says a new one takes 5 s on a cpu.
