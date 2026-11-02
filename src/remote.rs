@@ -546,9 +546,10 @@ impl<'a> Collect<'a> {
 /// What a job reads: the files its last dep-info lists, everything in its
 /// package, since a new module may be among it and proc macros read what
 /// they like there (its `Cargo.toml`, its `build.rs`) without dep-info
-/// listing it, its build script's output, native library directories, and
-/// `crates`, the crate files below it.
-pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
+/// listing it, its build script's output, native library directories,
+/// `crates`, the crate files below it, and `extra`, files a run on another
+/// box found it reads.
+pub fn stage(job: &Job, crates: &[ArcStr], extra: &[PathBuf], hashes: &Hashes) -> Result<Staged> {
     let cwd = PathBuf::from(job.cwd.as_str());
     let at = |p: &str| absolute(&cwd, p);
     let mut c = Collect::new(hashes);
@@ -567,6 +568,9 @@ pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
     c.walk(manifest.as_ref().context("no CARGO_MANIFEST_DIR")?, true)?;
     for src in &job.paths.sources {
         c.file(at(src))?;
+    }
+    for path in extra {
+        c.file(path.clone())?;
     }
     if let Some(out) = env(job, "OUT_DIR") {
         c.walk(&at(out), true)?;
@@ -596,6 +600,22 @@ pub fn stage(job: &Job, crates: &[ArcStr], hashes: &Hashes) -> Result<Staged> {
         _ => None,
     };
     Ok(Staged { files: c.files, dirs, late, outputs, blobs: c.blobs, hashed: c.hashed })
+}
+
+/// The files rustc, run in `cwd`, said don't exist that are here and
+/// weren't `staged`, at their absolute paths: a job reads them that its
+/// last dep-info, if it has one, doesn't list.
+pub fn unsent<'a>(cwd: &Path, staged: &Staged, stderr: impl Iterator<Item = &'a [u8]>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for missing in stderr.filter_map(protocol::missing_file) {
+        let path = absolute(cwd, &missing);
+        let Some(s) = path.to_str() else { continue };
+        let here = fs::metadata(&path).is_ok_and(|m| m.is_file());
+        if here && !system(&path) && !staged.files.iter().any(|f| f.path == s) && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 pub enum Event {
@@ -1074,7 +1094,7 @@ mod test {
             paths: portable.paths,
             reads: portable.reads,
         };
-        let staged = stage(&job, &[], &Hashes::default())?;
+        let staged = stage(&job, &[], &[], &Hashes::default())?;
         let names: Vec<&str> = staged.files.iter().filter_map(|f| f.path.rsplit_once('/')).map(|(_, n)| n).collect();
         assert_eq!(names, ["lib.rs"]);
         fs::remove_dir_all(&dir)?;
@@ -1107,7 +1127,7 @@ mod test {
             paths: portable.paths,
             reads: portable.reads,
         };
-        let staged = stage(&job, &[], &Hashes::default())?;
+        let staged = stage(&job, &[], &[], &Hashes::default())?;
         let mut names: Vec<&str> = staged.files.iter().filter_map(|f| f.path.rsplit_once('/')).map(|(_, n)| n).collect();
         names.sort();
         assert_eq!(names, ["Cargo.toml", "build.rs", "lib.rs"]);

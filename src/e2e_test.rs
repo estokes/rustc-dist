@@ -171,7 +171,7 @@ async fn send(
     hashes: &Hashes,
     class: Option<u32>,
 ) -> Result<(Outcome, Vec<Event>)> {
-    let staged = remote::stage(job, crates, hashes)?;
+    let staged = remote::stage(job, crates, &[], hashes)?;
     let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
     let offer = ToServer::Offer { unit: unit.clone(), key, target: None, class };
     let mut events = Vec::new();
@@ -215,7 +215,7 @@ impl Manual {
 
     /// Offer the job for the toolchain `key`.
     async fn offer_for(b: &ServerBox, (job, unit): &(Job, Unit), crates: &[ArcStr], key: ArcStr) -> Result<Self> {
-        let staged = remote::stage(job, crates, &Hashes::default())?;
+        let staged = remote::stage(job, crates, &[], &Hashes::default())?;
         let (out, mut inbox) = b.links.get(&b.jobs).await?.open()?;
         out.send(ToServer::Offer { unit: unit.clone(), key, target: None, class: None })?;
         out.flush().await?;
@@ -340,6 +340,30 @@ pub(crate) fn endless(dir: &Path) -> Result<(Job, Unit)> {
         &[
             "--crate-name", "spin", "--crate-type", "lib", "--edition", "2021", "spin/src/lib.rs",
             "--error-format=json", "--json=artifacts", "--emit=dep-info,metadata,link", "-C", "extra-filename=-s1",
+            "--out-dir", deps.to_str().unwrap(),
+        ],
+    )
+}
+
+/// A library that includes two files from outside its package, which only
+/// dep-info would name, and it has none.
+pub(crate) fn reads_outside(dir: &Path) -> Result<(Job, Unit)> {
+    fs::create_dir_all(dir.join("pkg/src"))?;
+    fs::create_dir_all(dir.join("outside"))?;
+    fs::create_dir_all(dir.join("target/deps"))?;
+    fs::write(
+        dir.join("pkg/src/lib.rs"),
+        "pub const A: &str = include_str!(\"../../outside/a.txt\");\ninclude!(\"../../outside/b.rs\");\n",
+    )?;
+    fs::write(dir.join("outside/a.txt"), "a")?;
+    fs::write(dir.join("outside/b.rs"), "pub fn b() -> u32 { 2 }\n")?;
+    let deps = dir.join("target/deps");
+    job(
+        dir,
+        "pkg",
+        &[
+            "--crate-name", "pkg", "--crate-type", "lib", "--edition", "2021", "pkg/src/lib.rs",
+            "--error-format=json", "--json=artifacts", "--emit=dep-info,metadata,link", "-C", "extra-filename=-o1",
             "--out-dir", deps.to_str().unwrap(),
         ],
     )
@@ -553,7 +577,7 @@ async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Res
     // The client sends one chunk of the blob, then drops the job.
     {
         let (job, unit) = &lib;
-        let staged = remote::stage(job, &crates, &Hashes::default())?;
+        let staged = remote::stage(job, &crates, &[], &Hashes::default())?;
         let (out, mut inbox) = link.open()?;
         let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
         out.send(ToServer::Offer { unit: unit.clone(), key, target: None, class: None })?;

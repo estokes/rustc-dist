@@ -64,7 +64,9 @@ The daemon answers a compile with either:
   a remote run that failed; or
 - a remote run's output as `Output` messages, then `Exit(code)`. Artifact
   lines come as rustc prints them; the rest waits for rustc to exit. If the
-  remote run fails, the daemon sends `Slot` instead and the job reruns here.
+  remote run fails, the daemon sends `Slot` instead and the job reruns here,
+  unless it failed for files it wasn't sent, which are sent with it when it is
+  placed again (see Failure).
 
 The wrapper spawns rustc itself so cargo's stdin, fds and environment reach
 rustc untouched. Socket close ends the job: the slot is freed, and a remote
@@ -683,7 +685,8 @@ chance collisions vanishingly rare. The client daemon caches
 - Sources: every file the unit's previous dep-info
   (`<out-dir>/<crate><extra>.d`) lists, which includes files outside the
   package, plus the whole package directory, so a newly added module is found
-  and proc macros find what they read there without dep-info listing it. The
+  and proc macros find what they read there without dep-info listing it, and
+  the files a run on another box found missing (see Failure). The
   walk skips cargo's output directories (`CACHEDIR.TAG`), hidden directories,
   and directories with a `Cargo.toml` of their own, which are other packages.
   A walk past 256 MB keeps the job local.
@@ -834,7 +837,18 @@ same box has little to send: on a warm box, a binary sends its own sources.
 
 ### Failure
 
-Any remote failure (non-zero exit, staging or sandbox error, dropped
+A unit's first build in a tree has no dep-info, so staging can't know the
+files it reads outside its package. When rustc there says it couldn't find
+files (`include_str!` and `include_bytes!` couldn't read one, `include!` and a
+`#[path]` module couldn't find it) that are here and weren't sent, the daemon
+adds them to the job's sources, logs it at info and places the job again, on
+any box, here included. The held-back diagnostics are discarded, and nothing
+counts toward keeping the unit local. Each placement sends files the last
+didn't, so it ends. On 2026-11-02 graphix_tests, built in a fresh copy of
+graphix, failed on ryouko this way: it includes fuzz findings from
+`graphix-fuzz/`, and reran here, predicted at 1,727 s against ryouko's 135.
+
+Any other remote failure (non-zero exit, staging or sandbox error, dropped
 connection) reruns on a local slot, and the held-back diagnostics are
 discarded. If the rmeta line was already forwarded, the wrapper drops it from
 the rerun's output. A remote failure is logged as a warning with the box and
@@ -842,8 +856,8 @@ rustc's first error, with its first note, where a proc macro's panic message
 goes. A unit that fails remotely and then builds locally twice is kept local
 until the daemon restarts, which is logged too, and the placement log gives
 that as the reason it can't go. Typical causes are proc macros that read the
-network or the environment (sqlx), or an include of a file the client never
-sent. Real compile errors get compiled twice. They usually fail fast.
+network, the environment (sqlx) or files outside their package, whose errors
+name no file. Real compile errors get compiled twice. They usually fail fast.
 
 Staging sends the whole package directory, since proc macros read what they
 like there and dep-info lists none of it. On 2026-11-01 every graphix_package

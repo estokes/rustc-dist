@@ -223,6 +223,22 @@ pub fn error_message(line: &[u8]) -> Option<CompactString> {
     })
 }
 
+/// If a line of rustc's JSON stderr says a file it was to read doesn't
+/// exist, that file as rustc names it: `include_str!` and `include_bytes!`
+/// say they couldn't read it, `include!` and a `#[path]` module that they
+/// couldn't find it.
+pub fn missing_file(line: &[u8]) -> Option<CompactString> {
+    let d: Diagnostic = serde_json::from_slice(line).ok()?;
+    if d.level != "error" {
+        return None;
+    }
+    let path = match d.message.strip_prefix("couldn't read `") {
+        Some(rest) => rest.rsplit_once("`: ").filter(|(_, why)| why.ends_with("(os error 2)"))?.0,
+        None => d.message.strip_prefix("couldn't find file `")?.strip_suffix('`')?,
+    };
+    Some(path.into())
+}
+
 /// Whether a line of rustc's JSON stderr announces its `.rmeta`.
 pub fn is_metadata_line(line: &[u8]) -> bool {
     is_artifact_line(line) && contains(line, br#""emit":"metadata""#)
@@ -516,5 +532,19 @@ mod test {
         assert_eq!(error_message(warning), None);
         assert_eq!(error_message(br#"{"$message_type":"artifact","artifact":"/t/liba.rmeta","emit":"metadata"}"#), None);
         assert_eq!(error_message(b"linker failed"), None);
+    }
+
+    #[test]
+    fn a_missing_file_is_named_from_rustcs_error() {
+        let read = br#"{"$message_type":"diagnostic","message":"couldn't read `pkg/src/../../outside/a.txt`: No such file or directory (os error 2)","code":null,"level":"error","spans":[],"children":[]}"#;
+        assert_eq!(missing_file(read).as_deref(), Some("pkg/src/../../outside/a.txt"));
+        let found = br#"{"$message_type":"diagnostic","message":"couldn't find file `pkg/src/../../outside/c.rs`","code":null,"level":"error","spans":[],"children":[]}"#;
+        assert_eq!(missing_file(found).as_deref(), Some("pkg/src/../../outside/c.rs"));
+        let denied = br#"{"$message_type":"diagnostic","message":"couldn't read `a.txt`: Permission denied (os error 13)","level":"error","spans":[],"children":[]}"#;
+        assert_eq!(missing_file(denied), None, "only a file that doesn't exist");
+        let warning = br#"{"$message_type":"diagnostic","message":"couldn't find file `x.rs`","level":"warning","spans":[],"children":[]}"#;
+        assert_eq!(missing_file(warning), None);
+        let plain = br#"{"$message_type":"diagnostic","message":"mismatched types","level":"error","spans":[],"children":[]}"#;
+        assert_eq!(missing_file(plain), None);
     }
 }

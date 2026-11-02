@@ -398,6 +398,8 @@ async fn compile(
     // Set once a remote run failed after passing cargo an rmeta notice.
     let mut filter_metadata = false;
     let mut failed_remotely = false;
+    // Files runs on other boxes found it reads that staging didn't send.
+    let mut extra: Vec<PathBuf> = Vec::new();
     loop {
         let Some(admission) = admit(&sock, ctx, unit.clone(), build, want.clone()).await? else {
             return Ok(());
@@ -446,8 +448,9 @@ async fn compile(
             }
             Admission::Remote(r) => {
                 let job = job.as_ref().expect("only portable jobs go remote");
-                match run_remote(&mut sock, &mut buf, ctx, job, r).await {
+                match run_remote(&mut sock, &mut buf, ctx, job, &extra, r).await {
                     Ok(Remote::Done) => return Ok(()),
+                    Ok(Remote::Unsent(paths)) => extra.extend(paths),
                     Ok(Remote::Gone) => {
                         debug!("{}: the wrapper went away; stopped it", unit.exact);
                         return Ok(());
@@ -471,6 +474,9 @@ async fn compile(
 enum Remote {
     Done,
     Busy,
+    /// rustc there couldn't find files that are here and weren't sent: send
+    /// them too and place it again.
+    Unsent(Vec<PathBuf>),
     /// It failed there; build it here.
     Failed { forwarded_metadata: bool },
     /// The wrapper hung up, so the job was stopped.
@@ -482,13 +488,14 @@ async fn run_remote(
     buf: &mut BytesMut,
     ctx: &Ctx,
     job: &triomphe::Arc<Job>,
+    extra: &[PathBuf],
     mut r: RemoteSlot,
 ) -> Result<Remote> {
     let links = &ctx.farm.get().context("not in a farm")?.links;
     let start = Instant::now();
     let staging = task::spawn_blocking({
-        let (job, crates, hashes) = (job.clone(), mem::take(&mut r.crates), ctx.hashes.clone());
-        move || remote::stage(&job, &crates, &hashes)
+        let (job, crates, extra, hashes) = (job.clone(), mem::take(&mut r.crates), extra.to_vec(), ctx.hashes.clone());
+        move || remote::stage(&job, &crates, &extra, &hashes)
     });
     let Some(staged) = unless_hung_up(sock, staging).await? else { return Ok(Remote::Gone) };
     let staged = staged??;
@@ -597,6 +604,19 @@ async fn run_remote(
         }
         Ok((_, Outcome::Exit { code, .. })) => {
             let mut stderr = held.iter().filter(|(stderr, _)| *stderr).map(|(_, line)| line);
+            let cwd = Path::new(job.cwd.as_str());
+            let unsent = remote::unsent(cwd, &staged, stderr.clone().map(|line| &line[..]));
+            if let Some(first) = unsent.first().filter(|_| !forwarded_metadata) {
+                info!(
+                    "{} on {} reads {} files it wasn't sent, {} first: sending them and placing it again",
+                    r.unit().exact,
+                    r.jobs,
+                    unsent.len(),
+                    first.display()
+                );
+                r.finish(RemoteOutcome::Failed);
+                return Ok(Remote::Unsent(unsent));
+            }
             let why = stderr.clone().find_map(|line| protocol::error_message(line)).or_else(|| {
                 stderr.next().map(|line| String::from_utf8_lossy(line).trim_end().into())
             });
@@ -701,14 +721,14 @@ mod test {
         let (mut sock, wrapper) = UnixStream::pair()?;
         let mut buf = BytesMut::new();
         drop(wrapper);
-        let staged = time::timeout(Duration::from_secs(5), run_remote(&mut sock, &mut buf, &ctx, &job, slot())).await;
+        let staged = time::timeout(Duration::from_secs(5), run_remote(&mut sock, &mut buf, &ctx, &job, &[], slot())).await;
         let fifo = dep_info.clone();
         task::spawn_blocking(move || OpenOptions::new().write(true).open(fifo)).await??;
         fs::remove_file(&dep_info)?;
         assert!(gone(staged), "staging went on after the wrapper hung up");
         // Running there, which it does until stopped.
         let (mut sock, wrapper) = UnixStream::pair()?;
-        let run = run_remote(&mut sock, &mut buf, &ctx, &job, slot());
+        let run = run_remote(&mut sock, &mut buf, &ctx, &job, &[], slot());
         tokio::pin!(run);
         tokio::select! {
             _ = &mut run => bail!("the job ended before its sandbox started"),
@@ -726,6 +746,43 @@ mod test {
             time::sleep(Duration::from_millis(100)).await;
         }
         until(10, "killing the sandbox", || running(&ws).is_empty()).await?;
+        drop(b);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_a_remote_run_found_unsent_are_sent_and_the_job_placed_again() -> Result<()> {
+        let dir = scratch("unsent")?;
+        let b = e2e_test::server(&dir.join("box")).await?;
+        let (ctx, _stopped, _msgs) = ctx();
+        let links = Arc::new(Links::new(b.net.subscriber().clone()));
+        let _ = ctx.farm.set(Farm { links, publisher: b.net.publisher().clone() });
+        let ws = dir.join("ws");
+        let (job, unit) = e2e_test::reads_outside(&ws)?;
+        let key = toolchain::key_of(Path::new(job.rustc.as_str()))?;
+        let job = triomphe::Arc::new(job);
+        let slot = || RemoteSlot::for_test(b.jobs.clone(), key.clone(), unit.clone(), ctx.tx.clone());
+        let (mut sock, mut wrapper) = UnixStream::pair()?;
+        let mut buf = BytesMut::new();
+        let Remote::Unsent(unsent) = run_remote(&mut sock, &mut buf, &ctx, &job, &[], slot()).await? else {
+            bail!("the job didn't find the files outside its package unsent");
+        };
+        let outside = ws.join("outside");
+        assert_eq!(unsent, [outside.join("a.txt"), outside.join("b.rs")]);
+        assert!(matches!(run_remote(&mut sock, &mut buf, &ctx, &job, &unsent, slot()).await?, Remote::Done));
+        drop(sock);
+        let mut printed = Vec::new();
+        let code = loop {
+            match protocol::recv_async::<Reply>(&mut wrapper, &mut buf).await? {
+                Reply::Output { data, .. } => printed.push(String::from_utf8_lossy(&data).into_owned()),
+                Reply::Exit(code) => break code,
+                r => bail!("unexpected {r:?}"),
+            }
+        };
+        assert_eq!(code, 0);
+        assert!(printed.iter().all(|line| !line.contains("couldn't")), "the failed run printed nothing: {printed:?}");
+        assert!(ws.join("target/deps/libpkg-o1.rlib").exists());
         drop(b);
         let _ = fs::remove_dir_all(&dir);
         Ok(())

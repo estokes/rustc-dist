@@ -66,7 +66,9 @@ Across boxes (a farm):
 - A job that links starts compiling before its dependencies' rlibs arrive. It
   builds against metadata-only stand-ins, and a stand-in linker waits for the
   real rlibs.
-- A remote failure reruns locally, and cargo never sees diagnostics twice.
+- A job that fails remotely because it reads a file it wasn't sent is sent
+  again with it. Any other remote failure reruns locally, and cargo never sees
+  diagnostics twice.
 - `rustc-dist status` shows a box's classes, queue and job history. Every box
   also publishes a status table to netidx, which the
   [netidx browser](https://netidx.github.io/netidx-book/) shows as one row
