@@ -868,6 +868,160 @@ was kept local within minutes of every restart. The failure was logged only
 at debug, so nothing showed why; sending `Cargo.toml` alone got past the
 first check and the new warning named the second.
 
+## Path remapping (proposed 2026-11-02)
+
+A server puts each job at the client's absolute paths in a mount namespace,
+which bwrap gets without privilege, so nothing is rewritten (see Sandbox).
+macOS and Windows have no such namespace. Even as root, a chroot on macOS
+would need dyld, its shared cache and the toolchain inside it, with no bind
+mount to put them there, and Windows maps paths per process only inside a
+container. Remapping lets a server run a job in a directory of its own and
+still return what a local build would.
+
+### The idea
+
+Each client directory a job uses, a client prefix, gets a server prefix of
+exactly the same length in bytes. The server rewrites client prefixes to
+server prefixes in what it is given, and server prefixes back to client
+prefixes in everything it returns. Because the lengths match, rewriting back
+is a byte substitution that moves nothing: no offset, size or length field
+changes. It is valid inside rlibs, rmeta, object files, DWARF, executables,
+dep-info and JSON without parsing any of them.
+
+That reaches what rustc's `--remap-path-prefix` doesn't: strings from
+`env!("CARGO_MANIFEST_DIR")` and `env!("OUT_DIR")`, which tests use to find
+their fixtures, and paths proc macros and build scripts make themselves.
+While rustc runs these name the server's directory, so proc macros and
+`include_str!` find their files; in what comes back they name the client's.
+
+The client doesn't change. The server derives the mapping from the
+manifest's paths and directories and the cwd, and rewrites before it sends
+anything, so to a client a remapping server looks like a bwrap one. The
+protocol doesn't change either.
+
+### Prefixes
+
+A server prefix is a base directory, a job id and filler to the client
+prefix's length: `/home/eric` (10 bytes) becomes `/rd/7q____`. The tree under
+it mirrors the client's. The base must be short and have no symlink in its
+path, since a path rustc or a proc macro resolves changes length and escapes
+the substitution (macOS's `/tmp` is `/private/tmp`).
+
+Client prefixes are chosen per job. Start from the job's top-level
+directories, those the sandbox binds today. Replace any shorter than the base
+plus an id by the children of it the job uses, and so on down. A file in a
+directory too short to map keeps the job local. With a 4-byte base and a
+2-byte id, washu-chan's `/home/eric` maps whole.
+
+Each prefix gets an id unique among running jobs, so two jobs from one
+checkout, or from two boxes with the same paths, never share a tree. Coming
+in, a client prefix is rewritten only where it ends at a path boundary, so
+`/p/graphix` doesn't match `/p/graphix2`. Going out, a server prefix is
+distinctive enough to substitute wherever it occurs.
+
+### What is rewritten
+
+In, client to server:
+
+- every argument and environment value (`--out-dir`, `--extern`, `-L`,
+  `CARGO_MANIFEST_DIR`, `OUT_DIR`, ...), and the cwd;
+- the manifest's paths, which say where the job tree goes.
+
+Inputs' contents aren't rewritten. They are store blobs other jobs share,
+and the crate files among them already name client paths, as they would
+here.
+
+Out, server to client, in place, before anything leaves the server or
+enters its store:
+
+- each file rustc writes, when its artifact line comes (the rmeta first, for
+  pipelining);
+- the object files rustc hands the linker, at the linker gate, before the
+  linker reads them. Every link job then passes the gate, not only those
+  waiting for late rlibs. The linker hashes client paths into the IDs it
+  computes (ELF build-id, Mach-O UUID), as a link here does;
+- the linked output, for paths the linker records itself (below);
+- stdout and stderr, line by line.
+
+The store keeps outputs as rewritten, which is what the client's next job
+lists as input.
+
+### rustc's own remapping
+
+The server also passes rustc `--remap-path-prefix=SERVER=CLIENT` for each
+pair. rustc hashes source file names into the crate hash after remapping,
+and leaves the mapping flags out (rustc_middle's `crate_hash`), so a
+remapped run should get the crate hash a build at the client's paths gets.
+Without the flag the hash would name the job directory, and a crate whose
+rmeta cargo already has, and whose run then fails, couldn't be rebuilt here
+(`filter_metadata`'s case): its dependents were compiled against another
+hash. With it, the substitution is left with `env!()` strings and the other
+paths rustc doesn't record itself.
+
+A job that already remaps paths, for example through cargo's `trim-paths`,
+needs its mappings composed with these. At first it stays local.
+
+### What a substitution can't reach
+
+- Compressed data: a linker that compresses debug sections
+  (`--compress-debug-sections`) hides the path. Those link jobs stay local.
+- Paths a linker records itself, and what it computes from them: ld64 writes
+  object files' paths into the symbol table (`N_OSO`), and a PE binary names
+  its PDB. Rewriting them after the link leaves a UUID that differs from a
+  local link's, though consistent, and voids the macOS code signature, which
+  Apple Silicon requires. The server signs again: an ad-hoc signature depends
+  only on the bytes, so it matches what a link here signs.
+- PDBs keep hashed name tables, which a rewritten name breaks. Windows link
+  jobs that write a PDB stay local until that's handled.
+- Files whose contents name client paths, such as a build script's generated
+  source with a literal absolute path. rustc on the server can't find the
+  file, and the job reruns here (see Failure).
+- A server prefix that turns up in output by chance: negligible with a
+  distinctive base.
+
+Windows paths take several spellings: backslashes, forward slashes, JSON's
+doubled backslashes, the `\\?\` form, and either case of the drive letter.
+Each server prefix is substituted in every one, and in UTF-16 if PE
+resources or PDBs keep paths that way (to check).
+
+### Sandboxing
+
+Remapping takes over one of bwrap's jobs, putting files at the client's
+paths. Isolation stays. On Linux, bwrap binds the job directory instead of
+the client's top-level directories. On macOS, `sandbox-exec`, deprecated but
+what Nix and Bazel use, with a profile that denies the network and writes
+outside the job directory. On Windows, an AppContainer (to check). None needs
+root. A short base on macOS needs one admin step, since its root volume is
+read-only: an APFS volume mounted at a top-level directory that
+`/etc/synthetic.conf` makes, as Nix does for `/nix`. Without it, the base
+goes under the server user's home and only longer client paths fit.
+
+macOS's default for cargo's dev profile splits debug info
+(`split-debuginfo = "unpacked"`), which keeps every job local today. The
+rule would need narrowing to the jobs that write split files, likely links
+only (to check). The same goes for windows-msvc, whose default is `packed`.
+
+### Proving it on Linux first
+
+bwrap at the client's paths is an exact reference. Build a project both ways
+on one box, every unit sent once at the client's paths and once remapped, and
+compare each output, stdout and stderr byte for byte. graphix's dev build
+has libraries, proc macros, build scripts, tests and binaries. Any differing
+byte is a gap. To settle there:
+
+1. Whether the crate hash and every rmeta byte match with rustc's remapping.
+   A remapped rmeta may record its source files as remapped rather than
+   local, and then a dependent's diagnostics here might stop quoting that
+   crate's source. If they do, the choice is between that and dropping the
+   flag and never falling back here once the rmeta has gone to cargo.
+2. Whether any output keeps a server path the substitution misses, such as
+   compressed metadata in proc macros' `.rustc` section.
+3. Whether linked outputs match whole, build-id included.
+
+Once Linux matches, bwrap's path role can go, and the same code serves
+macOS and Windows, where each platform's spellings and linkers are what's
+left.
+
 ## Config
 
 Config is real TOML (`toml` + serde), parsed into two separate structs.
@@ -909,7 +1063,9 @@ Phase 1 removed the first sketch's remote modules (`farm.rs`, `remote.rs`,
 `server.rs`, `stage.rs`, `identity.rs`). They are in git at 418df61. Phase 2
 can reuse `farm.rs` discovery and `identity.rs` toolchain matching from there.
 The argv and env rewriting, `Rewriter`, and the per-job RPC/session are not
-coming back.
+coming back. That rewriting fixed only text, so binaries kept the job
+directory's paths; Path remapping proposes one that keeps lengths and
+reaches every byte.
 
 ## Phases
 
