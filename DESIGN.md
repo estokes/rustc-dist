@@ -492,8 +492,9 @@ place `p` is
 - `b(p)`, the place's effect, is the log of µs per million instructions
   there.
 - `s(p)` is how much the place slows with its load, the mean runnable tasks
-  per CPU while the run ran. It is fitted for other boxes only and is 0 here
-  (see Proving it).
+  per CPU while the run ran. It is fitted for every place. Whether this
+  box's own slopes are used is for shadow mode to settle, profile by
+  profile (see Proving it).
 
 Two runs of one unit at `p` and `q` differ by `b(p) - b(q)` and the loads:
 the unit's size cancels. So place effects come from pairs alone, and unit
@@ -505,8 +506,8 @@ A weighted median polish over every run kept (each unit's last 16): set each
 place's effect to the weighted median of its runs' times less their units'
 effects, then each unit's to the weighted median of its runs' times less
 their places' effects, and repeat, ten rounds. Medians, so no single run,
-however long, moves an effect. For other boxes, each round also fits `s(p)`
-as the Theil-Sen slope of the place's residuals against load. Weights halve
+however long, moves an effect. Each round also fits `s(p)` as the Theil-Sen
+slope of the place's residuals against load. Weights halve
 every `half_life_s`, a day, for units and places alike.
 
 The scale is held by the reference, this box's fastest class in its current
@@ -565,18 +566,38 @@ actual over predicted, either way):
 
 Splitting front end from the rest gained nothing, and a unit memory of an
 hour instead of a day did worse: edits don't drive the noise, sample size
-does. A load term helped other boxes and hurt this one, even fed the load
-measured during each run: test runs that start after a job is placed decide
-this box's load. So this box doesn't react to its own load in this design,
-and `light_jobs_wait_for_a_busy_box_rather_than_run_slower_here` goes; an
-open question is whether a measure of load other than runnable tasks would
-predict here. Fitted at 10:20, 11:00, 11:40, 12:20 and 12:41, ryouko's
+does.
+
+A load term helped other boxes, and on this box it depended on the profile.
+Scored the same way from Sunday 16:00 to Monday 12:41 (runs of at least
+0.5 s, median error and share within 25%, without the load term, then with
+it):
+
+| | runs | no load | load slope |
+|---|---|---|---|
+| here, `max` | 1,470 | ×1.50, 33% | ×1.48, 32% |
+| here, `max`, load at least 1 | 375 | ×2.12, 11% | ×1.90, 17% |
+| here, `low` | 906 | ×1.45, 31% | ×1.67, 25% |
+| other boxes | 3,918 | ×1.18, 59% | ×1.17, 62% |
+
+In `max` this box's speed is near the others', jobs stay here under load,
+and load predicts; in `low` it is far slower, and load, even the load
+measured while each run ran, made predictions worse. That fits load mattering
+once this box competes for jobs, but `low`'s data could also mislead in other
+ways: which jobs stay here when it is slow, and test runs on other cores
+than a job's class. So shadow mode logs this box's predictions with its
+slopes and without, by profile, and the slopes are used in a profile where
+they predict better. Predictions here are poor either way, a median ×1.45 to
+×1.50 off, and runnable tasks per CPU swing with load the daemon doesn't run.
+A candidate better measure is CPU pressure (`/proc/pressure/cpu`), the share
+of time runnable tasks waited for a CPU, which is the slowdown itself. Fitted at 10:20, 11:00, 11:40, 12:20 and 12:41, ryouko's
 class sat at 2.28, 2.29, 2.20 and 2.20 times this box's class 0 from 11:00
 on, aieka's at 1.36 to 1.31, and syn's work at 3.1 to 2.9 s.
 
 Before it decides anything, the daemon fits the pair model beside the
-current one and logs both predictions on each placement line for a day;
-it switches when the pairs predict better on that day's runs. Tests: scaling
+current one and logs, on each placement line, the current prediction and the
+pairs' with and without this box's load slopes. After a day in each profile
+it switches to the pairs when they predict better on those days' runs. Tests: scaling
 every run's time at every place leaves predictions where they were and
 moves only the units' effects; a place's effect comes from pairs whatever
 the units' sizes; a place with few pairs stays near its calibration;
