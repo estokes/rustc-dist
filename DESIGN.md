@@ -485,16 +485,20 @@ nothing.
 A run's time `t` (start to exit, less any wait for late rlibs, as now) at
 place `p` is
 
-    log t = a(unit) + b(p) + s(p) · log(1 + load/100)
+    log t = a(unit) + b(p) + s(p) · log(max(1, load))
 
 - `a(unit)`, the unit's effect, is the log of its work: millions of
   instructions at the reference speed below.
 - `b(p)`, the place's effect, is the log of µs per million instructions
   there.
 - `s(p)` is how much the place slows with its load, the mean runnable tasks
-  per CPU while the run ran. It is fitted for every place. Whether this
-  box's own slopes are used is for shadow mode to settle, profile by
-  profile (see Proving it).
+  per CPU while the run ran, the job's own included: none up to one task
+  per CPU, since until then nothing waits for a CPU. It is fitted for every
+  place, starting from 1, time growing with load as when tasks share the
+  CPUs, which counts as 2 slopes. On 2026-11-02, when ryouko and aieka
+  switched to a new profile at 6 and 7 tasks per CPU, their new places had
+  no runs, and without that start the fit would have taken them to be as
+  fast as their calibrations, twice this box's speed, under any load.
 
 Two runs of one unit at `p` and `q` differ by `b(p) - b(q)` and the loads:
 the unit's size cancels. So place effects come from pairs alone, and unit

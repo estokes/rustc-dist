@@ -1,5 +1,5 @@
 //! Place speeds from pairs of runs of the same unit (DESIGN.md, "Speeds from
-//! pairs of runs"): log time = unit + place + slope × log(1 + load). A
+//! pairs of runs"): log time = unit + place + slope × log(max(1, load)). A
 //! place's effect comes only from the differences between units' times
 //! there and at other places, so a unit's size cancels and can't feed back
 //! into the places' speeds. For now it only predicts beside the cost table,
@@ -17,9 +17,14 @@ const SWEEPS: usize = 50;
 /// A place's calibration counts as this many fresh runs that never age: in a
 /// mean, so a place's own runs decide it once it has a few.
 const PRIOR_RUNS: f64 = 2.;
+/// A place's load slope before its runs say otherwise: past a task per CPU,
+/// time grows with load, as when tasks share the CPUs. It counts as
+/// `PRIOR_RUNS` slopes, so a place new to the fit isn't taken to be as fast
+/// under any load as at its calibration.
+const PRIOR_SLOPE: f64 = 1.;
 /// Points of a place a load slope is fitted from.
 const SLOPE_POINTS: usize = 200;
-/// Two runs make a load slope only if `log(1 + load)` differs this much
+/// Two runs make a load slope only if `log(max(1, load))` differs this much
 /// between them.
 const SLOPE_MIN_DX: f64 = 0.2;
 
@@ -99,8 +104,10 @@ impl Ran {
     }
 }
 
+/// How loaded a run was: none up to a runnable task per CPU, the job's own
+/// included, since until then nothing waits for a CPU.
 fn x(load_c: u32) -> f64 {
-    (load_c as f64 / 100.).ln_1p()
+    (load_c as f64 / 100.).max(1.).ln()
 }
 
 fn log_us(s: &Sample) -> f64 {
@@ -195,7 +202,7 @@ impl Fit {
             by_place[s.place.index()].push(i);
             by_unit[s.unit as usize].push(i);
         }
-        let mut slope: LPooled<Vec<f64>> = (0..n).map(|_| 0.).collect();
+        let mut slope: LPooled<Vec<f64>> = (0..n).map(|_| PRIOR_SLOPE).collect();
         let mut unit: LPooled<Vec<f64>> = (0..snap.units.len()).map(|_| 0.).collect();
         let mut scratch: LPooled<Vec<(f64, f64)>> = LPooled::take();
         let mut place = LPooled::take();
@@ -258,8 +265,9 @@ impl Fit {
 }
 
 /// The Theil-Sen slope of a place's runs' times, less their units' effects,
-/// against `log(1 + load)`, over up to `SLOPE_POINTS` of them spread across
-/// the loads seen. More load never makes a run faster, so it is at least 0.
+/// against `log(max(1, load))`, over up to `SLOPE_POINTS` of them spread across
+/// the loads seen, with `PRIOR_SLOPE` as `PRIOR_RUNS` more. More load never
+/// makes a run faster, so it is at least 0.
 fn load_slope(snap: &Snapshot, ix: &[usize], weight: &[f64], unit: &[f64]) -> f64 {
     let mut pts: LPooled<Vec<(f64, f64, f64)>> = ix
         .iter()
@@ -271,12 +279,13 @@ fn load_slope(snap: &Snapshot, ix: &[usize], weight: &[f64], unit: &[f64]) -> f6
     pts.sort_by(|a, b| a.0.total_cmp(&b.0));
     let step = pts.len().div_ceil(SLOPE_POINTS).max(1);
     let mut slopes: LPooled<Vec<(f64, f64)>> = LPooled::take();
+    slopes.push((PRIOR_SLOPE, PRIOR_RUNS));
     for (k, a) in pts.iter().step_by(step).enumerate() {
         for b in pts.iter().step_by(step).skip(k + 1).filter(|b| b.0 - a.0 > SLOPE_MIN_DX) {
             slopes.push(((b.1 - a.1) / (b.0 - a.0), a.2 * b.2));
         }
     }
-    median(&mut slopes).unwrap_or(0.).max(0.)
+    median(&mut slopes).unwrap_or(PRIOR_SLOPE).max(0.)
 }
 
 #[cfg(test)]
@@ -413,19 +422,31 @@ mod test {
     #[test]
     fn a_places_load_slope_is_learned() {
         let (mut s, [a, b, _]) = table();
-        // On b a run takes (1 + load) times as long: a slope of 1 in log
-        // time against log(1 + load).
+        // On b a run takes half again as long per task per CPU past the
+        // first: a slope of 1.5 in log time against log(max(1, load)).
         for i in 0..20 {
             ran(&mut s, &format!("u{i}:1"), a, 0, 1000 + 100 * i);
             for load_c in [0, 100, 200, 400] {
-                ran(&mut s, &format!("u{i}:1"), b, load_c, (1000 + 100 * i) * (100 + load_c as u64) / 100);
+                let slowed = (load_c.max(100) as f64 / 100.).powf(1.5);
+                ran(&mut s, &format!("u{i}:1"), b, load_c, ((1000 + 100 * i) as f64 * slowed) as u64);
             }
         }
         let fit = Fit::new(&s.pair_snapshot(a));
         let at = |load_c| predict(&fit, "u5:1", b, load_c);
-        assert!(near(at(0), 1_500_000) && near(at(300), 6_000_000), "{} {}", at(0), at(300));
+        assert!(near(at(50), 1_500_000) && near(at(300), (1.5e6 * 3f64.powf(1.5)) as u64), "{} {}", at(50), at(300));
         let u = unit("u5:1");
         assert_eq!(fit.predict_us(&u.exact, &u.coarse, b, 300, false).map(|p| p.0), Some(at(0)), "without its slope");
+    }
+
+    #[test]
+    fn a_place_no_run_has_shown_loaded_is_slowed_by_its_load() {
+        let (mut s, [a, _, c]) = table();
+        ran(&mut s, "u:1", a, 0, 1000);
+        // c is calibrated as fast as a and has never run anything: alone on
+        // it a job runs at its calibration, and at 3 tasks per cpu takes 3
+        // times as long.
+        let fit = Fit::new(&s.pair_snapshot(a));
+        assert!(near(predict(&fit, "u:1", c, 100), 1_000_000) && near(predict(&fit, "u:1", c, 300), 3_000_000));
     }
 
     #[test]
