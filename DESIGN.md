@@ -421,7 +421,12 @@ The table is per daemon, persisted under `$XDG_STATE_HOME` (`jobs.hdr`). Its
 key is crate name plus the `-C metadata` hash, cargo's identity for a unit
 (package, version, features, profile, target). The hash doesn't change when
 sources are edited. A unit with no history falls back to crate name plus
-opt-level plus emit kinds, then to the median size of all units. Each entry
+opt-level plus emit kinds, then to the median unit: the median size of all
+units, split by the median share of it front ends take, and the median
+width, but no wider than its codegen units. With no units at all it runs
+on one thread. On 2026-11-02 a unit never run was its median size all
+spread over its 16 codegen units, so new crates were predicted 16 to 100
+times too fast: funty at 0.01 s on aieka, where it took 1.02 s. Each entry
 also holds hdrhistograms (2 significant figures) of wall time, peak memory,
 and sent runs' copy time and bytes, and runs counted by where they ran and
 for whom. At 256 runs each histogram halves the count at or above each value,
@@ -1136,8 +1141,8 @@ libraries and linker, kept so by the sysadmin.
   plus the rest at the mean rate per CPU, over the threads it can get:
   min(its width, the box's CPUs). Its front end runs first, on one thread,
   so the short jobs holding tokens when it starts are gone by the time its
-  codegen wants them. Its width is as measured, or its codegen
-  units if never measured. It goes wherever it finishes first, this box or
+  codegen wants them. Its width is as measured, or if never measured
+  the median unit's, no more than its codegen units. It goes wherever it finishes first, this box or
   another, and on another box it runs on every CPU too; a server starts it
   holding a token from its fastest class and a spare. With no history to
   predict by, it takes this box if a token is free, else the other box with

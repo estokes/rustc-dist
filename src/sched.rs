@@ -1062,13 +1062,14 @@ fn spread_rates(classes: impl Iterator<Item = (u64, u64)>) -> (u64, u64) {
 
 /// Whether a job runs pinned to one class.
 fn light(pred: &Prediction) -> bool {
-    pred.width_c.is_some_and(|w| w < LIGHT_WIDTH_C)
+    pred.known && pred.width_c < LIGHT_WIDTH_C
 }
 
-/// Threads a job keeps busy after its front end: as measured, or its
-/// `codegen_units` if never measured.
+/// Threads a job keeps busy after its front end: as measured, or if never
+/// measured, every unit's median but no more than its `codegen_units`.
 fn width(pred: &Prediction, codegen_units: u32) -> f64 {
-    pred.width_c.map_or(codegen_units as f64, |w| w as f64 / 100.).max(1.)
+    let width = pred.width_c as f64 / 100.;
+    if pred.known { width.max(1.) } else { width.min(codegen_units as f64).max(1.) }
 }
 
 /// Hundredths of a task per CPU that `threads` add on `cpus` CPUs.
@@ -2256,7 +2257,7 @@ impl Sched {
                     served,
                     work_ms: ms(info.pred.cost_mi()),
                     front_ms: (info.pred.front_mi > 0).then(|| ms(info.pred.front_mi)),
-                    width_c: info.pred.width_c.unwrap_or(100),
+                    width_c: info.pred.width_c,
                     now_ms: self.run_us(&pred, &spot, self.load_c, false) / 1000,
                     wall_ms: info.wall_ms,
                     mem_kb: info.pred.mem_kb,
@@ -3530,6 +3531,23 @@ mod test {
             Ok(Admission::Slot(slot)) => slot,
             _ => panic!("no slot"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_job_never_run_is_as_wide_as_the_median_unit_not_its_codegen_units() -> Result<()> {
+        let dir = scratch("never-run-width");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room(u64::MAX), &[], &[])?;
+        // Every unit a second on one thread; a new one has 16 codegen units.
+        for name in ["a", "b", "c"] {
+            history(&mut s, name, 1_000_000, 100);
+        }
+        let place = Place::Spread { layout: s.layout.id, class: 0 };
+        let known = s.estimate(&unit("a", &[]), s.local(place), 0, false).run_us;
+        let new = s.estimate(&unit("new", &[]), s.local(place), 0, false).run_us;
+        assert!(new.abs_diff(known) * 50 <= known, "a second, not a quarter of one on each cpu: {new} {known}");
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[tokio::test]

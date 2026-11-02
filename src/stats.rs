@@ -409,6 +409,11 @@ struct RunSample {
 }
 
 impl RunSample {
+    /// The threads it kept busy after its front end.
+    fn width(&self) -> f64 {
+        if self.rest_us > 0. { (self.tokens_us / self.rest_us).max(1.) } else { 1. }
+    }
+
     /// Its front end's work and the rest's, in millions of instructions,
     /// at `p`'s calibrated speed.
     fn work_mi(&self, p: &Place) -> (f64, f64) {
@@ -533,8 +538,7 @@ impl Record {
             runs += k;
             front.push((front_mi / m, k));
             rest.push((rest_mi / m, k));
-            let w = if r.rest_us > 0. { (r.tokens_us / r.rest_us).max(1.) } else { 1. };
-            width.push((w, k));
+            width.push((r.width(), k));
         }
         Some(Size { runs, front_mi: median(&mut front)?, rest_mi: median(&mut rest)?, width: median(&mut width)? })
     }
@@ -546,9 +550,8 @@ pub struct Prediction {
     /// on one thread, and the rest's, spread over its width.
     pub front_mi: u64,
     pub rest_mi: u64,
-    /// Hundredths of the threads busy after the front end; none until the
-    /// unit or its crate has run.
-    pub width_c: Option<u64>,
+    /// Hundredths of the threads busy after the front end.
+    pub width_c: u64,
     pub mem_kb: u64,
     /// It comes from the unit's or its crate's own runs, not every job's.
     pub known: bool,
@@ -598,9 +601,52 @@ fn known(r: &Record, s: &Size) -> Prediction {
     Prediction {
         front_mi: s.front_mi as u64,
         rest_mi: s.rest_mi as u64,
-        width_c: Some((s.width * 100.) as u64),
+        width_c: (s.width * 100.) as u64,
         mem_kb: r.mem_kb.value_at_quantile(0.9),
         known: true,
+    }
+}
+
+/// Every unit's size, the share of it its front end takes, its width and
+/// its peak: the prior for a unit with no history.
+struct Global {
+    cost_mi: Histogram<u32>,
+    front_pct: Histogram<u32>,
+    width_c: Histogram<u32>,
+    mem_kb: Histogram<u32>,
+}
+
+impl Global {
+    fn new() -> Self {
+        Self {
+            cost_mi: histogram(1_000_000_000),
+            front_pct: histogram(100),
+            width_c: histogram(100_000),
+            mem_kb: histogram(1 << 30),
+        }
+    }
+
+    fn record(&mut self, front_mi: f64, rest_mi: f64, width: f64, mem_kb: u64) {
+        let cost_mi = front_mi + rest_mi;
+        self.cost_mi.saturating_record(cost_mi.max(1.) as u64);
+        if cost_mi > 0. {
+            self.front_pct.saturating_record((front_mi * 100. / cost_mi).round() as u64);
+        }
+        self.width_c.saturating_record((width * 100.) as u64);
+        self.mem_kb.saturating_record(mem_kb.max(1));
+    }
+
+    /// The median unit, which with nothing recorded runs on one thread.
+    fn prediction(&self) -> Prediction {
+        let cost_mi = hist_median(&self.cost_mi).unwrap_or(UNKNOWN_COST_MI);
+        let front_mi = cost_mi * hist_median(&self.front_pct).unwrap_or(100) / 100;
+        Prediction {
+            front_mi,
+            rest_mi: cost_mi - front_mi,
+            width_c: hist_median(&self.width_c).unwrap_or(100),
+            mem_kb: hist_median(&self.mem_kb).unwrap_or(0),
+            known: false,
+        }
     }
 }
 
@@ -634,9 +680,7 @@ pub struct Stats {
     by_key: HashMap<ArcStr, PlaceId>,
     exact: HashMap<ArcStr, Record>,
     coarse: HashMap<ArcStr, Record>,
-    /// Every unit's size and peak, the prior for a unit with no history.
-    global_cost: Histogram<u32>,
-    global_mem: Histogram<u32>,
+    global: Global,
     /// Seconds since the epoch, which weights decay to: see `set_now`.
     now: f64,
     /// The `now` every place's factors were last worked out at.
@@ -653,8 +697,7 @@ impl Stats {
             by_key: HashMap::new(),
             exact: HashMap::new(),
             coarse: HashMap::new(),
-            global_cost: histogram(1_000_000_000),
-            global_mem: histogram(1 << 30),
+            global: Global::new(),
             now,
             refreshed: now,
             decay,
@@ -808,13 +851,7 @@ impl Stats {
         });
         match own {
             Some((r, s)) => known(r, &s),
-            None => Prediction {
-                front_mi: 0,
-                rest_mi: hist_median(&self.global_cost).unwrap_or(UNKNOWN_COST_MI),
-                width_c: None,
-                mem_kb: hist_median(&self.global_mem).unwrap_or(0),
-                known: false,
-            },
+            None => self.global.prediction(),
         }
     }
 
@@ -877,8 +914,7 @@ impl Stats {
             place.send(t.links, send, now, self.decay.copy_half_life_s);
         }
         let ((front_mi, rest_mi), m) = (sample.work_mi(place), place.factor(run.load_c));
-        self.global_cost.saturating_record(((front_mi + rest_mi) / m).max(1.) as u64);
-        self.global_mem.saturating_record(run.mem_kb.max(1));
+        self.global.record(front_mi / m, rest_mi / m, sample.width(), run.mem_kb);
         self.dirty = true;
     }
 
@@ -892,8 +928,7 @@ impl Stats {
             push(&mut r.runs_kept, sample, RUNS_KEPT);
             r.mem_kb.saturating_record(mem_kb.max(1));
         }
-        self.global_cost.saturating_record((front_mi + rest_mi).max(1));
-        self.global_mem.saturating_record(mem_kb.max(1));
+        self.global.record(front_mi as f64, rest_mi as f64, width_c as f64 / 100., mem_kb);
         self.dirty = true;
     }
 
@@ -921,14 +956,13 @@ impl Stats {
             p.refresh(now, self.decay.half_life_s);
         }
         self.refreshed = now;
-        let (mut cost, mut mem) = (histogram(1_000_000_000), histogram(1 << 30));
+        let mut global = Global::new();
         for r in self.exact.values() {
             if let Some(s) = r.size(&self.places, now, self.decay.half_life_s, |_| true) {
-                cost.saturating_record((s.front_mi + s.rest_mi).max(1.) as u64);
-                mem.saturating_record(r.mem_kb.value_at_quantile(0.9).max(1));
+                global.record(s.front_mi, s.rest_mi, s.width, r.mem_kb.value_at_quantile(0.9));
             }
         }
-        (self.global_cost, self.global_mem) = (cost, mem);
+        self.global = global;
     }
 
     /// A missing file is an empty table.
@@ -1299,6 +1333,21 @@ mod test {
     }
 
     #[test]
+    fn a_unit_with_no_history_is_the_median_unit_or_with_none_runs_on_one_thread() {
+        let mut s = Stats::new(Decay::default());
+        let p = predict(&s, &unit("new:1", "new"));
+        assert_eq!((p.front_mi, p.rest_mi, p.width_c, p.known), (UNKNOWN_COST_MI, 0, 100, false));
+        // Every unit a second of work, three quarters of it its front end,
+        // then two threads wide.
+        for i in 0..5 {
+            s.seed(&unit(&format!("u{i}:1"), &format!("u{i}")), 750, 250, 200, 1);
+        }
+        let p = predict(&s, &unit("new:1", "new"));
+        assert!(p.front_mi.abs_diff(750) <= 8 && p.cost_mi().abs_diff(1000) <= 8, "{} {}", p.front_mi, p.rest_mi);
+        assert_eq!((p.width_c, p.known), (200, false));
+    }
+
+    #[test]
     fn predicts_from_exact_then_coarse_then_global() {
         let mut s = Stats::new(Decay::default());
         assert_eq!(predict(&s, &unit("a:1", "a")).cost_mi(), UNKNOWN_COST_MI);
@@ -1310,7 +1359,7 @@ mod test {
             s.record(&unit("light:1", "light"), &run(here, 0, 20));
         }
         let heavy = predict(&s, &unit("heavy:1", "heavy"));
-        assert_eq!(heavy.width_c, Some(100));
+        assert_eq!(heavy.width_c, 100);
         assert!(near(heavy.cost_mi() as f64, 50_000.), "{}", heavy.cost_mi());
         let other_profile = predict(&s, &unit("heavy:2", "heavy"));
         assert_eq!(other_profile.cost_mi(), heavy.cost_mi());
@@ -1327,7 +1376,7 @@ mod test {
         let r = Run { front_us: Some(400_000), tokens_us: 400_000 + 2_400_000, ..run(here, 0, 1000) };
         s.record(&unit("a:1", "a"), &r);
         let p = predict(&s, &unit("a:1", "a"));
-        assert_eq!((p.front_mi, p.rest_mi, p.width_c), (800, 2400, Some(400)));
+        assert_eq!((p.front_mi, p.rest_mi, p.width_c), (800, 2400, 400));
         assert_eq!(s.time_us(&p, here, 0, 4.), 1_000_000);
         assert_eq!(s.time_us(&p, here, 0, 2.), 1_600_000, "half the threads, twice the rest");
     }
@@ -1810,8 +1859,8 @@ mod test {
             let p = predict(&s, &unit(u, u));
             (p.front_mi, p.rest_mi, p.width_c)
         };
-        assert_eq!(p("a:1"), (400, 2400, Some(400)));
-        assert_eq!(p("s:1"), (100, 900, Some(300)));
+        assert_eq!(p("a:1"), (400, 2400, 400));
+        assert_eq!(p("s:1"), (100, 900, 300));
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -1954,7 +2003,7 @@ mod test {
         // Histograms keep two significant figures.
         let near = |x: u64, want: u64| x.abs_diff(want) * 100 <= want;
         assert!(near(p.front_mi, 1000) && near(p.rest_mi, 4000), "{} {}", p.front_mi, p.rest_mi);
-        assert!(p.width_c.is_some_and(|w| near(w, 300)), "{:?}", p.width_c);
+        assert!(near(p.width_c, 300), "{}", p.width_c);
         assert!((2000..=2100).contains(&p.mem_kb), "{}", p.mem_kb);
         let (_, a) = s.units().next().unwrap();
         assert_eq!(a.runs, [4, 0, 1]);
