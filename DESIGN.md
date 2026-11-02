@@ -502,19 +502,30 @@ sizes can't feed back into them.
 
 ### Fitting
 
-A weighted median polish over every run kept (each unit's last 16): set each
-place's effect to the weighted median of its runs' times less their units'
-effects, then each unit's to the weighted median of its runs' times less
-their places' effects, and repeat, ten rounds. Medians, so no single run,
-however long, moves an effect. Each round also fits `s(p)` as the Theil-Sen
-slope of the place's residuals against load. Weights halve
-every `half_life_s`, a day, for units and places alike.
+From every run kept (each unit's last 16), weights halving every
+`half_life_s`, a day:
+
+1. Each unit's weighted median time at each place it ran at, less the load
+   the place's slope says it ran under. Each pair of those places gets the
+   difference, weighing what the less-run side weighs.
+2. Each pair of places takes the weighted median of its units' differences,
+   weighing their sum. Medians, so no odd run, however long, moves a pair.
+3. The places' effects are the weighted least-squares fit to those pairs,
+   the reference held at its calibration, every other place's calibration
+   counting as 2 runs that never age (Gauss-Seidel, 50 sweeps).
+4. Each unit's effect is the weighted median of its runs' times less their
+   places' effects and load, and each place's slope the Theil-Sen slope of
+   its runs' times less their units' effects against load. Four rounds.
 
 The scale is held by the reference, this box's fastest class in its current
-profile: its effect is fixed at its calibration. Every other place's
-calibration counts as 8 runs that never age, placed at its calibrated µs
-per million instructions, so a place with few pairs stays near it and one
-with many follows its runs. An all-CPUs place starts at its fastest class's
+profile: its effect is fixed at its calibration. A place with few pairs
+stays near its own calibration; one stray run ten times off moves a place
+with no others a third of the way, in log. Two other ways stuck. A median
+polish, alternating medians over runs, left place effects 3 to 8% off on a
+steady test farm, and stalled at its calibration when a unit's runs split
+evenly between two places, since the lower median sat on one place's runs.
+And a place set to the median of what its few pairs say sticks at whichever
+lies between, often its calibration; a mean of medians doesn't. An all-CPUs place starts at its fastest class's
 rate, as if single-threaded. A unit's effect is then its typical time at the
 reference, which is what status shows as work.
 
@@ -594,10 +605,20 @@ of time runnable tasks waited for a CPU, which is the slowdown itself. Fitted at
 class sat at 2.28, 2.29, 2.20 and 2.20 times this box's class 0 from 11:00
 on, aieka's at 1.36 to 1.31, and syn's work at 3.1 to 2.9 s.
 
+Built as above (`src/pairs.rs`), scored the same way as the prototype on
+the same 1,367 runs: median ×1.19, p90 ×1.96, 58% within 25% (median polish
+×1.23, ×2.22, 53%; the daemon ×1.26, ×2.63, 49%). Here ×1.44, p90 ×2.49, 35%
+within 25%; new to the place ×1.35, ×2.37, 40%; other boxes ×1.13, ×1.58,
+70%. Fitted this way, this box's load slope didn't hurt in `low`.
+
 Before it decides anything, the daemon fits the pair model beside the
-current one and logs, on each placement line, the current prediction and the
-pairs' with and without this box's load slopes. After a day in each profile
-it switches to the pairs when they predict better on those days' runs. Tests: scaling
+current one, every minute while the placement log is on, and each candidate
+on a placement line shows what it predicts there: `(pairs 1.23)` for
+another box, `(pairs 1.23, no load 1.10)` here. When a run ends, a line
+under the same log target says where it ran, its time, the tokens it held
+and its load: `rustc:… ran at here/low/0: 1.31 s holding 1.0 tokens at load
+0.85`. After a day in each profile it switches to the pairs when they
+predict better on those days' runs. Tests: scaling
 every run's time at every place leaves predictions where they were and
 moves only the units' effects; a place's effect comes from pairs whatever
 the units' sizes; a place with few pairs stays near its calibration;

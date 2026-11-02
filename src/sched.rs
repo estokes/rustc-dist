@@ -4,6 +4,7 @@ use crate::{
     classes::{self, Class, Profile},
     farm::{BoxState, ClassState, Load},
     graph::Graph,
+    pairs,
     protocol::{
         BoxClass, BoxStatus, ClassStatus, Measured, Ran, Reads, Reply, SpreadStatus, Status, Switching,
         Unit, UnitStatus, frame,
@@ -121,6 +122,8 @@ pub enum Msg {
     Calibrated { profile: Profile, result: Result<Vec<Class>> },
     /// A heartbeat moved `kb` to the box `name` in `us`.
     Heartbeat { name: ArcStr, kb: u64, us: u64 },
+    /// A fit of the pairs model to the runs as they were.
+    Pairs(Box<pairs::Fit>),
     Drain,
 }
 
@@ -1111,6 +1114,13 @@ struct Spot {
 }
 
 impl Spot {
+    /// The load a job here runs under on a box at `load_c`: with its own
+    /// threads added if it starts now, and not if it waits for a token,
+    /// since it then takes over from a job that ends.
+    fn load_under(&self, load_c: u32, waits: bool) -> u32 {
+        if waits { load_c } else { load_c + self.adds }
+    }
+
     /// At `at`, pinned to a class or on every one of a box's `cpus`, for a
     /// job of `codegen_units`.
     fn new(pred: &Prediction, codegen_units: u32, at: PlaceId, pinned: bool, cpus: u64) -> Self {
@@ -1162,6 +1172,10 @@ pub struct Sched {
     /// predictions down from.
     published: Instant,
     stats: Stats,
+    /// The pairs model's latest fit, which predicts only for the placement
+    /// log, beside the cost table, and whether a fit is under way.
+    pairs: Option<Box<pairs::Fit>>,
+    fitting: bool,
     graph: Graph,
     load: watch::Sender<Load>,
     tx: mpsc::UnboundedSender<Msg>,
@@ -1208,6 +1222,8 @@ impl Sched {
             answered: false,
             published: Instant::now(),
             stats,
+            pairs: None,
+            fitting: false,
             graph,
             load,
             tx,
@@ -1262,6 +1278,7 @@ impl Sched {
                 Event::Measure => self.measure(Instant::now()),
                 Event::Save => {
                     self.save();
+                    self.refit();
                 }
             }
             self.dispatch();
@@ -1332,6 +1349,10 @@ impl Sched {
                     self.stats.heartbeat(&at, kb, us);
                 }
             }
+            Msg::Pairs(fit) => {
+                self.pairs = Some(fit);
+                self.fitting = false;
+            }
             Msg::Drain => return Ok(false),
         }
         Ok(true)
@@ -1375,17 +1396,39 @@ impl Sched {
         let measured = layout.release(job, Instant::now());
         self.reclaim();
         if let (Some((ran, linker_waited_us)), Some(m)) = (ran, measured) {
-            debug!(
-                "{} took {} ms holding {} tokens at load {}",
-                unit.exact,
-                ran.wall_us / 1000,
-                m.tokens_us as f64 / ran.wall_us.max(1) as f64,
-                m.load_c as f64 / 100.
-            );
             let origin = if r.build.is_some() { Origin::Here } else { Origin::Served };
             let run = timed(r.at, &ran, m, linker_waited_us, ran.maxrss_kb.max(r.peak_kb), origin);
-            self.stats.record(unit, &run);
+            self.record(unit, &run);
         }
+    }
+
+    /// While the placement log is on, fit the pairs model to the runs as
+    /// they are now, off this thread; a fit under way is left to finish.
+    fn refit(&mut self) {
+        if self.fitting || !log_enabled!(target: "placement", Level::Debug) {
+            return;
+        }
+        self.fitting = true;
+        let snapshot = self.stats.pair_snapshot(self.layout.places.classes[self.layout.by_speed()[0]]);
+        let tx = self.tx.clone();
+        task::spawn_blocking(move || {
+            let _ = tx.send(Msg::Pairs(Box::new(pairs::Fit::new(&snapshot))));
+        });
+    }
+
+    /// Record a run, and in the placement log where it ran, how long it
+    /// took, holding how many tokens, under what load.
+    fn record(&mut self, unit: &Unit, run: &Run) {
+        debug!(
+            target: "placement",
+            "{} ran at {}: {:.2} s holding {:.1} tokens at load {:.2}",
+            unit.exact,
+            self.stats.key(run.place),
+            run.wall_us as f64 / 1e6,
+            run.tokens_us as f64 / run.wall_us.max(1) as f64,
+            run.load_c as f64 / 100.
+        );
+        self.stats.record(unit, run);
     }
 
     fn take_running(&mut self, job: JobId) -> Option<Running> {
@@ -1406,7 +1449,7 @@ impl Sched {
             RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer, kept }) => {
                 self.mismatches.remove(&unit.exact);
                 let run = timed(r.at, &ran, measured, linker_waited_us, ran.maxrss_kb, Origin::Sent(transfer));
-                self.stats.record(unit, &run);
+                self.record(unit, &run);
                 let rb = &mut self.remotes[remote];
                 if let Some((state, _)) = &rb.state {
                     rb.held.used(&kept, state.cache_gb << 20);
@@ -1720,14 +1763,12 @@ impl Sched {
     fn estimate(&self, unit: &Unit, (at, pinned, cpus): (PlaceId, bool, u64), load_c: u32, waits: bool) -> Estimate {
         let (pred, basis) = self.stats.predict_at(&unit.exact, &unit.coarse, at);
         let spot = Spot::new(&pred, unit.codegen_units, at, pinned, cpus);
-        Estimate { spot, run_us: self.run_us(&pred, &spot, load_c, waits), basis }
+        let load_c = spot.load_under(load_c, waits);
+        Estimate { spot, run_us: self.run_us(&pred, &spot, load_c), basis, load_c }
     }
 
-    /// Predicted µs at `spot` on a box under `load_c`: with the job's own
-    /// threads added if it starts now, and not if it waits for a token,
-    /// since it then takes over from a job that ends.
-    fn run_us(&self, pred: &Prediction, spot: &Spot, load_c: u32, waits: bool) -> u64 {
-        let load_c = if waits { load_c } else { load_c + spot.adds };
+    /// Predicted µs at `spot` under `load_c`.
+    fn run_us(&self, pred: &Prediction, spot: &Spot, load_c: u32) -> u64 {
         self.stats.time_us(pred, spot.at, load_c, spot.threads)
     }
 
@@ -1827,8 +1868,8 @@ impl Sched {
                     let place = Place::Local { layout: id, class: k };
                     let waits = held[k] == 0;
                     let load_c = if waits { self.load_c } else { load_here };
-                    let Estimate { spot, run_us, basis } = self.estimate(&w.unit, self.local(place), load_c, waits);
-                    cands.push(Cand { start_us: frees_in[k], copy_us: 0, run_us, spot, place, queue: None, basis });
+                    let Estimate { spot, run_us, basis, load_c: under } = self.estimate(&w.unit, self.local(place), load_c, waits);
+                    cands.push(Cand { start_us: frees_in[k], copy_us: 0, run_us, spot, place, queue: None, basis, load_c: under });
                 }
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Ok((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
@@ -1846,11 +1887,11 @@ impl Sched {
                             },
                         };
                         let load_c = if waits { state.load_c } else { load_there[r] };
-                        let Estimate { spot, run_us, basis } = self.estimate(&w.unit, (at, true, cpus), load_c, waits);
+                        let Estimate { spot, run_us, basis, load_c: under } = self.estimate(&w.unit, (at, true, cpus), load_c, waits);
                         let moving = self.stats.moving(&w.unit, at, links, missing_kb);
                         let (copy_us, moves) = shared(&crossing, moving, frees_in_us, run_us);
                         let place = Place::Remote { remote: r, class: Some(k), shown_in: None, moves };
-                        cands.push(Cand { start_us: frees_in_us, copy_us, run_us, spot, place, queue: None, basis });
+                        cands.push(Cand { start_us: frees_in_us, copy_us, run_us, spot, place, queue: None, basis, load_c: under });
                     }
                 }
                 (!cands.is_empty()).then(|| {
@@ -1873,15 +1914,15 @@ impl Sched {
                     let place = Place::Spread { layout: id, class };
                     let waits = held[class] == 0;
                     let load_c = if waits { self.load_c } else { load_here };
-                    let Estimate { spot, run_us, basis } = self.estimate(&w.unit, self.local(place), load_c, waits);
-                    cands.push(Cand { start_us, copy_us: 0, run_us, spot, place, queue: None, basis });
+                    let Estimate { spot, run_us, basis, load_c: under } = self.estimate(&w.unit, self.local(place), load_c, waits);
+                    cands.push(Cand { start_us, copy_us: 0, run_us, spot, place, queue: None, basis, load_c: under });
                 }
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Ok((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
                     let cpus = state.classes.iter().map(|c| c.cpus as u64).sum();
                     let waits = rb.avail.iter().all(|&n| n == 0);
                     let load_c = if waits { state.load_c } else { load_there[r] };
-                    let Estimate { spot, run_us, basis } = self.estimate(&w.unit, (places.all, false, cpus), load_c, waits);
+                    let Estimate { spot, run_us, basis, load_c: under } = self.estimate(&w.unit, (places.all, false, cpus), load_c, waits);
                     let missing_kb = away.map_or(0, |p| rb.held.missing_kb(&p.inputs));
                     let moving = self.stats.moving(&w.unit, places.all, links, missing_kb);
                     // A busy box is worth waiting for if it finishes the job
@@ -1897,7 +1938,7 @@ impl Sched {
                     if let Some((start_us, queue)) = start {
                         let (copy_us, moves) = shared(&crossing, moving, start_us, run_us);
                         let place = Place::Remote { remote: r, class: None, shown_in: None, moves };
-                        cands.push(Cand { start_us, copy_us, run_us, spot, place, queue, basis });
+                        cands.push(Cand { start_us, copy_us, run_us, spot, place, queue, basis, load_c: under });
                     }
                 }
                 (!cands.is_empty()).then(|| pick_wide(&cands, w.pred.known))
@@ -1995,8 +2036,9 @@ impl Sched {
     /// thread of this box's fastest class; each place it could go, with the
     /// seconds until a slot, moving its files and running there, and what
     /// that run time comes from (its own runs there, its runs on that box,
-    /// or an estimate from its size), the one it takes starred; and why it
-    /// couldn't go anywhere else.
+    /// or an estimate from its size), the one it takes starred, and what the
+    /// pairs model predicts it runs in there, here with and without its load
+    /// slope; and why it couldn't go anywhere else.
     fn placement(
         &self,
         w: &Waiting,
@@ -2024,6 +2066,16 @@ impl Sched {
                 Basis::Size => "est",
             };
             let _ = write!(line, " {:.2}+{:.2}+{:.2} [{basis}]", s(c.start_us), s(c.copy_us), s(c.run_us));
+            if let Some(fit) = &self.pairs {
+                let pairs = |loaded| match fit.predict_us(&w.unit.exact, &w.unit.coarse, c.spot.at, c.load_c, loaded) {
+                    Some(us) => format_compact!("{:.2}", s(us)),
+                    None => CompactString::const_new("-"),
+                };
+                let _ = match c.place.here() {
+                    true => write!(line, " (pairs {}, no load {})", pairs(true), pairs(false)),
+                    false => write!(line, " (pairs {})", pairs(true)),
+                };
+            }
         }
         if !fits {
             line.push_str("; not here: its memory doesn't fit");
@@ -2258,7 +2310,7 @@ impl Sched {
                     work_ms: ms(info.pred.cost_mi()),
                     front_ms: (info.pred.front_mi > 0).then(|| ms(info.pred.front_mi)),
                     width_c: info.pred.width_c,
-                    now_ms: self.run_us(&pred, &spot, self.load_c, false) / 1000,
+                    now_ms: self.run_us(&pred, &spot, spot.load_under(self.load_c, false)) / 1000,
                     wall_ms: info.wall_ms,
                     mem_kb: info.pred.mem_kb,
                     copy_ms: info.copy_ms,
@@ -2383,11 +2435,13 @@ impl Sched {
     }
 }
 
-/// What `Sched::estimate` predicts of a job at a place.
+/// What `Sched::estimate` predicts of a job at a place, and the load it
+/// predicts the run under.
 struct Estimate {
     spot: Spot,
     run_us: u64,
     basis: Basis,
+    load_c: u32,
 }
 
 /// Somewhere a job could run.
@@ -2402,6 +2456,8 @@ struct Cand {
     /// wait for.
     queue: Option<usize>,
     basis: Basis,
+    /// Hundredths of a runnable task per CPU its run is predicted under.
+    load_c: u32,
 }
 
 impl Cand {
@@ -2491,7 +2547,7 @@ mod test {
 
     fn local(run_us: u64, start_us: u64) -> Cand {
         let place = Place::Local { layout: LayoutId::new(), class: 0 };
-        Cand { start_us, copy_us: 0, run_us, spot: spot(), place, queue: None, basis: Basis::Place }
+        Cand { start_us, copy_us: 0, run_us, spot: spot(), place, queue: None, basis: Basis::Place, load_c: 0 }
     }
 
     #[test]
@@ -2531,6 +2587,7 @@ mod test {
             spot: spot(),
             queue: None,
             basis: Basis::Place,
+            load_c: 0,
             place: if here {
                 Place::Spread { layout: LayoutId::new(), class: 0 }
             } else {
@@ -3367,6 +3424,7 @@ mod test {
             place,
             queue: None,
             basis,
+            load_c: 0,
         };
         let here = Place::Spread { layout: s.layout.id, class: 0 };
         let b = Place::Remote { remote: 0, class: None, shown_in: None, moves: Moves::default() };
@@ -3382,6 +3440,53 @@ mod test {
             s.placement(stays, 1_000_000, false, Err("it can't go to another box"), &cands[1..], 0).as_str(),
             "stays (never ran; 1.00 s on one thread of the fastest class here): *b/all 0.25+0.40+1.00 [est]; \
              not here: its memory doesn't fit; no other box: it can't go to another box"
+        );
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_placement_line_shows_what_the_pairs_predict() -> Result<()> {
+        let dir = scratch("placement-pairs");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0])], room(u64::MAX), &[], &[])?;
+        // b is calibrated twice as fast, and twenty units bear that out.
+        s.farm("b".into(), Some(remote_box(500, 4, 4, 1)));
+        let (here, there) = (s.layout.places.classes[0], s.remotes[0].state.as_ref().unwrap().1.all);
+        let ran = |s: &mut Sched, name: &str, place, ms: u64| {
+            let wall_us = ms * 1000;
+            let run = Run { place, load_c: 0, wall_us, front_us: None, tokens_us: wall_us, mem_kb: 1, origin: Origin::Here };
+            s.stats.record(&unit(name, &[]), &run);
+        };
+        for i in 0..20 {
+            for _ in 0..8 {
+                ran(&mut s, &format!("u{i}"), here, 200 * (i + 1));
+                ran(&mut s, &format!("u{i}"), there, 100 * (i + 1));
+            }
+        }
+        // job ran only here, in 2 s.
+        ran(&mut s, "job", here, 2000);
+        s.pairs = Some(Box::new(pairs::Fit::new(&s.stats.pair_snapshot(here))));
+        let (reply, _rx) = oneshot::channel();
+        s.submit(unit("job", &[]), 1, want(), reply);
+        let cand = |at, place, run_us| Cand {
+            start_us: 0,
+            copy_us: 0,
+            run_us,
+            spot: Spot { at, threads: 1., adds: 0 },
+            place,
+            queue: None,
+            basis: Basis::Place,
+            load_c: 0,
+        };
+        let b = Place::Remote { remote: 0, class: None, shown_in: None, moves: Moves::default() };
+        let cands = [cand(here, Place::Local { layout: s.layout.id, class: 0 }, 2_000_000), cand(there, b, 1_000_000)];
+        let w = &s.queue[0];
+        let away = w.portable.as_ref().map_err(|why| anyhow::anyhow!("{why}"))?;
+        assert_eq!(
+            s.placement(w, 2_000_000, true, Ok(away), &cands, 1).as_str(),
+            "job (ran before; 2.00 s on one thread of the fastest class here): \
+             here/0 0.00+0.00+2.00 [own] (pairs 2.00, no load 2.00) *b/all 0.00+0.00+1.00 [own] (pairs 1.00)"
         );
         drop(s);
         fs::remove_dir_all(&dir)?;

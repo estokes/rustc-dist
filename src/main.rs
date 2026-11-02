@@ -9,6 +9,7 @@ mod daemon;
 mod farm;
 mod graph;
 mod link;
+mod pairs;
 mod perf;
 mod protocol;
 mod remote;

@@ -6,7 +6,7 @@
 //! estimate is a weighted median of recent samples, weights halving with
 //! age, so no one bad run moves it.
 
-use crate::protocol::Unit;
+use crate::{pairs, protocol::Unit};
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use compact_str::format_compact;
@@ -82,7 +82,7 @@ pub fn now_s() -> f64 {
 
 /// What a weight set at `at` is worth at `now`, halving every
 /// `half_life_s`.
-fn keep(at: f64, now: f64, half_life_s: f64) -> f64 {
+pub(crate) fn keep(at: f64, now: f64, half_life_s: f64) -> f64 {
     0.5f64.powf((now - at).max(0.) / half_life_s)
 }
 
@@ -226,6 +226,12 @@ pub struct Run {
 /// A place's index in the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaceId(u32);
+
+impl PlaceId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// A run's time at a place over what its unit's size from runs elsewhere
 /// predicted at the place's calibrated speed, weighing that prediction.
@@ -853,6 +859,34 @@ impl Stats {
             Some((r, s)) => known(r, &s),
             None => self.global.prediction(),
         }
+    }
+
+    /// The key `place` was made with.
+    pub fn key(&self, place: PlaceId) -> &str {
+        &self.places[place.index()].key
+    }
+
+    /// The runs a pairs fit reads, with `reference` holding the scale. A
+    /// place's prior is its calibrated µs per million instructions at its
+    /// fastest rate; the seed place, whose runs no box made, has none.
+    pub fn pair_snapshot(&self, reference: PlaceId) -> pairs::Snapshot {
+        let sample = |unit: u32, r: &RunSample| pairs::Sample {
+            unit,
+            place: r.place,
+            at: r.at,
+            load_c: r.load_c,
+            wall_us: r.front_us + r.rest_us,
+        };
+        let mut units = Vec::with_capacity(self.exact.len());
+        let mut samples = Vec::new();
+        for (key, r) in &self.exact {
+            samples.extend(r.runs_kept.iter().map(|run| sample(units.len() as u32, run)));
+            units.push(key.clone());
+        }
+        let coarse =
+            self.coarse.iter().map(|(k, r)| (k.clone(), r.runs_kept.iter().map(|run| sample(0, run)).collect())).collect();
+        let priors = self.places.iter().map(|p| (p.key != SEED).then(|| (1e6 / p.fast as f64).ln())).collect();
+        pairs::Snapshot { units, samples, coarse, priors, reference, now: self.now, half_life_s: self.decay.half_life_s }
     }
 
     /// Every unit with runs.
