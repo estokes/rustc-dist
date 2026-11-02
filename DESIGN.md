@@ -445,7 +445,7 @@ daemon can't read, such as one a later version wrote, is moved aside to
 `jobs.hdr.unreadable` (or `.unreadable.2`, and so on, never over one already
 there), with an error in the log, and the daemon starts with an empty table.
 
-## Speeds from pairs of runs (proposed 2026-11-02)
+## Speeds from pairs of runs (placing since 2026-11-02)
 
 Every job is a calibration load. A unit that ran at two places says how fast
 one is against the other, whatever its size, and the table holds thousands
@@ -518,7 +518,9 @@ From every run kept (each unit's last 16), weights halving every
    its runs' times less their units' effects against load. Four rounds.
 
 The scale is held by the reference, this box's fastest class in its current
-profile: its effect is fixed at its calibration. A place with few pairs
+profile: its effect is fixed at its calibration. The seed place is held at
+its own too, so seeded history is work at a factor of 1, as in the cost
+table. A place with few pairs
 stays near its own calibration; one stray run ten times off moves a place
 with no others a third of the way, in log. Two other ways stuck. A median
 polish, alternating medians over runs, left place effects 3 to 8% off on a
@@ -611,14 +613,19 @@ the same 1,367 runs: median ×1.19, p90 ×1.96, 58% within 25% (median polish
 within 25%; new to the place ×1.35, ×2.37, 40%; other boxes ×1.13, ×1.58,
 70%. Fitted this way, this box's load slope didn't hurt in `low`.
 
-Before it decides anything, the daemon fits the pair model beside the
-current one, every minute while the placement log is on, and each candidate
-on a placement line shows what it predicts there: `(pairs 1.23)` for
-another box, `(pairs 1.23, no load 1.10)` here. When a run ends, a line
-under the same log target says where it ran, its time, the tokens it held
-and its load: `rustc:… ran at here/low/0: 1.31 s holding 1.0 tokens at load
-0.85`. After a day in each profile it switches to the pairs when they
-predict better on those days' runs. Tests: scaling
+On the evidence above it places jobs, without first shadowing the cost
+table for a day. Every candidate's run time, the 1 s threshold for sending
+a job away, and ranks come from the pairs, fitted every minute (23 ms for
+24,726 runs) and after a profile switch; before the first fit, and at a
+place the fit doesn't know, the cost table predicts. The cost table still
+learns, and each candidate on a placement line shows what it predicts,
+`(table 1.40)`, with here what the pairs predict without the load slope,
+`(no load 1.10, table 1.40)`, so the profile question can still be scored.
+When a run ends, a line under the same log target says where it ran, its
+time, the tokens it held and its load: `rustc:… ran at here/low/0: 1.31 s
+holding 1.0 tokens at load 0.85`. Memory and whether a job is light still
+come from the cost table, and so does `status`, whose speeds and work are
+still the cost table's. Tests: scaling
 every run's time at every place leaves predictions where they were and
 moves only the units' effects; a place's effect comes from pairs whatever
 the units' sizes; a place with few pairs stays near its calibration;

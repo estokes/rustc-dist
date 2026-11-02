@@ -587,8 +587,12 @@ pub enum Basis {
     /// Its runs at other places of that box.
     Box,
     /// Its size from all its runs, or its crate's, or every unit's, at the
-    /// place's factor.
+    /// place's factor; or for the pairs model, its crate's effect or the
+    /// median unit's.
     Size,
+    /// The pairs model: its runs elsewhere, and other units' runs both
+    /// there and where it ran.
+    Pairs,
 }
 
 /// What `status` shows of a unit.
@@ -868,7 +872,8 @@ impl Stats {
 
     /// The runs a pairs fit reads, with `reference` holding the scale. A
     /// place's prior is its calibrated µs per million instructions at its
-    /// fastest rate; the seed place, whose runs no box made, has none.
+    /// fastest rate. The seed place is held at its own, as here: its runs
+    /// are work at a factor of 1.
     pub fn pair_snapshot(&self, reference: PlaceId) -> pairs::Snapshot {
         let sample = |unit: u32, r: &RunSample| pairs::Sample {
             unit,
@@ -885,8 +890,9 @@ impl Stats {
         }
         let coarse =
             self.coarse.iter().map(|(k, r)| (k.clone(), r.runs_kept.iter().map(|run| sample(0, run)).collect())).collect();
-        let priors = self.places.iter().map(|p| (p.key != SEED).then(|| (1e6 / p.fast as f64).ln())).collect();
-        pairs::Snapshot { units, samples, coarse, priors, reference, now: self.now, half_life_s: self.decay.half_life_s }
+        let priors = self.places.iter().map(|p| (1e6 / p.fast as f64).ln()).collect();
+        let fixed = vec![reference, self.by_key[SEED]];
+        pairs::Snapshot { units, samples, coarse, priors, fixed, now: self.now, half_life_s: self.decay.half_life_s }
     }
 
     /// Every unit with runs.

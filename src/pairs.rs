@@ -5,7 +5,7 @@
 //! into the places' speeds. For now it only predicts beside the cost table,
 //! for the placement log.
 
-use crate::stats::{PlaceId, keep};
+use crate::stats::{Basis, PlaceId, keep};
 use arcstr::ArcStr;
 use poolshark::local::LPooled;
 use std::collections::HashMap;
@@ -35,26 +35,28 @@ pub struct Sample {
 }
 
 /// What a fit reads: the runs of every unit and of every coarse key, each
-/// place's calibrated µs per million instructions (none for a place that
-/// predicts nothing), and the place whose calibration holds the scale.
+/// place's calibrated µs per million instructions, and the places held
+/// there: the reference, which holds the scale, and the seed place, whose
+/// runs are work recorded before runs were timed.
 pub struct Snapshot {
     pub units: Vec<ArcStr>,
     pub samples: Vec<Sample>,
     pub coarse: Vec<(ArcStr, Vec<Sample>)>,
-    pub priors: Vec<Option<f64>>,
-    pub reference: PlaceId,
+    pub priors: Vec<f64>,
+    pub fixed: Vec<PlaceId>,
     pub now: f64,
     pub half_life_s: f64,
 }
 
 /// Each unit's effect, the log of its work in millions of instructions at
-/// the reference, and each place's effect and load slope.
+/// the reference, with the places it ran at, and each place's effect and
+/// load slope.
 pub struct Fit {
-    units: HashMap<ArcStr, f64>,
+    units: HashMap<ArcStr, (f64, Ran)>,
     coarse: HashMap<ArcStr, f64>,
     /// For a unit with neither.
     median: Option<f64>,
-    places: Vec<Option<(f64, f64)>>,
+    places: Vec<(f64, f64)>,
 }
 
 /// The weighted median of `samples`, each a value and its weight, or the
@@ -78,6 +80,23 @@ fn median(samples: &mut [(f64, f64)]) -> Option<f64> {
         }
     }
     samples.last().map(|(v, _)| *v)
+}
+
+/// The places a unit ran at, as bits by their index; a place past the 64th
+/// counts as one it never ran at.
+#[derive(Clone, Copy, Default)]
+struct Ran(u64);
+
+impl Ran {
+    fn add(&mut self, place: PlaceId) {
+        if let Some(bit) = 1u64.checked_shl(place.index() as u32) {
+            self.0 |= bit;
+        }
+    }
+
+    fn at(self, place: PlaceId) -> bool {
+        1u64.checked_shl(place.index() as u32).is_some_and(|bit| self.0 & bit != 0)
+    }
 }
 
 fn x(load_c: u32) -> f64 {
@@ -135,12 +154,12 @@ impl Pairs {
     /// Each place's effect: the weighted mean of what each place it has
     /// pairs with says of it, by the weighted median of those pairs' units,
     /// weighing what the pairs weigh, and of its calibration, weighing
-    /// `PRIOR_RUNS`; the reference stays at its calibration. The medians
+    /// `PRIOR_RUNS`; the fixed places stay at their calibration. The medians
     /// keep odd runs out; a median of the few places a place pairs with
     /// would stick at whichever lies between, often its calibration.
     fn places(&mut self, snap: &Snapshot) -> LPooled<Vec<f64>> {
         let n = self.n;
-        let prior = |p: usize| snap.priors[p].unwrap_or(0.);
+        let prior = |p: usize| snap.priors[p];
         let mut edges: LPooled<Vec<Option<(f64, f64)>>> = LPooled::take();
         for d in self.diffs.iter_mut() {
             let w = d.iter().map(|(_, w)| w).sum::<f64>();
@@ -148,7 +167,7 @@ impl Pairs {
         }
         let mut place: LPooled<Vec<f64>> = (0..n).map(prior).collect();
         for _ in 0..SWEEPS {
-            for p in (0..n).filter(|&p| p != snap.reference.index() && snap.priors[p].is_some()) {
+            for p in (0..n).filter(|&p| !snap.fixed.iter().any(|f| f.index() == p)) {
                 let (mut sum, mut weight) = (prior(p) * PRIOR_RUNS, PRIOR_RUNS);
                 for q in 0..n {
                     if let Some((d, w)) = edges[p * n + q] {
@@ -168,7 +187,7 @@ impl Pairs {
 impl Fit {
     pub fn new(snap: &Snapshot) -> Self {
         let n = snap.priors.len();
-        let known = |s: &Sample| snap.priors.get(s.place.index()).is_some_and(Option::is_some);
+        let known = |s: &Sample| s.place.index() < n;
         let weight: LPooled<Vec<f64>> = snap.samples.iter().map(|s| keep(s.at, snap.now, snap.half_life_s)).collect();
         let mut by_place: LPooled<Vec<LPooled<Vec<usize>>>> = (0..n).map(|_| LPooled::take()).collect();
         let mut by_unit: LPooled<Vec<LPooled<Vec<usize>>>> = (0..snap.units.len()).map(|_| LPooled::take()).collect();
@@ -205,26 +224,36 @@ impl Fit {
             median(&mut scratch)
         };
         let coarse = snap.coarse.iter().filter_map(|(k, runs)| Some((k.clone(), effect(runs)?))).collect();
-        let units: HashMap<ArcStr, f64> = by_unit
+        let units: HashMap<ArcStr, (f64, Ran)> = by_unit
             .iter()
             .enumerate()
             .filter(|(_, ix)| !ix.is_empty())
-            .map(|(u, _)| (snap.units[u].clone(), unit[u]))
+            .map(|(u, ix)| {
+                let mut ran = Ran::default();
+                for &i in ix.iter() {
+                    ran.add(snap.samples[i].place);
+                }
+                (snap.units[u].clone(), (unit[u], ran))
+            })
             .collect();
-        let mut all: LPooled<Vec<(f64, f64)>> = units.values().map(|&a| (a, 1.)).collect();
+        let mut all: LPooled<Vec<(f64, f64)>> = units.values().map(|&(a, _)| (a, 1.)).collect();
         let median = median(&mut all);
-        let places = (0..n).map(|p| snap.priors[p].map(|_| (place[p], slope[p]))).collect();
+        let places = (0..n).map(|p| (place[p], slope[p])).collect();
         Self { units, coarse, median, places }
     }
 
     /// Predicted µs of `exact`, or its `coarse` key, or the median unit, at
-    /// `place` under `load_c`; `loaded` false leaves out the place's load
-    /// slope. None for a place the fit doesn't know.
-    pub fn predict_us(&self, exact: &str, coarse: &str, place: PlaceId, load_c: u32, loaded: bool) -> Option<u64> {
-        let (effect, slope) = (*self.places.get(place.index())?)?;
-        let unit = self.units.get(exact).or_else(|| self.coarse.get(coarse)).copied().or(self.median)?;
+    /// `place` under `load_c`, and what it comes from; `loaded` false leaves
+    /// out the place's load slope. None for a place the fit doesn't know.
+    pub fn predict_us(&self, exact: &str, coarse: &str, place: PlaceId, load_c: u32, loaded: bool) -> Option<(u64, Basis)> {
+        let &(effect, slope) = self.places.get(place.index())?;
+        let (unit, basis) = match self.units.get(exact) {
+            Some(&(unit, ran)) if ran.at(place) => (unit, Basis::Place),
+            Some(&(unit, _)) => (unit, Basis::Pairs),
+            None => (self.coarse.get(coarse).copied().or(self.median)?, Basis::Size),
+        };
         let load = if loaded { slope * x(load_c) } else { 0. };
-        Some((unit + effect + load).exp() as u64)
+        Some(((unit + effect + load).exp() as u64, basis))
     }
 }
 
@@ -282,7 +311,7 @@ mod test {
 
     fn predict(fit: &Fit, name: &str, at: PlaceId, load_c: u32) -> u64 {
         let u = unit(name);
-        fit.predict_us(&u.exact, &u.coarse, at, load_c, true).unwrap()
+        fit.predict_us(&u.exact, &u.coarse, at, load_c, true).unwrap().0
     }
 
     fn near(got: u64, want: u64) -> bool {
@@ -396,7 +425,7 @@ mod test {
         let at = |load_c| predict(&fit, "u5:1", b, load_c);
         assert!(near(at(0), 1_500_000) && near(at(300), 6_000_000), "{} {}", at(0), at(300));
         let u = unit("u5:1");
-        assert_eq!(fit.predict_us(&u.exact, &u.coarse, b, 300, false), Some(at(0)), "without its slope");
+        assert_eq!(fit.predict_us(&u.exact, &u.coarse, b, 300, false).map(|p| p.0), Some(at(0)), "without its slope");
     }
 
     #[test]
