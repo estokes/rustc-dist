@@ -2,14 +2,15 @@
 
 Build Rust on every machine you own.
 
-rustc-dist is a cargo `rustc-wrapper` plus a small daemon on each box. The
-daemon decides where each rustc cargo starts should run: which cores on this
-box, or another machine when that one would finish it sooner. Boxes find each
-other and trade work over [netidx](https://github.com/netidx/netidx). Work on
-a laptop and let the desktops in the house do the compiling.
+rustc-dist is a cargo `rustc-wrapper` that distributes rust compile jobs across
+a cluster of machines. Discovery, communication, and security are handled by
+[netidx](https://github.com/netidx/netidx); if you already have a netidx domain,
+setup is simple. Jobs are placed where they are predicted to finish the fastest,
+and the daemon learns from run history and accounts for network latency. Work on
+battery and watch the heavy compile jobs migrate to a desktop or a cloud server.
 
-It is not a cache. Every job is compiled, just on the core or machine where
-it finishes soonest.
+Unlike sccache it is not a cache, every compile job runs, and toolchains are
+not transferred.
 
 ## Results
 
@@ -20,13 +21,12 @@ once, such as eight coding agents in their own checkouts all compiling
 together.
 
 Cargo alone doesn't handle that. Each cargo sizes its jobserver to the whole
-box and knows nothing of the others. Builds that share a target directory
-wait on its lock; builds in separate ones run side by side, with up to eight
-times as many rustc threads as the box has CPUs, and the memory to match.
-(A jobserver inherited from a parent `make` would be shared, but separately
-started agents have none.) With rustc-dist, every rustc on the box, from any
-cargo, holds one of the daemon's tokens, 1.5 per CPU, admitted by predicted
-memory, critical path first. Work beyond that goes to other boxes.
+box and knows nothing of the others. Builds that share a target directory wait
+on its lock; builds in separate ones run side by side, with many agents rustc
+threads overcommit the box and thrash. With rustc-dist, every rustc on the box,
+from any cargo, holds one of the daemon's tokens (default 1.5 per CPU). Work
+always goes where it's predicted to finish fastest, but when total work exceeds
+capacity overcommit is limited and thrashing is eliminated.
 
 In daily use, with several agents building their own checkouts of
 [graphix](https://github.com/graphix-lang/graphix), the fastest desktop does
@@ -44,15 +44,16 @@ desktops on the same LAN:
 | fastest desktop alone, plain cargo | 1m 19s |
 
 The laptop's own speed hardly matters: a build from it finishes about as fast
-as one on the fastest box.
+as one on the fastest box, and a surge of many agents compiling at once will
+utilize all three boxes efficiently.
 
 ## What it does
 
 On one box:
 
 - **Core classes.** It calibrates each class of cores (performance,
-  efficiency, low-power) for each power profile, and hands out each class's
-  jobserver tokens.
+  efficiency, low-power) for each power profile, and schedules jobs on the
+  slowest core that will finish fast enough not to bottleneck the build.
 - **Critical path first.** It records the build graph, so the jobs most work
   waits on get the fast cores. Jobs with time to spare take slow cores, but
   never wait for one while a faster core sits idle. Jobs that use several
