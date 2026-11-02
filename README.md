@@ -15,9 +15,31 @@ it finishes soonest.
 
 ## Results
 
-A clean dev build of [graphix](https://github.com/graphix-lang/graphix) (about 650
-crates), launched from a laptop. The farm was the laptop plus two desktops on
-the same LAN:
+The point isn't to make one build faster. How much a single build gains
+depends on its crate graph: a chain of crates that each wait on the last runs
+no faster on more machines. The point is having the capacity, and using it
+well, when many builds want it at once: eight coding agents, each in its own
+checkout, all compiling at the same moment.
+
+Cargo alone doesn't handle that. Each cargo sizes its jobserver to the whole
+box and knows nothing of the others. Builds that share a target directory
+wait on its lock. Builds in separate target directories run side by side,
+with up to eight times as many rustc threads as the box has CPUs, and the
+memory to match. (Cargo can share a jobserver inherited from a parent `make`,
+but agents started separately don't have one.) With rustc-dist, every rustc
+on the box, from any cargo, holds a token from the one daemon: 1.5 per CPU
+(`tokens_per_cpu`), admitted by predicted memory, critical path first. Work
+beyond that goes to boxes with capacity to spare.
+
+In daily use, with several agents each building its own checkout of
+[graphix](https://github.com/graphix-lang/graphix), the farm settled into a
+pattern: the fastest desktop does most of the compiling, the laptop runs the
+tests, and the other desktop takes the surges when three or more agents build
+at once. Our estimate is that agentic work got at least twice as fast.
+
+One build on its own: a clean dev build of graphix (about 650 crates),
+launched from a laptop. The farm was the laptop plus two desktops on the same
+LAN:
 
 | | wall time |
 |---|---|
