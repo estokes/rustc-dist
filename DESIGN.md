@@ -445,6 +445,144 @@ daemon can't read, such as one a later version wrote, is moved aside to
 `jobs.hdr.unreadable` (or `.unreadable.2`, and so on, never over one already
 there), with an error in the log, and the daemon starts with an empty table.
 
+## Speeds from pairs of runs (proposed 2026-11-02)
+
+Every job is a calibration load. A unit that ran at two places says how fast
+one is against the other, whatever its size, and the table holds thousands
+of such pairs. This replaces how places learn their speed (the curves and
+comparisons in Cost); sends, memory and the build graph stay as they are.
+
+### Why
+
+The sizes units learn and the speeds places learn drift apart together.
+Between 10:05 and 12:41 on 2026-11-02, under the code then deployed:
+
+| unit | work at 10:05 | work at 12:41 | measured wall, 10:05 → 12:41 |
+|---|---|---|---|
+| syn (`78fcc1f5`) | 9.68 s | 22.89 s | 2.61 → 2.25 s |
+| object | 3.22 s | 9.59 s | 1.98 → 1.90 s |
+| chrono | 3.09 s | 9.40 s | 0.70 → 0.69 s |
+| cc | 4.06 s | 10.56 s | 1.01 → 0.93 s |
+
+Status meanwhile put ryouko's light jobs at 5.78 times this box's class 0
+idle, up from 1.55, and this box's heavy jobs at 4.46 a thread.
+
+A prediction is a unit's size times a place's factor, so only their product
+is fixed by the runs: every size twice as big and every factor half as big
+predicts the same. The calibration was to hold the scale, but its weight is
+small against the runs, an idle bucket that has runs has no anchor at all,
+and each bucket keeps only its last 32 comparisons. And a comparison
+measures a run against the unit's size, which is learned from the same runs,
+so a skewed stretch of comparisons moves sizes and factors in step. Runs on
+other boxes still come out right, size times factor, but this box's classes
+stay near their calibration, so here the inflated sizes come straight
+through: graphix_tests was predicted at 1,727 s here against 135 s on
+ryouko. Work is priced off this box, ranks stretch, and status's speeds mean
+nothing.
+
+### The model
+
+A run's time `t` (start to exit, less any wait for late rlibs, as now) at
+place `p` is
+
+    log t = a(unit) + b(p) + s(p) · log(1 + load/100)
+
+- `a(unit)`, the unit's effect, is the log of its work: millions of
+  instructions at the reference speed below.
+- `b(p)`, the place's effect, is the log of µs per million instructions
+  there.
+- `s(p)` is how much the place slows with its load, the mean runnable tasks
+  per CPU while the run ran. It is fitted for other boxes only and is 0 here
+  (see Proving it).
+
+Two runs of one unit at `p` and `q` differ by `b(p) - b(q)` and the loads:
+the unit's size cancels. So place effects come from pairs alone, and unit
+sizes can't feed back into them.
+
+### Fitting
+
+A weighted median polish over every run kept (each unit's last 16): set each
+place's effect to the weighted median of its runs' times less their units'
+effects, then each unit's to the weighted median of its runs' times less
+their places' effects, and repeat, ten rounds. Medians, so no single run,
+however long, moves an effect. For other boxes, each round also fits `s(p)`
+as the Theil-Sen slope of the place's residuals against load. Weights halve
+every `half_life_s`, a day, for units and places alike.
+
+The scale is held by the reference, this box's fastest class in its current
+profile: its effect is fixed at its calibration. Every other place's
+calibration counts as 8 runs that never age, placed at its calibrated µs
+per million instructions, so a place with few pairs stays near it and one
+with many follows its runs. An all-CPUs place starts at its fastest class's
+rate, as if single-threaded. A unit's effect is then its typical time at the
+reference, which is what status shows as work.
+
+A unit with no runs falls back to its coarse key, then to the median unit.
+Each profile keeps its own places, as now; one never used starts at its
+calibration.
+
+The daemon refits on a blocking thread every minute and after a calibration
+or profile switch, and placement reads the latest fit. In Python a fit of
+25,000 runs takes half a second.
+
+Width, the tokens a job holds after its front end, is still measured per
+unit: it decides light or heavy and the load a job adds. It no longer enters
+a job's time, which the place effect carries. The placement log's bases
+become `[own]` (the unit ran at the place), `[pairs]` (it ran elsewhere) and
+`[est]` (it never ran). The table (`rdstat12`) drops the curves; an rdstat11
+table loads its runs and sends without them.
+
+### Exploring (second stage)
+
+A place a unit never ran at is predicted from other units' pairs, and is
+less certain than one it did. With `explore` on (off by default), such a
+place is made to look faster by its typical miss: the median absolute
+residual of its runs, over `√(n+1)` for `n` runs of the unit there. That
+applies only where the job, at the prediction without the bonus, still
+finishes within its slack, and the place has a token free. So exploring
+spends idle capacity and time the build had to spare, and an idle box like
+aieka, whose heavy runs on 2026-11-02 took two thirds of what was predicted,
+gets jobs to learn from. The placement log marks such a choice `[explore]`.
+
+### Proving it
+
+An offline prototype read `jobs.hdr` and the placement log of 2026-11-02.
+Fitted on the runs before each ten-minute window from 10:20 to 12:41, it
+predicted that window's runs of at least 0.5 s, against what the daemon
+predicted when it placed them (1,367 runs every variant covers; error as
+actual over predicted, either way):
+
+| | median | p90 | within 25% |
+|---|---|---|---|
+| daemon | ×1.26 | ×2.63 | 49% |
+| pairs | ×1.23 | ×2.22 | 53% |
+| here, daemon | ×1.66 | ×4.02 | 23% |
+| here, pairs | ×1.46 | ×3.18 | 28% |
+| new to the place, daemon | ×1.64 | ×4.07 | 24% |
+| new to the place, pairs | ×1.49 | ×3.04 | 29% |
+| remote, daemon | ×1.16 | ×1.64 | 64% |
+| remote, pairs with load | ×1.13 | ×1.60 | 70% |
+
+Splitting front end from the rest gained nothing, and a unit memory of an
+hour instead of a day did worse: edits don't drive the noise, sample size
+does. A load term helped other boxes and hurt this one, even fed the load
+measured during each run: test runs that start after a job is placed decide
+this box's load. So this box doesn't react to its own load in this design,
+and `light_jobs_wait_for_a_busy_box_rather_than_run_slower_here` goes; an
+open question is whether a measure of load other than runnable tasks would
+predict here. Fitted at 10:20, 11:00, 11:40, 12:20 and 12:41, ryouko's
+class sat at 2.28, 2.29, 2.20 and 2.20 times this box's class 0 from 11:00
+on, aieka's at 1.36 to 1.31, and syn's work at 3.1 to 2.9 s.
+
+Before it decides anything, the daemon fits the pair model beside the
+current one and logs both predictions on each placement line for a day;
+it switches when the pairs predict better on that day's runs. Tests: scaling
+every run's time at every place leaves predictions where they were and
+moves only the units' effects; a place's effect comes from pairs whatever
+the units' sizes; a place with few pairs stays near its calibration;
+refitting unchanged runs moves nothing; an rdstat11 table loads without its
+curves.
+
 ## Build graph
 
 Builds replay nearly the same trace, so the daemon learns which jobs read
