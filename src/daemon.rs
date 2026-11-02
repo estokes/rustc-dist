@@ -562,14 +562,16 @@ async fn run_remote(
     drop(handle);
     match outcome {
         Ok((link_us, Outcome::Exit { code: 0, ran, measured, moved })) => {
-            let Moved { bytes, wire_bytes, linker_waited_us, kept, steps } = moved;
+            let Moved { sent, received, linker_waited_us, kept, steps } = moved;
             let copy_us = (start.elapsed().as_micros() as u64).saturating_sub(ran.wall_us) + linker_waited_us;
             let links = job.reads != Reads::Metadata;
-            let transfer = Transfer { sent_kb: bytes / 1024, copy_ms: copy_us / 1000, links };
+            let (sent_kb, received_kb) = (sent.raw / 1024, received.raw / 1024);
+            let transfer = Transfer { sent_kb, received_kb, copy_ms: copy_us / 1000, links };
             let ms = |us: u64| us / 1000;
             info!(
                 "{} on {}: compiled in {} ms, moving files took {} ms: staging {} (hashing {} MB {}), link {}, \
-                 offer {}, manifest {}, sending {} kB as {} kB {}, setup and outputs {} ms, linker waited {} ms",
+                 offer {}, manifest {}, sending {} kB as {} kB {}, setup and outputs {} ms (receiving {} kB as {} kB), \
+                 linker waited {} ms",
                 r.unit().exact,
                 r.jobs,
                 ms(ran.wall_us),
@@ -580,10 +582,12 @@ async fn run_remote(
                 ms(link_us),
                 ms(steps.offer_us),
                 ms(steps.manifest_us),
-                transfer.sent_kb,
-                wire_bytes / 1024,
+                sent_kb,
+                sent.wire / 1024,
                 ms(steps.send_us),
                 ms(steps.run_us.saturating_sub(ran.wall_us)),
+                received_kb,
+                received.wire / 1024,
                 ms(linker_waited_us)
             );
             r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us, transfer, kept }));

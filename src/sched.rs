@@ -9,7 +9,7 @@ use crate::{
         Unit, UnitStatus, frame,
     },
     remote::{self, CrateFiles},
-    stats::{self, Basis, Decay, Origin, PlaceId, Prediction, Run, Stats, Transfer},
+    stats::{self, Basis, Decay, Moving, Origin, PlaceId, Prediction, Run, Stats, Transfer},
     sys::{self, BoxMemory},
 };
 use anyhow::{Context, Result};
@@ -840,8 +840,46 @@ enum Place {
     Spread { layout: LayoutId, class: usize },
     /// On another box, pinned to `class` or, with none, on every CPU.
     /// `shown_in` is the version of the box's state that first counts the
-    /// job, known once the box accepts it.
-    Remote { remote: usize, class: Option<usize>, shown_in: Option<u64> },
+    /// job, known once the box accepts it. Its files keep this box's link
+    /// busy for `moves`.
+    Remote { remote: usize, class: Option<usize>, shown_in: Option<u64>, moves: Moves },
+}
+
+/// How long a job sent to another box keeps this box's link busy with its
+/// inputs, from when it is sent, and with its outputs, until it ends. Every
+/// job this box sends shares the one link.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Moves {
+    inputs_us: u64,
+    outputs_us: u64,
+}
+
+/// When a job's files cross the link, in µs from now: two spans, or one
+/// and an empty one.
+type Spans = [(i64, i64); 2];
+
+impl Moves {
+    /// Its spans if it is sent at `sent` and ends at `end`, one if its
+    /// inputs and outputs meet.
+    fn spans(self, sent: i64, end: i64) -> Spans {
+        let inputs = (sent, sent + self.inputs_us as i64);
+        let outputs = ((end - self.outputs_us as i64).max(sent), end.max(sent));
+        if outputs.0 <= inputs.1 { [(sent, inputs.1.max(outputs.1)), (0, 0)] } else { [inputs, outputs] }
+    }
+}
+
+/// The µs spans `a` and `b` overlap.
+fn overlap_us(a: &Spans, b: &Spans) -> u64 {
+    a.iter().flat_map(|x| b.iter().map(move |y| (x.1.min(y.1) - x.0.max(y.0)).max(0) as u64)).sum()
+}
+
+/// What moving a job's files costs with the link shared: its own moving,
+/// plus, while its files cross, the time the link spends on those of the
+/// jobs `crossing` it, if it is sent at `start_us` and runs `run_us`.
+fn shared(crossing: &[Spans], m: Moving, start_us: u64, run_us: u64) -> (u64, Moves) {
+    let moves = Moves { inputs_us: m.inputs_us, outputs_us: m.outputs_us };
+    let mine = moves.spans(start_us as i64, (start_us + m.copy_us + run_us) as i64);
+    (m.copy_us + crossing.iter().map(|o| overlap_us(&mine, o)).sum::<u64>(), moves)
 }
 
 impl Place {
@@ -1752,6 +1790,16 @@ impl Sched {
         // Set once a job can neither fit here nor go to another box. Later
         // jobs don't run here either, so smaller ones can't starve it.
         let mut mem_blocked = false;
+        // When the files of the jobs this box has sent cross its link,
+        // joined by those this dispatch sends.
+        let mut crossing: LPooled<Vec<Spans>> = LPooled::take();
+        crossing.extend(self.running.iter().filter_map(|r| match r.place {
+            Place::Remote { moves, .. } => {
+                let sent = -(now.duration_since(r.start).as_micros() as i64);
+                Some(moves.spans(sent, r.left_us(now) as i64))
+            }
+            Place::Local { .. } | Place::Spread { .. } => None,
+        }));
         let mut cands: LPooled<Vec<Cand>> = LPooled::take();
         let logging = log_enabled!(target: "placement", Level::Debug);
         let mut granted: LPooled<Vec<(usize, Place, u64, PlaceId)>> = LPooled::take();
@@ -1796,10 +1844,11 @@ impl Sched {
                                 None => continue,
                             },
                         };
-                        let place = Place::Remote { remote: r, class: Some(k), shown_in: None };
                         let load_c = if waits { state.load_c } else { load_there[r] };
                         let Estimate { spot, run_us, basis } = self.estimate(&w.unit, (at, true, cpus), load_c, waits);
-                        let copy_us = self.stats.copy_us(&w.unit, at, links, missing_kb);
+                        let moving = self.stats.moving(&w.unit, at, links, missing_kb);
+                        let (copy_us, moves) = shared(&crossing, moving, frees_in_us, run_us);
+                        let place = Place::Remote { remote: r, class: Some(k), shown_in: None, moves };
                         cands.push(Cand { start_us: frees_in_us, copy_us, run_us, spot, place, queue: None, basis });
                     }
                 }
@@ -1829,12 +1878,11 @@ impl Sched {
                 for (r, rb) in self.remotes.iter().enumerate() {
                     let Ok((state, places)) = away.and_then(|p| rb.usable(p)) else { continue };
                     let cpus = state.classes.iter().map(|c| c.cpus as u64).sum();
-                    let place = Place::Remote { remote: r, class: None, shown_in: None };
                     let waits = rb.avail.iter().all(|&n| n == 0);
                     let load_c = if waits { state.load_c } else { load_there[r] };
                     let Estimate { spot, run_us, basis } = self.estimate(&w.unit, (places.all, false, cpus), load_c, waits);
                     let missing_kb = away.map_or(0, |p| rb.held.missing_kb(&p.inputs));
-                    let copy_us = self.stats.copy_us(&w.unit, places.all, links, missing_kb);
+                    let moving = self.stats.moving(&w.unit, places.all, links, missing_kb);
                     // A busy box is worth waiting for if it finishes the job
                     // sooner than anywhere free; with no history to say so,
                     // the job doesn't wait for one.
@@ -1846,6 +1894,8 @@ impl Sched {
                         false => None,
                     };
                     if let Some((start_us, queue)) = start {
+                        let (copy_us, moves) = shared(&crossing, moving, start_us, run_us);
+                        let place = Place::Remote { remote: r, class: None, shown_in: None, moves };
                         cands.push(Cand { start_us, copy_us, run_us, spot, place, queue, basis });
                     }
                 }
@@ -1866,7 +1916,7 @@ impl Sched {
                 first_here = false;
             }
             match place {
-                Place::Remote { remote, class, .. } => {
+                Place::Remote { remote, class, moves, .. } => {
                     let RemoteBox { state, avail, .. } = &mut self.remotes[remote];
                     let waits = match class {
                         Some(k) => avail.get(k).is_none_or(|&n| n == 0),
@@ -1890,6 +1940,7 @@ impl Sched {
                     let unseen = &mut self.remotes[remote].unseen_left_us;
                     *unseen = Some(unseen.map_or(run_us, |t| t.min(run_us)));
                     load_there[remote] += spot.adds;
+                    crossing.push(moves.spans(0, run_us as i64));
                     if let Some(line) = line {
                         debug!(target: "placement", "{}", line.as_str());
                     }
@@ -1934,7 +1985,7 @@ impl Sched {
                     };
                     let _ = w.reply.send(admission);
                 }
-                Place::Remote { remote, class, .. } => self.send_remote(w, remote, class, at, run_us, now),
+                Place::Remote { remote, class, moves, .. } => self.send_remote(w, (remote, class, moves), at, run_us, now),
             }
         }
     }
@@ -2030,7 +2081,7 @@ impl Sched {
             }
         }
         for r in &self.running {
-            let Place::Remote { remote, class, shown_in } = r.place else { continue };
+            let Place::Remote { remote, class, shown_in, .. } = r.place else { continue };
             let RemoteBox { state: Some((state, _)), avail, unseen_left_us, .. } = &mut self.remotes[remote]
             else {
                 continue;
@@ -2092,14 +2143,21 @@ impl Sched {
 
     /// Send `w` to another box, where it runs at `at` and is predicted to
     /// take `run_us`, moving its files included.
-    fn send_remote(&mut self, w: Waiting, remote: usize, class: Option<usize>, at: PlaceId, run_us: u64, now: Instant) {
+    fn send_remote(
+        &mut self,
+        w: Waiting,
+        (remote, class, moves): (usize, Option<usize>, Moves),
+        at: PlaceId,
+        run_us: u64,
+        now: Instant,
+    ) {
         let rb = &self.remotes[remote];
         debug!("sending {} to {} class {class:?}", w.unit.exact, rb.name);
         let job = JobId::new();
         self.running.push(Running {
             job,
             build: Some(w.build),
-            place: Place::Remote { remote, class, shown_in: None },
+            place: Place::Remote { remote, class, shown_in: None, moves },
             at,
             run_us,
             mem_kb: 0,
@@ -2475,7 +2533,7 @@ mod test {
             place: if here {
                 Place::Spread { layout: LayoutId::new(), class: 0 }
             } else {
-                Place::Remote { remote: 0, class: None, shown_in: None }
+                Place::Remote { remote: 0, class: None, shown_in: None, moves: Moves::default() }
             },
         };
         // No history: where it finishes soonest of the places with a token
@@ -3138,7 +3196,7 @@ mod test {
         let wall_us = wall_ms * 1000;
         let ran = Ran { wall_us, maxrss_kb: 1, front: None };
         let measured = Measured { tokens_us: wall_us, load_c: 0 };
-        let transfer = Transfer { sent_kb: 1, copy_ms, links: false };
+        let transfer = Transfer { sent_kb: 1, received_kb: 0, copy_ms, links: false };
         r.finish(RemoteOutcome::Done(SentRun { ran, measured, linker_waited_us: 0, transfer, kept: vec![] }));
         while let Ok(msg) = rx.try_recv() {
             s.handle(msg).unwrap();
@@ -3175,6 +3233,55 @@ mod test {
         Ok(())
     }
 
+    #[test]
+    fn a_jobs_files_cross_the_link_from_when_it_is_sent_and_until_it_ends() {
+        let m = Moves { inputs_us: 100, outputs_us: 50 };
+        assert_eq!(m.spans(0, 1000), [(0, 100), (950, 1000)]);
+        assert_eq!(m.spans(0, 120), [(0, 120), (0, 0)], "they meet: one span");
+        assert_eq!(m.spans(-50, 500), [(-50, 50), (450, 500)], "sent before now");
+        assert_eq!(overlap_us(&m.spans(0, 1000), &m.spans(0, 1000)), 150);
+        assert_eq!(overlap_us(&m.spans(0, 1000), &Moves::default().spans(0, 1000)), 0, "nothing to move");
+    }
+
+    #[tokio::test]
+    async fn jobs_sent_at_once_share_the_link() -> Result<()> {
+        let dir = scratch("share-link");
+        let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room(u64::MAX), &[], &[])?;
+        // 2 s here, 0.4 s on b. Sends there move 10 µs a kB: "big" gets
+        // 100 MB back, a second of the link; "small" gets 1 MB back.
+        s.farm("b".into(), Some(remote_box(200, 32, 32, 1)));
+        let at = s.remotes[0].state.as_ref().unwrap().1.classes[0];
+        for (name, received_kb, copy_ms) in [("big", 100_000, 1000), ("small", 1000, 10)] {
+            history(&mut s, name, 2_000_000, 100);
+            for _ in 0..4 {
+                let transfer = Transfer { sent_kb: 0, received_kb, copy_ms, links: false };
+                let run = Run {
+                    place: at,
+                    load_c: 0,
+                    wall_us: 400_000,
+                    front_us: None,
+                    tokens_us: 400_000,
+                    mem_kb: 1,
+                    origin: Origin::Sent(transfer),
+                };
+                s.stats.record(&unit(name, &[]), &run);
+            }
+        }
+        let sent = |rx: Vec<oneshot::Receiver<Admission>>| {
+            rx.into_iter().map(|mut rx| matches!(rx.try_recv(), Ok(Admission::Remote(_)))).collect::<Vec<_>>()
+        };
+        // The first big one goes: 1.4 s there against 2 here. The next would
+        // get its 100 MB back while the first does, 2.4 s, so it stays.
+        assert_eq!(sent(place(&mut s, &["big", "big", "big"], true)), [true, false, false]);
+        // While the first is on its way, a fourth stays too.
+        assert_eq!(sent(place(&mut s, &["big"], true)), [false]);
+        // A megabyte each barely shares the link, even with the big one's.
+        assert_eq!(sent(place(&mut s, &["small", "small", "small"], true)), [true, true, true]);
+        drop(s);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_librarys_first_send_is_not_charged_what_links_took() -> Result<()> {
         let dir = scratch("copy-kinds");
@@ -3183,7 +3290,7 @@ mod test {
         s.farm("b".into(), Some(remote_box(200, 4, 4, 1)));
         history(&mut s, "lib", 5_000_000, 100);
         let at = s.remotes[0].state.as_ref().unwrap().1.classes[0];
-        let transfer = Transfer { sent_kb: 300_000, copy_ms: 10_000, links: true };
+        let transfer = Transfer { sent_kb: 300_000, received_kb: 0, copy_ms: 10_000, links: true };
         let run = Run {
             place: at,
             load_c: 0,
@@ -3261,7 +3368,7 @@ mod test {
             basis,
         };
         let here = Place::Spread { layout: s.layout.id, class: 0 };
-        let b = Place::Remote { remote: 0, class: None, shown_in: None };
+        let b = Place::Remote { remote: 0, class: None, shown_in: None, moves: Moves::default() };
         let cands = [cand(0, 0, 5_000_000, here, Basis::Place), cand(250_000, 400_000, 1_000_000, b, Basis::Size)];
         let (job, stays) = (&s.queue[0], &s.queue[1]);
         let away = job.portable.as_ref().map_err(|why| anyhow::anyhow!("{why}"))?;
@@ -3336,7 +3443,7 @@ mod test {
         // What it measured is a send there.
         s.handle(Msg::Heartbeat { name: "b".into(), kb: 1024, us: 50_000 })?;
         let at = s.remotes[0].state.as_ref().unwrap().1.all;
-        assert_eq!(s.stats.copy_us(&unit("big", &[]), at, false, 1024), 50_000);
+        assert_eq!(s.stats.moving(&unit("big", &[]), at, false, 1024).copy_us, 50_000);
         drop(s);
         fs::remove_dir_all(&dir)?;
         Ok(())
@@ -3777,7 +3884,7 @@ mod test {
         let Admission::Remote(r) = admitted(h.submit_with("big", want())).await? else {
             bail!("not sent remote");
         };
-        let transfer = Transfer { sent_kb: 300, copy_ms: 40, links: false };
+        let transfer = Transfer { sent_kb: 300, received_kb: 0, copy_ms: 40, links: false };
         let measured = Measured::default();
         r.finish(RemoteOutcome::Done(SentRun { ran: ran(), measured, linker_waited_us: 0, transfer, kept: vec![] }));
         let st = h.status().await;

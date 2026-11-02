@@ -640,13 +640,21 @@ struct Exited {
     linker_waited_us: u64,
     measured: Measured,
     built: Vec<(Hash, u64)>,
+    received: Volume,
+}
+
+/// Bytes of files, and as they crossed the wire.
+#[derive(Default, Clone, Copy)]
+pub struct Volume {
+    pub raw: u64,
+    pub wire: u64,
 }
 
 /// What moving a job's files took that compiling didn't.
 pub struct Moved {
-    /// Of inputs sent, and those bytes as sent.
-    pub bytes: u64,
-    pub wire_bytes: u64,
+    /// Of inputs sent, and of outputs received.
+    pub sent: Volume,
+    pub received: Volume,
     /// How long the linker waited for rlibs still on their way.
     pub linker_waited_us: u64,
     /// The crate files the server holds after the job, by hash with their
@@ -728,7 +736,7 @@ pub async fn run(
     });
     let mut receiving = pin!(receive(&mut inbox, &link.jobs, staged, hashes, &mut sink));
     let mut sending_done = false;
-    let Exited { code, ran, linker_waited_us, measured, built } = loop {
+    let Exited { code, ran, linker_waited_us, measured, built, received } = loop {
         tokio::select! {
             exit = &mut receiving => break exit.context("receiving outputs")?,
             r = &mut sending, if !sending_done => {
@@ -738,9 +746,9 @@ pub async fn run(
         }
     };
     let kept = staged.crates(&asked).chain(built).collect();
-    let (bytes, wire_bytes) = (sent.raw.load(Ordering::Relaxed), sent.wire.load(Ordering::Relaxed));
+    let sent = Volume { raw: sent.raw.load(Ordering::Relaxed), wire: sent.wire.load(Ordering::Relaxed) };
     let steps = Steps { offer_us, manifest_us, send_us, run_us: lap() };
-    let moved = Moved { bytes, wire_bytes, linker_waited_us, kept, steps };
+    let moved = Moved { sent, received, linker_waited_us, kept, steps };
     Ok(Outcome::Exit { code, ran, measured, moved })
 }
 
@@ -825,10 +833,13 @@ async fn receive(
 ) -> Result<Exited> {
     let mut writing: Option<Writing> = None;
     let mut built = Vec::new();
+    let mut received = Volume::default();
     loop {
         match inbox.recv().await? {
             FromServer::Output { path, mode, data, part } => {
+                received.wire += data.wire_len() as u64;
                 let data = data.unpack()?;
+                received.raw += data.len() as u64;
                 let w = match &mut writing {
                     Some(w) => w,
                     None => {
@@ -856,7 +867,7 @@ async fn receive(
             }
             FromServer::Stdout(data) => sink(Event::Stdout(data))?,
             FromServer::Exit { code, ran, linker_waited_us, measured } => {
-                return Ok(Exited { code, ran, linker_waited_us, measured, built });
+                return Ok(Exited { code, ran, linker_waited_us, measured, built, received });
             }
             FromServer::Failed(why) => bail!("{jobs}: {why}"),
             m => bail!("{jobs}: unexpected {m:?}"),

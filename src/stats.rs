@@ -62,7 +62,9 @@ const COPY_US: f64 = 200_000.;
 /// Predicted size, in millions of instructions, of a job when nothing at
 /// all has been recorded.
 const UNKNOWN_COST_MI: u64 = 1000;
-const MAGIC: &[u8; 8] = b"rdstat10";
+const MAGIC: &[u8; 8] = b"rdstat11";
+/// A table whose sends counted only the kB they sent, which are dropped.
+const SENT_ONLY_MAGIC: &[u8; 8] = b"rdstat10";
 /// A table whose runs are work at their place's calibration.
 const WORK_MAGIC: &[u8; 8] = b"rdstats9";
 /// A table of decayed sums, read as one sample for each sum.
@@ -197,6 +199,8 @@ impl Origin {
 #[derive(Clone, Copy)]
 pub struct Transfer {
     pub sent_kb: u64,
+    /// Of its outputs.
+    pub received_kb: u64,
     /// The time it spent other than compiling: staging and sending inputs,
     /// its linker waiting for rlibs, receiving the last outputs.
     pub copy_ms: u64,
@@ -232,12 +236,20 @@ struct Comparison {
     weight: f64,
 }
 
-/// What a send spent other than compiling, and the kB it sent.
+/// What a send spent other than compiling, and the kB it sent and got
+/// back.
 #[derive(Clone, Copy)]
 struct Send {
     at: f64,
     copy_us: f64,
-    kb: f64,
+    in_kb: f64,
+    out_kb: f64,
+}
+
+impl Send {
+    fn kb(&self) -> f64 {
+        self.in_kb + self.out_kb
+    }
 }
 
 /// A class of a box, where light jobs run, or all of a box's CPUs, where
@@ -372,9 +384,9 @@ impl Place {
             slopes.clear();
             slopes.push((SEND_US_PER_KB, 1.));
             for (i, a) in sends.iter().enumerate() {
-                for b in sends.iter().skip(i + 1).filter(|b| (b.kb - a.kb).abs() >= SLOPE_MIN_KB) {
+                for b in sends.iter().skip(i + 1).filter(|b| (b.kb() - a.kb()).abs() >= SLOPE_MIN_KB) {
                     let w = keep(a.at, now, half_life_s) * keep(b.at, now, half_life_s);
-                    slopes.push(((b.copy_us - a.copy_us) / (b.kb - a.kb), w));
+                    slopes.push(((b.copy_us - a.copy_us) / (b.kb() - a.kb()), w));
                 }
             }
             *per_kb = median(&mut slopes).unwrap_or(SEND_US_PER_KB).max(0.);
@@ -542,6 +554,16 @@ pub struct Prediction {
     pub known: bool,
 }
 
+/// What a sent run is predicted to spend other than compiling, and of
+/// that, its inputs' and its outputs' time on the link at the place's µs
+/// per kB.
+#[derive(Debug, Clone, Copy)]
+pub struct Moving {
+    pub copy_us: u64,
+    pub inputs_us: u64,
+    pub outputs_us: u64,
+}
+
 impl Prediction {
     pub fn cost_mi(&self) -> u64 {
         self.front_mi + self.rest_mi
@@ -690,30 +712,46 @@ impl Stats {
         ((front + rest) * p.factor(load_c)) as u64
     }
 
-    /// Predicted µs a run of `unit` sent to `place`, where it must send
-    /// `missing_kb`, spends other than compiling: the weighted median of
-    /// its own sends there while they weigh at least `OWN_WEIGHT` fresh
-    /// sends, else of those of every job there that links as it does or
-    /// doesn't, else a guess, each adjusted for sending more or fewer kB
-    /// than it did at the µs per kB sends there show.
-    pub fn copy_us(&self, unit: &Unit, place: PlaceId, links: bool, missing_kb: u64) -> u64 {
-        let half_life_s = self.decay.copy_half_life_s;
+    /// What a run of `unit` sent to `place`, where it must send
+    /// `missing_kb`, is predicted to spend other than compiling: the
+    /// weighted median of its own sends there while they weigh at least
+    /// `OWN_WEIGHT` fresh sends, else of those of every job there that
+    /// links as it does or doesn't, else a guess, each adjusted for moving
+    /// more or fewer kB than it did at the µs per kB sends there show. It
+    /// gets back what its own sends got back, wherever they went, or with
+    /// none what each send it is judged by did.
+    pub fn moving(&self, unit: &Unit, place: PlaceId, links: bool, missing_kb: u64) -> Moving {
+        let (now, half_life_s) = (self.now, self.decay.copy_half_life_s);
         let p = &self.places[place.0 as usize];
         let per_kb = p.per_kb[usize::from(links)];
-        let at = |s: &Send, now: f64| (s.copy_us + per_kb * (missing_kb as f64 - s.kb), keep(s.at, now, half_life_s));
+        let sends = self.exact.get(&unit.exact).map(|r| &r.sends);
         let mut samples: LPooled<Vec<(f64, f64)>> = LPooled::take();
-        let own = self.exact.get(&unit.exact).into_iter().flat_map(|r| &r.sends).filter(|s| s.place == place);
-        samples.extend(own.map(|s| at(&s.send, self.now)));
+        samples.extend(sends.into_iter().flatten().map(|s| (s.send.out_kb, keep(s.send.at, now, half_life_s))));
+        let out_kb = median(&mut samples);
+        let at = |s: &Send, now: f64| {
+            let kb = missing_kb as f64 + out_kb.unwrap_or(s.out_kb);
+            (s.copy_us + per_kb * (kb - s.kb()), keep(s.at, now, half_life_s))
+        };
+        samples.clear();
+        samples.extend(sends.into_iter().flatten().filter(|s| s.place == place).map(|s| at(&s.send, now)));
+        let place_sends = &p.sends[usize::from(links)];
         if samples.iter().map(|(_, w)| w).sum::<f64>() < OWN_WEIGHT {
-            let sends = &p.sends[usize::from(links)];
             // A median doesn't move when every weight scales, so weighing
             // from the newest send gives what weighing from now would, and
             // still works where weights from now would all round to 0.
-            let newest = sends.iter().map(|s| s.at).fold(f64::NEG_INFINITY, f64::max);
+            let newest = place_sends.iter().map(|s| s.at).fold(f64::NEG_INFINITY, f64::max);
             samples.clear();
-            samples.extend(sends.iter().map(|s| at(s, newest)));
+            samples.extend(place_sends.iter().map(|s| at(s, newest)));
         }
-        median(&mut samples).unwrap_or(COPY_US + per_kb * missing_kb as f64).max(0.) as u64
+        let copy_us = median(&mut samples).unwrap_or(COPY_US + per_kb * missing_kb as f64).max(0.) as u64;
+        let out_kb = out_kb.or_else(|| {
+            // Heartbeats get nothing back.
+            samples.clear();
+            samples.extend(place_sends.iter().filter(|s| s.out_kb > 0.).map(|s| (s.out_kb, keep(s.at, now, half_life_s))));
+            median(&mut samples)
+        });
+        let us = |kb: f64| (per_kb * kb) as u64;
+        Moving { copy_us, inputs_us: us(missing_kb as f64), outputs_us: us(out_kb.unwrap_or(0.)) }
     }
 
     /// The weighted median time sends to `place` of jobs that link, or of
@@ -731,7 +769,7 @@ impl Stats {
     /// of both kinds of sends to each.
     pub fn heartbeat(&mut self, places: &[PlaceId], kb: u64, us: u64) {
         let (now, half_life_s) = (self.now, self.decay.copy_half_life_s);
-        let send = Send { at: now, copy_us: us as f64, kb: kb as f64 };
+        let send = Send { at: now, copy_us: us as f64, in_kb: kb as f64, out_kb: 0. };
         for p in places {
             for links in [false, true] {
                 self.places[p.0 as usize].send(links, send, now, half_life_s);
@@ -820,7 +858,10 @@ impl Stats {
         }
         let sample = RunSample { place: run.place, at: now, load_c: run.load_c, front_us, rest_us, tokens_us };
         let sent = match run.origin {
-            Origin::Sent(t) => Some((t, Send { at: now, copy_us: t.copy_ms as f64 * 1000., kb: t.sent_kb as f64 })),
+            Origin::Sent(t) => {
+                let (in_kb, out_kb) = (t.sent_kb as f64, t.received_kb as f64);
+                Some((t, Send { at: now, copy_us: t.copy_ms as f64 * 1000., in_kb, out_kb }))
+            }
             Origin::Here | Origin::Served => None,
         };
         for (map, key) in [(&mut self.exact, &unit.exact), (&mut self.coarse, &unit.coarse)] {
@@ -901,8 +942,9 @@ impl Stats {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         let mut stats = match &magic {
-            MAGIC => Self::read(&mut r, decay, read_run)?,
-            WORK_MAGIC => Self::read(&mut r, decay, read_work_run)?,
+            MAGIC => Self::read(&mut r, decay, read_run, read_send)?,
+            SENT_ONLY_MAGIC => Self::read(&mut r, decay, read_run, read_sent_only)?,
+            WORK_MAGIC => Self::read(&mut r, decay, read_work_run, read_sent_only)?,
             SUMS_MAGIC => Self::read_sums(&mut r, decay)?,
             OLD_MAGIC => Self::read_old(&mut r, decay)?,
             _ => bail!("{} is not a stats file", path.display()),
@@ -960,11 +1002,13 @@ impl Stats {
         Ok(())
     }
 
-    /// A table whose runs `read_run` reads.
+    /// A table whose runs `read_run` reads and whose sends `read_send`
+    /// reads, keeping those it returns.
     fn read(
         r: &mut impl Read,
         decay: Decay,
         read_run: fn(&mut dyn Read, &[Place]) -> Result<RunSample>,
+        read_send: fn(&mut dyn Read) -> Result<Option<Send>>,
     ) -> Result<Self> {
         let mut stats = Self::new(decay);
         stats.read_places(r, |p, r| {
@@ -975,7 +1019,7 @@ impl Stats {
             }
             for q in &mut p.sends {
                 for _ in 0..read_u32(r)? {
-                    q.push_back(Send { at: read_f64(r)?, copy_us: read_f64(r)?, kb: read_f64(r)? });
+                    q.extend(read_send(r)?);
                 }
             }
             Ok(())
@@ -986,8 +1030,7 @@ impl Stats {
             }
             for _ in 0..read_u32(r)? {
                 let place = read_place(r, places)?;
-                let send = Send { at: read_f64(r)?, copy_us: read_f64(r)?, kb: read_f64(r)? };
-                rec.sends.push_back(UnitSend { place, send });
+                rec.sends.extend(read_send(r)?.map(|send| UnitSend { place, send }));
             }
             Ok(())
         })?;
@@ -1005,11 +1048,10 @@ impl Stats {
                     q.push_back(Comparison { at, ratio: time_us / calibrated_us, weight: calibrated_us });
                 }
             }
-            for q in &mut p.sends {
-                let (at, n, us, kb, _kb2, _kb_us) =
-                    (read_f64(r)?, read_f64(r)?, read_f64(r)?, read_f64(r)?, read_f64(r)?, read_f64(r)?);
-                if n > 0. {
-                    q.push_back(Send { at, copy_us: us / n, kb: kb / n });
+            // Its sends counted only the kB they sent: none is kept.
+            for _ in &p.sends {
+                for _ in 0..6 {
+                    read_f64(r)?;
                 }
             }
             Ok(())
@@ -1024,7 +1066,7 @@ impl Stats {
                 for s in &mut sums {
                     *s = read_f64(r)?;
                 }
-                let [runs, load_c, front_mi, rest_mi, rest_us, tokens_us, sent, copy_us, sent_kb] = sums;
+                let [runs, load_c, front_mi, rest_mi, rest_us, tokens_us, ..] = sums;
                 if runs > 0. {
                     rec.runs_kept.push_back(WorkSample {
                         place,
@@ -1037,12 +1079,8 @@ impl Stats {
                     }
                     .measured(places));
                 }
-                if sent > 0. {
-                    rec.sends.push_back(UnitSend { place, send: Send { at, copy_us: copy_us / sent, kb: sent_kb / sent } });
-                }
             }
             rec.runs_kept.make_contiguous().sort_by(|a, b| a.at.total_cmp(&b.at));
-            rec.sends.make_contiguous().sort_by(|a, b| a.send.at.total_cmp(&b.send.at));
             Ok(())
         })?;
         Ok(stats)
@@ -1101,7 +1139,7 @@ impl Stats {
             for q in &p.sends {
                 w.write_all(&(q.len() as u32).to_be_bytes())?;
                 for s in q {
-                    write_f64s(&mut w, &[s.at, s.copy_us, s.kb])?;
+                    write_f64s(&mut w, &[s.at, s.copy_us, s.in_kb, s.out_kb])?;
                 }
             }
         }
@@ -1120,7 +1158,7 @@ impl Stats {
                 w.write_all(&(rec.sends.len() as u32).to_be_bytes())?;
                 for s in &rec.sends {
                     w.write_all(&s.place.0.to_be_bytes())?;
-                    write_f64s(&mut w, &[s.send.at, s.send.copy_us, s.send.kb])?;
+                    write_f64s(&mut w, &[s.send.at, s.send.copy_us, s.send.in_kb, s.send.out_kb])?;
                 }
                 for h in rec.each() {
                     ser.serialize(h, &mut w).map_err(|e| anyhow!("{e:?}"))?;
@@ -1153,7 +1191,21 @@ fn seed_run(places: &[Place], front_mi: u64, rest_mi: u64, width_c: u64, now: f6
     work.measured(places)
 }
 
-/// A run as rdstat10 keeps it.
+/// A send as rdstat11 keeps it.
+fn read_send(r: &mut dyn Read) -> Result<Option<Send>> {
+    Ok(Some(Send { at: read_f64(r)?, copy_us: read_f64(r)?, in_kb: read_f64(r)?, out_kb: read_f64(r)? }))
+}
+
+/// A send as tables before rdstat11 kept it, without the kB it got back,
+/// so nothing it says about moving kB holds: none is kept.
+fn read_sent_only(r: &mut dyn Read) -> Result<Option<Send>> {
+    for _ in 0..3 {
+        read_f64(r)?;
+    }
+    Ok(None)
+}
+
+/// A run as rdstat10 and rdstat11 keep it.
 fn read_run(r: &mut dyn Read, places: &[Place]) -> Result<RunSample> {
     Ok(RunSample {
         place: read_place(r, places)?,
@@ -1441,20 +1493,20 @@ mod test {
         let after = s.factor(b, 0) / s.factor(a, 0);
         assert!((after - before).abs() < before * 0.05, "{before} {after}");
         // Seven sends of a second, then one that took 135 s.
-        let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1000, copy_ms, links: true }), ..run(b, 0, 100) };
+        let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1000, received_kb: 0, copy_ms, links: true }), ..run(b, 0, 100) };
         for _ in 0..7 {
             s.record(&unit("t:1", "t"), &sent(1000));
         }
         s.record(&unit("t:1", "t"), &sent(135_000));
-        assert_eq!(s.copy_us(&unit("t:1", "t"), b, true, 1000), 1_000_000);
-        assert_eq!(s.copy_us(&unit("other:1", "other"), b, true, 1000), 1_000_000);
+        assert_eq!(s.moving(&unit("t:1", "t"), b, true, 1000).copy_us, 1_000_000);
+        assert_eq!(s.moving(&unit("other:1", "other"), b, true, 1000).copy_us, 1_000_000);
     }
 
     #[test]
     fn copy_times_follow_their_own_shorter_half_life() {
         let mut s = Stats::new(Decay::default());
         let there = s.place("b/all", 1000, 1000);
-        let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms, links: false }), ..run(there, 0, 100) };
+        let sent = |copy_ms| Run { origin: Origin::Sent(Transfer { sent_kb: 1, received_kb: 0, copy_ms, links: false }), ..run(there, 0, 100) };
         // Twice 10 s to move its files on a slow link, then 1 s two hours
         // later: the old ones count a quarter each, and the new one wins
         // the median. At the day's half-life they'd still outweigh it.
@@ -1463,8 +1515,8 @@ mod test {
         s.record(&unit("a:1", "a"), &sent(10_000));
         s.set_now(2. * 3600.);
         s.record(&unit("a:1", "a"), &sent(1000));
-        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 1), 1_000_000);
-        assert_eq!(s.copy_us(&unit("b:1", "b"), there, false, 1), 1_000_000, "every unit's too");
+        assert_eq!(s.moving(&unit("a:1", "a"), there, false, 1).copy_us, 1_000_000);
+        assert_eq!(s.moving(&unit("b:1", "b"), there, false, 1).copy_us, 1_000_000, "every unit's too");
         // Its size counts every run.
         let p = predict(&s, &unit("a:1", "a"));
         assert!((99..=100).contains(&p.rest_mi), "{}", p.rest_mi);
@@ -1475,7 +1527,7 @@ mod test {
         let mut s = Stats::new(Decay::default());
         let there = s.place("b/all", 1000, 1000);
         let sent = |copy_ms, sent_kb| Run {
-            origin: Origin::Sent(Transfer { sent_kb, copy_ms, links: true }),
+            origin: Origin::Sent(Transfer { sent_kb, received_kb: 0, copy_ms, links: true }),
             ..run(there, 0, 100)
         };
         // Sent cold, its 100 MB of rlibs took 10 s; warm, nothing to send,
@@ -1486,13 +1538,90 @@ mod test {
         }
         let near = |got: u64, want: u64| got.abs_diff(want) < want / 50;
         let bin = unit("bin:1", "bin");
-        assert!(near(s.copy_us(&bin, there, true, 0), 1_000_000), "{}", s.copy_us(&bin, there, true, 0));
-        assert!(near(s.copy_us(&bin, there, true, 100_000), 10_000_000), "{}", s.copy_us(&bin, there, true, 100_000));
+        assert!(near(s.moving(&bin, there, true, 0).copy_us, 1_000_000), "{}", s.moving(&bin, there, true, 0).copy_us);
+        assert!(near(s.moving(&bin, there, true, 100_000).copy_us, 10_000_000), "{}", s.moving(&bin, there, true, 100_000).copy_us);
         // A unit never sent there is priced from every send of its kind.
         let other = unit("other:1", "other");
-        assert!(near(s.copy_us(&other, there, true, 50_000), 5_500_000), "{}", s.copy_us(&other, there, true, 50_000));
+        assert!(near(s.moving(&other, there, true, 50_000).copy_us, 5_500_000), "{}", s.moving(&other, there, true, 50_000).copy_us);
         let (mean, mb_per_s) = s.sends(there, true);
         assert!(mean.is_some() && (11. ..11.2).contains(&mb_per_s), "{mb_per_s}");
+    }
+
+    #[test]
+    fn what_a_send_gets_back_is_priced_and_predicted() {
+        let mut s = Stats::new(Decay::default());
+        let there = s.place("b/all", 1000, 1000);
+        let sent = |copy_ms, received_kb| Run {
+            origin: Origin::Sent(Transfer { sent_kb: 0, received_kb, copy_ms, links: true }),
+            ..run(there, 0, 100)
+        };
+        // Binaries that send nothing there and get 100 MB back in 1 s, or
+        // 10 MB in 0.1 s: 10 µs a kB, 100 MB/s. Counting only what they
+        // sent, every pair of them has the same kB and gives no slope.
+        for _ in 0..10 {
+            s.record(&unit("big:1", "big"), &sent(1000, 100_000));
+            s.record(&unit("small:1", "small"), &sent(100, 10_000));
+        }
+        let (_, mb_per_s) = s.sends(there, true);
+        assert!((99. ..101.).contains(&mb_per_s), "{mb_per_s}");
+        let m = s.moving(&unit("big:1", "big"), there, true, 0);
+        assert_eq!((m.copy_us, m.inputs_us, m.outputs_us), (1_000_000, 0, 1_000_000));
+        let m = s.moving(&unit("big:1", "big"), there, true, 50_000);
+        assert_eq!((m.copy_us, m.inputs_us), (1_500_000, 500_000), "50 MB to send costs half a second");
+        // A unit never sent gets back what the sends there got back.
+        let m = s.moving(&unit("new:1", "new"), there, true, 0);
+        assert_eq!((m.copy_us, m.outputs_us), (100_000, 100_000));
+        // Its outputs are its own wherever it went.
+        let elsewhere = s.place("c/all", 1000, 1000);
+        assert_eq!(s.moving(&unit("big:1", "big"), elsewhere, true, 0).outputs_us, 2_000_000, "at 50 MB/s, the guess");
+    }
+
+    #[test]
+    fn a_table_whose_sends_counted_only_what_they_sent_loads_without_them() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("rustc-dist-stats-sent-only-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("jobs.hdr");
+        let mut w = BufWriter::new(File::create(&path)?);
+        let now = now_s();
+        w.write_all(SENT_ONLY_MAGIC)?;
+        w.write_all(&2u32.to_be_bytes())?;
+        for key in [SEED, "b/all"] {
+            write_key(&mut w, key)?;
+            w.write_all(&1000u64.to_be_bytes())?;
+            w.write_all(&1000u64.to_be_bytes())?;
+            for _ in BUCKETS {
+                w.write_all(&0u32.to_be_bytes())?;
+            }
+            for _ in 0..2 {
+                w.write_all(&1u32.to_be_bytes())?;
+                write_f64s(&mut w, &[now, 1e6, 100.])?;
+            }
+        }
+        w.write_all(&1u32.to_be_bytes())?;
+        write_key(&mut w, "a:1")?;
+        w.write_all(&1u32.to_be_bytes())?;
+        w.write_all(&1u32.to_be_bytes())?;
+        w.write_all(&now.to_be_bytes())?;
+        w.write_all(&0u32.to_be_bytes())?;
+        write_f64s(&mut w, &[0., 1e6, 1e6])?;
+        w.write_all(&1u32.to_be_bytes())?;
+        w.write_all(&1u32.to_be_bytes())?;
+        write_f64s(&mut w, &[now, 1e6, 100.])?;
+        let mut ser = V2Serializer::new();
+        for h in Record::new().each() {
+            ser.serialize(h, &mut w).unwrap();
+        }
+        for n in [0u64, 1, 0] {
+            w.write_all(&n.to_be_bytes())?;
+        }
+        w.write_all(&0u32.to_be_bytes())?;
+        drop(w);
+        let s = Stats::load(&path, Decay::default())?;
+        assert_eq!(s.exact["a:1"].runs_kept.len(), 1, "runs stay");
+        assert!(s.exact["a:1"].sends.is_empty());
+        assert!(s.places.iter().all(|p| p.sends.iter().all(VecDeque::is_empty)));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
@@ -1518,7 +1647,7 @@ mod test {
         for _ in 0..5 {
             s.record(&unit("u:1", "u"), &run(a, 0, 1000));
         }
-        let sent = Origin::Sent(Transfer { sent_kb: 1, copy_ms: 300, links: false });
+        let sent = Origin::Sent(Transfer { sent_kb: 1, received_kb: 0, copy_ms: 300, links: false });
         s.record(&unit("t:1", "t"), &Run { origin: sent, ..run(a, 0, 100) });
         let at_a = |s: &Stats| {
             let (pred, basis) = s.predict_at(&ArcStr::from("u:1"), &ArcStr::from("u"), a);
@@ -1528,7 +1657,7 @@ mod test {
         assert_eq!(s.place("a/p/0", 2000, 2000), a);
         assert_eq!(at_a(&s), (1_000_000, Basis::Place), "the same runs on the same CPUs");
         assert_eq!(predict(&s, &unit("u:1", "u")).rest_mi, 2000, "twice the work at twice the speed");
-        assert_eq!(s.copy_us(&unit("v:1", "v"), a, false, 1), 300_000, "its sends say nothing of its CPUs");
+        assert_eq!(s.moving(&unit("v:1", "v"), a, false, 1).copy_us, 300_000, "its sends say nothing of its CPUs");
     }
 
     #[test]
@@ -1599,7 +1728,7 @@ mod test {
     fn a_unit_whose_samples_all_went_stale_is_dropped() {
         let mut s = Stats::new(Decay::default());
         let a = s.place("a/0", 1000, 1000);
-        let sent = Origin::Sent(Transfer { sent_kb: 1, copy_ms: 300, links: false });
+        let sent = Origin::Sent(Transfer { sent_kb: 1, received_kb: 0, copy_ms: 300, links: false });
         s.set_now(0.);
         s.record(&unit("old:1", "old"), &Run { origin: sent, ..run(a, 0, 1000) });
         s.set_now(KEEP_S);
@@ -1615,7 +1744,7 @@ mod test {
         let mut s = Stats::new(Decay::default());
         let there = s.place("b/all", 1000, 1000);
         let sent = |copy_ms| Run {
-            origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms, links: false }),
+            origin: Origin::Sent(Transfer { sent_kb: 1, received_kb: 0, copy_ms, links: false }),
             ..run(there, 0, 100)
         };
         // a:1 was sent twice on a slow network, then twenty other units on
@@ -1627,11 +1756,11 @@ mod test {
         for i in 0..20 {
             s.record(&unit(&format!("u{i}:1"), "u"), &sent(100));
         }
-        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 1), 100_000);
+        assert_eq!(s.moving(&unit("a:1", "a"), there, false, 1).copy_us, 100_000);
         // Long after, when every weight from now is too small for an f64,
         // the place's sends still stand.
         s.set_now(50. * 86_400.);
-        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 1), 100_000);
+        assert_eq!(s.moving(&unit("a:1", "a"), there, false, 1).copy_us, 100_000);
     }
 
     #[test]
@@ -1688,7 +1817,7 @@ mod test {
     }
 
     #[test]
-    fn a_table_of_sums_loads_oldest_first_and_keeps_no_more_runs_or_sends_than_any_unit() -> Result<()> {
+    fn a_table_of_sums_loads_oldest_first_keeping_no_more_runs_than_any_unit_and_no_sends() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("rustc-dist-stats-sums-{}", std::process::id()));
         fs::create_dir_all(&dir)?;
         let path = dir.join("jobs.hdr");
@@ -1723,10 +1852,10 @@ mod test {
         w.write_all(&0u32.to_be_bytes())?;
         drop(w);
         let mut s = Stats::load(&path, Decay::default())?;
-        assert_eq!((s.exact["a:1"].runs_kept.len(), s.exact["a:1"].sends.len()), (cells, cells));
+        assert_eq!((s.exact["a:1"].runs_kept.len(), s.exact["a:1"].sends.len()), (cells, 0), "its sends counted no outputs");
         assert_eq!(predict(&s, &unit("a:1", "a")).rest_mi, 1000);
         let a = s.place("a/0", 1000, 1000);
-        let sent = Run { origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms: 100, links: false }), ..run(a, 0, 1000) };
+        let sent = Run { origin: Origin::Sent(Transfer { sent_kb: 1, received_kb: 0, copy_ms: 100, links: false }), ..run(a, 0, 1000) };
         s.record(&unit("a:1", "a"), &sent);
         let r = &s.exact["a:1"];
         let runs = &r.runs_kept;
@@ -1734,10 +1863,7 @@ mod test {
         let oldest = now - runs[0].at;
         assert!((oldest - (RUNS_KEPT - 1) as f64).abs() < 1e-3, "{oldest}");
         assert!(runs.iter().zip(runs.iter().skip(1)).all(|(a, b)| a.at <= b.at));
-        assert_eq!(r.sends.len(), UNIT_SENDS_KEPT);
-        let oldest = now - r.sends[0].send.at;
-        assert!((oldest - (UNIT_SENDS_KEPT - 1) as f64).abs() < 1e-3, "{oldest}");
-        assert!(r.sends.iter().zip(r.sends.iter().skip(1)).all(|(a, b)| a.send.at <= b.send.at));
+        assert_eq!(r.sends.len(), 1);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -1747,18 +1873,18 @@ mod test {
         let mut s = Stats::new(Decay::default());
         let there = s.place("b/all", 1000, 1000);
         let sent = |copy_ms, links| Run {
-            origin: Origin::Sent(Transfer { sent_kb: 1, copy_ms, links }),
+            origin: Origin::Sent(Transfer { sent_kb: 1, received_kb: 0, copy_ms, links }),
             ..run(there, 0, 100)
         };
-        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 0), COPY_US as u64, "a guess");
+        assert_eq!(s.moving(&unit("a:1", "a"), there, false, 0).copy_us, COPY_US as u64, "a guess");
         s.record(&unit("a:1", "a"), &sent(300, false));
         s.record(&unit("b:1", "b"), &sent(100, false));
         s.record(&unit("d:1", "d"), &sent(200, false));
         s.record(&unit("bin:1", "bin"), &sent(9000, true));
         // Each sent 1 kB; so does the next.
-        assert_eq!(s.copy_us(&unit("a:1", "a"), there, false, 1), 300_000);
-        assert_eq!(s.copy_us(&unit("c:1", "c"), there, false, 1), 200_000, "libraries'");
-        assert_eq!(s.copy_us(&unit("c:1", "c"), there, true, 1), 9_000_000, "links'");
+        assert_eq!(s.moving(&unit("a:1", "a"), there, false, 1).copy_us, 300_000);
+        assert_eq!(s.moving(&unit("c:1", "c"), there, false, 1).copy_us, 200_000, "libraries'");
+        assert_eq!(s.moving(&unit("c:1", "c"), there, true, 1).copy_us, 9_000_000, "links'");
     }
 
     #[test]
@@ -1769,7 +1895,7 @@ mod test {
         let (a, b) = (s.place("a/0", 1000, 1000), s.place("b/all", 3000, 2000));
         s.record(&unit("a:1", "a"), &run(a, 0, 1234));
         s.record(&unit("a:1", "a"), &Run { origin: Origin::Served, ..run(b, 0, 2000) });
-        let sent = Origin::Sent(Transfer { sent_kb: 2048, copy_ms: 70, links: true });
+        let sent = Origin::Sent(Transfer { sent_kb: 2048, received_kb: 4096, copy_ms: 70, links: true });
         s.record(&unit("b:1", "b"), &Run { front_us: Some(30_000), tokens_us: 230_000, origin: sent, ..run(b, 100, 99) });
         s.save(&path)?;
         assert!(!s.dirty);
@@ -1788,9 +1914,10 @@ mod test {
         let (_, b1) = t.units().find(|(k, _)| k.as_str() == "b:1").unwrap();
         assert_eq!(b1.runs, [0, 1, 0]);
         assert_eq!(b1.copy_ms, Some(70));
-        assert_eq!(t.copy_us(&unit("b:1", "b"), b, true, 2048), 70_000);
-        assert_eq!(t.copy_us(&unit("c:1", "c"), b, true, 2048), 70_000, "links' sends were saved");
-        assert_eq!(t.copy_us(&unit("c:1", "c"), b, false, 2048), (COPY_US + SEND_US_PER_KB * 2048.) as u64);
+        assert_eq!(t.moving(&unit("b:1", "b"), b, true, 2048).copy_us, 70_000);
+        assert_eq!(t.moving(&unit("b:1", "b"), b, true, 2048).outputs_us, (SEND_US_PER_KB * 4096.) as u64, "what it got back");
+        assert_eq!(t.moving(&unit("c:1", "c"), b, true, 2048).copy_us, 70_000, "links' sends were saved");
+        assert_eq!(t.moving(&unit("c:1", "c"), b, false, 2048).copy_us, (COPY_US + SEND_US_PER_KB * 2048.) as u64);
         fs::remove_dir_all(&dir)?;
         Ok(())
     }

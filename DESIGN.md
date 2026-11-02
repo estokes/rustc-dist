@@ -380,11 +380,20 @@ box already holds, such as crates it just built, is cheap to send there:
   place while they weigh at least half a fresh send, else of the last 64
   sends there of jobs that link as it does or doesn't (a job that links
   sends every rlib below it), however old, else a guess of 200 ms, each
-  adjusted for the kB the box lacks now against the kB that send
-  moved, at the place's µs per kB: the weighted median of the slopes between
-  pairs of those 64 whose kB differ by at least 256 kB (Theil-Sen), with
-  50 MB/s as one more slope. kB are counted before compression, so a place's
-  µs per kB takes in how well what crosses compresses.
+  adjusted for the kB it would move now against the kB that send moved, at
+  the place's µs per kB. A send moves what it sends and what it gets back.
+  Now it would send the kB the box lacks and get back what its own sends
+  got back, wherever they went, or with none, what that send got back. The
+  µs per kB is the weighted median of the slopes between pairs of those 64
+  whose kB differ by at least 256 kB (Theil-Sen), with 50 MB/s as one more
+  slope. kB are counted before compression, so a place's µs per kB takes in
+  how well what crosses compresses.
+- Every job this box sends shares its link. A sent job's inputs cross it
+  from when it is sent, at the place's µs per kB, and its outputs up to when
+  it is predicted to end. A job placed while others' files cross adds the
+  time theirs overlap its own: n equal jobs sent at once each take about n
+  times as long to move. Jobs placed in the same dispatch count, as do jobs
+  past their prediction, whose end moves out as their time left does.
 - While jobs wait here, a box with a token free that has run nothing from here
   and had no heartbeat for a minute gets one: half a MB or a MB, in turn, of
   the start of the rustc-dist binary, which compresses about as object code
@@ -394,7 +403,17 @@ box already holds, such as crates it just built, is cheap to send there:
   and runs nothing.
 
 Its weights halve every `copy_half_life_s`, an hour by default, since the
-network a laptop is on changes as it moves. The server reports the token-µs and
+network a laptop is on changes as it moves.
+
+On 2026-11-02, before sends counted what they got back, every send aieka
+saw got back a binary and sent next to nothing, so no pair gave a slope
+above zero and status showed 1,000,000 MB/s: what a job sent there was
+free. And each job was priced as if it had the link to itself: eleven
+build scripts went to ryouko at once, each predicted to spend under 2 s
+moving files, and all of them spent 9.4 to 9.9 s getting back their
+binaries, up to 193 MB each, against 1.2 to 4.3 s to build here. Build
+scripts lost 220 s that way in seven hours, while libraries and tests sent
+away saved 2,300. The server reports the token-µs and
 load it measured, counted from when rustc started, so time waiting for inputs
 isn't counted as the job's.
 
@@ -409,8 +428,10 @@ for whom. At 256 runs each histogram halves the count at or above each value,
 rounding up, so every quantile stays where it was and old values still fade.
 Admission uses the unit's p90 peak. Only successful compiles are recorded. A
 sample older than about 60 days, as long as the build graph keeps a node, is
-dropped, and a unit left with none goes with it. The table (`rdstat10`)
-keeps runs as measured. One that kept them as work at their place's
+dropped, and a unit left with none goes with it. The table (`rdstat11`)
+keeps runs as measured, and sends with what they sent and got back. One
+whose sends counted only what they sent (`rdstat10` and older) loads
+without its sends. One that kept them as work at their place's
 calibration (`rdstats9`, or `rdstats8`'s decayed sums) loads each run as the
 µs that work takes at its place's calibration, as wide. A table from before
 runs were timed loads as seed history: each unit's median instruction count,
@@ -1447,7 +1468,7 @@ Every number below is a guess. None has been tested on an idle box.
 | sample memory and job footprints every | 250 ms | `src/sched.rs` `MEASURE` |
 | keep graph nodes unseen for | 60 days | `src/graph.rs` `KEEP_DAYS` |
 | only send jobs predicted to take at least | 1 s | `src/sched.rs` `REMOTE_MIN_US` |
-| time moving files, before anything was sent to a place | 200 ms | `src/sched.rs` `REMOTE_OVERHEAD_US` |
+| time moving files, before anything was sent to a place | 200 ms | `src/stats.rs` `COPY_US` |
 | count and lend each job's tokens every | 100 ms | `src/sched.rs` `SAMPLE` |
 | jobserver tokens per CPU | 1.5 | `src/config.rs` `tokens_per_cpu` |
 | a job is light below this many tokens held | 1.5 | `src/sched.rs` `LIGHT_WIDTH_C` |

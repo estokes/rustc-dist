@@ -7,7 +7,7 @@ use crate::{
     classes::{self, Class, Profile},
     farm::Load,
     protocol::{Job, Reads, Unit},
-    remote::{self, CHUNK, Event, FromServer, In, Links, Moved, Out, Outcome, Packed, Sent, Staged, ToServer},
+    remote::{self, CHUNK, Event, FromServer, In, Links, Moved, Out, Outcome, Packed, Sent, Staged, ToServer, Volume},
     sandbox::{self, Server},
     sched::{Msg, Sched, Setup},
     stats::Decay,
@@ -601,7 +601,7 @@ async fn a_job_its_client_drops_stops_on_the_box_and_frees_what_it_held() -> Res
     let again = time::timeout(Duration::from_secs(60), send(&b, &lib, &crates, &Hashes::default(), None)).await;
     let (outcome, events) = again.context("the next job waited for the dropped job's blob")??;
     let Outcome::Exit { code: 0, moved, .. } = outcome else { bail!("failed: {:?}", stderr(&events)) };
-    assert!(moved.bytes >= big.len() as u64, "{} bytes", moved.bytes);
+    assert!(moved.sent.raw >= big.len() as u64, "{} bytes", moved.sent.raw);
     // On the same channel all along.
     let same = b.links.get(&b.jobs).await?;
     assert!(Arc::ptr_eq(&link, &same) && !link.failed());
@@ -698,7 +698,7 @@ async fn jobs_sent_together_send_a_blob_they_share_once() -> Result<()> {
     let hashes = Hashes::default();
     let (one, two) = tokio::join!(send(&b, &ws1, &c1, &hashes, None), send(&b, &ws2, &c2, &hashes, None));
     let bytes = |o: Result<(Outcome, Vec<Event>)>| match o? {
-        (Outcome::Exit { code: 0, moved, .. }, _) => Ok(moved.bytes),
+        (Outcome::Exit { code: 0, moved, .. }, _) => Ok(moved.sent.raw),
         _ => bail!("failed"),
     };
     let (one, two) = (bytes(one)?, bytes(two)?);
@@ -841,8 +841,8 @@ async fn a_file_that_compresses_goes_small_and_its_output_comes_back_whole() -> 
     let crates: Vec<ArcStr> = lib.1.deps.iter().filter_map(|d| d.file.clone()).collect();
     let (outcome, events) = send(&b, &lib, &crates, &Hashes::default(), None).await?;
     let Outcome::Exit { code: 0, moved, .. } = outcome else { bail!("failed: {:?}", stderr(&events)) };
-    assert!(moved.bytes >= text.len() as u64, "{} bytes", moved.bytes);
-    assert!(moved.wire_bytes < moved.bytes / 20, "{} bytes as {}", moved.bytes, moved.wire_bytes);
+    assert!(moved.sent.raw >= text.len() as u64, "{} bytes", moved.sent.raw);
+    assert!(moved.sent.wire < moved.sent.raw / 20, "{} bytes as {}", moved.sent.raw, moved.sent.wire);
     // The rlib holds the text, and came back whole.
     let rlib = fs::read(dir.join("ws/target/deps/libapp-a1.rlib"))?;
     let at = rlib.windows(28).position(|w| w == &text.as_bytes()[..28]).context("the rlib lacks the text")?;
@@ -900,7 +900,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     // nothing and builds the same outputs.
     let blobs = blob_count(&b.store_dir);
     let (outcome, _) = send(&b, &lib, &lib_crates, &hashes, Some(0)).await?;
-    assert!(matches!(outcome, Outcome::Exit { code: 0, moved: Moved { bytes: 0, .. }, .. }));
+    assert!(matches!(outcome, Outcome::Exit { code: 0, moved: Moved { sent: Volume { raw: 0, .. }, .. }, .. }));
     assert_eq!(blob_count(&b.store_dir), blobs);
     // A binary links app's rlib, which the server kept, and dep's, which
     // arrives while rustc runs, behind a stand-in.
@@ -915,7 +915,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     let Outcome::Exit { code: 0, moved, .. } = outcome else { bail!("the binary failed: {:?}", stderr(&events)) };
     let dep_rlib = fs::metadata(deps.join("libdep-d1.rlib"))?.len();
     let app_rlib = fs::metadata(deps.join("libapp-a1.rlib"))?.len();
-    assert!(moved.bytes >= dep_rlib && moved.bytes < dep_rlib + app_rlib, "{} bytes", moved.bytes);
+    assert!(moved.sent.raw >= dep_rlib && moved.sent.raw < dep_rlib + app_rlib, "{} bytes", moved.sent.raw);
     assert_eq!(artifacts(&events).len(), 2, "dep-info and the binary");
     let out = Command::new(deps.join("main-m1")).output()?;
     assert_eq!(out.stdout, b"42\n");
@@ -923,7 +923,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     // Now the server has every rlib, so nothing comes late.
     let (outcome, _) = send(&b, &bin, &bin_crates, &hashes, None).await?;
     let Outcome::Exit { code: 0, moved, .. } = outcome else { bail!("the binary failed again") };
-    assert_eq!((moved.bytes, moved.linker_waited_us), (0, 0));
+    assert_eq!((moved.sent.raw, moved.linker_waited_us), (0, 0));
     // The linker waits for an rlib that is slow to come.
     let late = binaries_on_a_new_crate(&dir.join("ws"), &["late_bin"])?;
     let (code, linker_waited_us) = send_late(&b, &late.bins[0], &late.crates, Duration::from_secs(2)).await?;
