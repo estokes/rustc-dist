@@ -36,6 +36,7 @@ parking_lot = "0.13.0"
 poolshark = "0.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+timer-grid = "0.1.1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1.1.8"
 triomphe = "0.1.17"

@@ -18,7 +18,7 @@ use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
 use compact_str::{CompactString, format_compact};
 use log::{Level, debug, error, info, log_enabled, warn};
-use netidx::{path::Path as NPath, tick};
+use netidx::path::Path as NPath;
 use netidx_core::atomic_id;
 use poolshark::local::LPooled;
 use serde::{Deserialize, Serialize};
@@ -62,9 +62,9 @@ const SAMPLE: Duration = Duration::from_millis(100);
 /// A unit that failed remotely and then built locally this many times is
 /// kept local.
 const PIN_AFTER: u8 = 2;
-/// How often a quiet daemon wakes. Its periodic timers tick on netidx's
-/// clock grid (`netidx::tick`), and every idle period is a multiple of
-/// this, so they wake it together.
+/// How often a quiet daemon wakes. Its periodic timers tick on the wall-clock
+/// grid of `timer_grid`, as netidx's do, and every idle period is a multiple
+/// of this, so they wake it together.
 pub const IDLE: Duration = Duration::from_secs(2);
 /// Sample the box's memory, the footprints of jobs running here and the
 /// load each job runs under this often, on the clock grid, while jobs run
@@ -1259,7 +1259,7 @@ impl Sched {
             Measure,
             Save,
         }
-        let mut save = tick::interval(SAVE_EVERY);
+        let mut save = timer_grid::interval(SAVE_EVERY);
         let mut recheck = time::interval(RECHECK);
         recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut sample = time::interval(SAMPLE);
@@ -1273,7 +1273,7 @@ impl Sched {
                 msg = rx.recv() => Event::Msg(msg),
                 _ = recheck.tick(), if starved => Event::Recheck,
                 _ = sample.tick(), if sampling => Event::Sample,
-                _ = time::sleep_until(self.next_measure(sampling)) => Event::Measure,
+                _ = time::sleep_until(self.next_measure(sampling).into()) => Event::Measure,
                 _ = time::sleep_until(gathering.unwrap_or_else(Instant::now).into()), if gathering.is_some() => {
                     Event::Recheck
                 }
@@ -1738,7 +1738,7 @@ impl Sched {
             Ok(mem) => self.mem = mem,
             Err(e) => warn!("measuring memory: {e:#}"),
         }
-        if self.counted.is_none_or(|t| tick::next(COUNT_LOAD, t.into()) <= now.into()) {
+        if self.counted.is_none_or(|t| timer_grid::next(COUNT_LOAD, t) <= now) {
             let cpus = self.setup.allowed.len().max(1);
             match (self.setup.runnable)(cpus) {
                 Ok(n) => {
@@ -1764,10 +1764,10 @@ impl Sched {
     /// When to measure next: at the next tick of `MEASURE` while jobs run
     /// here, or hold tokens (`sampling`), else when the load is due to be
     /// counted.
-    fn next_measure(&self, sampling: bool) -> time::Instant {
+    fn next_measure(&self, sampling: bool) -> Instant {
         let running = sampling || self.running.iter().any(|r| r.pid.is_some());
         let (last, every) = if running { (self.measured, MEASURE) } else { (self.counted, COUNT_LOAD) };
-        last.map_or_else(time::Instant::now, |t| tick::next(every, t.into()))
+        last.map_or_else(Instant::now, |t| timer_grid::next(every, t))
     }
 
     fn measure_if_stale(&mut self, now: Instant) {
@@ -3114,7 +3114,7 @@ mod test {
         let room = Room { runnable: Box::new(move |_| Ok(seen.load(Ordering::Relaxed) as f64)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         // A tick of the grid the load is counted on.
-        let t0 = tick::next(COUNT_LOAD, time::Instant::now()).into_std();
+        let t0 = timer_grid::next(COUNT_LOAD, Instant::now());
         s.measure(t0);
         assert_eq!(s.load_c, 0);
         tasks.store(400, Ordering::Relaxed);

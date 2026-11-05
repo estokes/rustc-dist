@@ -1566,6 +1566,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tempdir",
+ "timer-grid",
  "tokio",
  "tokio-rustls",
  "triomphe",
@@ -2281,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "rustc-dist"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arcstr",
@@ -2303,6 +2304,7 @@ dependencies = [
  "poolshark",
  "serde",
  "serde_json",
+ "timer-grid",
  "tokio",
  "toml",
  "triomphe",
@@ -2698,6 +2700,15 @@ checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "timer-grid"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f85f406827845f1cabc4ed1e2be817839447aee5e3b86f4331bd4330bebade0f"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

@@ -15,7 +15,6 @@ use futures::{StreamExt, channel::mpsc as fmpsc};
 use netidx::{
     path::Path,
     publisher::{ClId, Event, Id, Publisher, UpdateBatch, Value},
-    tick,
 };
 use std::{collections::HashMap, time::Duration};
 use tokio::sync::{mpsc, oneshot};
@@ -34,7 +33,7 @@ pub async fn run(publisher: Publisher, row: Path, units: Path, tx: mpsc::Unbound
     let (events_tx, mut events) = fmpsc::unbounded();
     publisher.events(events_tx);
     let mut board = Board::new(row, units);
-    let mut refresh = tick::interval(REFRESH);
+    let mut refresh = timer_grid::interval(REFRESH);
     let mut parts = Parts { figures: true, units: true };
     loop {
         if parts.figures || parts.units {

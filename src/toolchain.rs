@@ -2,7 +2,6 @@ use anyhow::{Context, Result, bail};
 use arcstr::ArcStr;
 use compact_str::format_compact;
 use log::{info, warn};
-use netidx::tick;
 use netidx_derive::Pack;
 use parking_lot::Mutex;
 use std::{
@@ -207,7 +206,7 @@ fn watch_in(home: PathBuf, published: Vec<Toolchain>, every: Duration) -> watch:
     tokio::spawn(async move {
         // None at first: `published` may predate a change.
         let mut read: Option<Toolchains> = None;
-        let mut tick = tick::interval(every);
+        let mut tick = timer_grid::interval(every);
         loop {
             tokio::select! {
                 _ = tick.tick() => (),

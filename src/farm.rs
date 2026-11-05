@@ -22,7 +22,6 @@ use netidx::{
     publisher::{FromValue, Id, Publisher, UpdateBatch, Val, Value},
     resolver_client::{ChangeTracker, ResolverRead},
     subscriber::{Dval, Event, SubId, Subscriber, UpdateChan, UpdatesFlags},
-    tick,
 };
 use netidx_derive::Pack;
 use poolshark::{global::GPooled, local::LPooled};
@@ -253,7 +252,7 @@ impl Lister for Rows {
 /// grid of `every`. An error is logged and asked again at the next look, and
 /// a slow answer skips the looks it overran rather than bunching them up.
 fn listings(lister: impl Lister, every: Duration) -> impl Stream<Item = GPooled<Vec<Path>>> {
-    let tick = tick::interval(every);
+    let tick = timer_grid::interval(every);
     stream::unfold((lister, tick), |(mut lister, mut tick)| async move {
         loop {
             tick.tick().await;
