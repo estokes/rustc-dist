@@ -1,8 +1,8 @@
-use crate::tick;
 use anyhow::{Context, Result, bail};
 use arcstr::ArcStr;
 use compact_str::format_compact;
 use log::{info, warn};
+use netidx::tick;
 use netidx_derive::Pack;
 use parking_lot::Mutex;
 use std::{

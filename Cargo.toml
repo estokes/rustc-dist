@@ -27,10 +27,10 @@ hdrhistogram = "7.6.0"
 immutable-chunkmap = "2.1.5"
 libc = "0.2"
 log = "0.4"
-netidx = { version = "0.32.0", default-features = false }
-netidx-core = { version = "0.32.0", default-features = false }
-netidx-derive = "0.32.0"
-netidx-protocols = { version = "0.32.0", default-features = false }
+netidx = { version = "0.32.0", path = "../netidx/netidx", default-features = false }
+netidx-core = { version = "0.32.0", path = "../netidx/netidx-core", default-features = false }
+netidx-derive = { version = "0.32.0", path = "../netidx/netidx-derive" }
+netidx-protocols = { version = "0.32.0", path = "../netidx/netidx-protocols", default-features = false }
 nohash = "0.2.0"
 parking_lot = "0.13.0"
 poolshark = "0.2"

@@ -9,8 +9,7 @@
 
 use crate::{
     protocol::PROTOCOL,
-    sched::Msg,
-    tick,
+    sched::{self, Msg},
     toolchain::{self, Toolchain},
 };
 use anyhow::{Result, bail};
@@ -23,6 +22,7 @@ use netidx::{
     publisher::{FromValue, Id, Publisher, UpdateBatch, Val, Value},
     resolver_client::{ChangeTracker, ResolverRead},
     subscriber::{Dval, Event, SubId, Subscriber, UpdateChan, UpdatesFlags},
+    tick,
 };
 use netidx_derive::Pack;
 use poolshark::{global::GPooled, local::LPooled};
@@ -36,7 +36,7 @@ use tokio::{
 /// an update per job.
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 /// How often to look for boxes joining or leaving.
-const LIST_EVERY: Duration = tick::IDLE;
+const LIST_EVERY: Duration = sched::IDLE;
 
 /// The status columns a box's state is published in. A change updates the
 /// columns it touches in one batch, which subscribers get whole, so a box

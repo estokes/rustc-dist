@@ -6,8 +6,7 @@
 use crate::{
     farm::Cell,
     protocol::{ClassStatus, Status, Switching, gib},
-    sched::Msg,
-    tick,
+    sched::{self, Msg},
 };
 use anyhow::Result;
 use arcstr::ArcStr;
@@ -16,12 +15,13 @@ use futures::{StreamExt, channel::mpsc as fmpsc};
 use netidx::{
     path::Path,
     publisher::{ClId, Event, Id, Publisher, UpdateBatch, Value},
+    tick,
 };
 use std::{collections::HashMap, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 /// Building the units' rows costs the scheduler tens of ms.
-const REFRESH: Duration = tick::IDLE;
+const REFRESH: Duration = sched::IDLE;
 
 const UNIT_COLUMNS: [&str; 12] =
     ["rank s", "work s", "front %", "width", "now s", "wall s", "mem MB", "here", "sent", "served", "copy s", "sent MB"];

@@ -39,17 +39,19 @@ its runtime starts threads, so placing, publishing and moving files keep up
 on a busy box. Jobs it runs for other boxes and calibration run at nice 0;
 the wrapper's own jobs run at cargo's.
 
-Idle, the daemon wakes once every 2 s (`tick::IDLE`, `src/tick.rs`). Every
-periodic timer ticks when the wall clock reads a whole multiple of its period
-since the Unix epoch, and the periods divide each other: counting the load and looking for other boxes
+Idle, the daemon wakes once every 2 s (`sched::IDLE`). Every periodic timer
+is on netidx's clock grid (`netidx::tick`): it ticks when the wall clock reads
+a whole multiple of its period since the Unix epoch, and the periods divide
+each other: counting the load and looking for other boxes
 every 2 s, rustup's toolchains every 10 s, saving every 60 s, and while jobs
 run, sampling them every 250 ms. So timers due together fire in one wakeup,
 which on a battery-powered box costs far less than as many spread out. Boxes
 whose clocks agree (ours are within tens of ms by NTP) tick together, so a
 state one publishes on its tick reaches the others as they wake for theirs.
-The status board doesn't tick while no client watches it. Netidx's
-heartbeats, once a second on each connection, are on the same grid from the
-netidx release that has `netidx::tick`, which this module then gives way to.
+The status board doesn't tick while no client watches it. Netidx's own
+timers, its heartbeat once a second on each connection among them, are on
+the same grid, so a quiet daemon wakes once a second for all of them and
+every other second for its own work as well.
 
 The wrapper never runs rustc without a grant. If it cannot reach or start the
 daemon it fails the compile with a clear message. `RUSTC_DIST=off` bypasses
