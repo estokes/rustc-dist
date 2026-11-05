@@ -293,7 +293,10 @@ work at nice 19 counts 1/68 of a task at nice 0, since it hardly slows a
 job. The daemon's own tasks don't count; test binaries and other work it
 doesn't run do. Counting reads every task's `stat` under `/proc`, 45 to
 125 ms on a server running 5,000 tasks, so the box is counted every 2 s,
-into a moving average in which a count weighs `1/e` as much after 10 s.
+and only when `/proc/loadavg` shows more than half a task per CPU runnable
+besides the reader; at or below that, its count, every task as one, is
+the load, which weighing could only lower short of a task below nice 0. The
+counts go into a moving average in which a count weighs `1/e` as much after 10 s.
 Placement, publishing and the samples a run takes, every 250 ms, all use
 the average. A run's load is
 the mean of the samples taken since its rustc started, or the latest sample

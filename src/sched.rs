@@ -735,9 +735,9 @@ pub struct Setup {
     pub allowed: Vec<u32>,
     /// Measures the box's memory.
     pub memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
-    /// Counts the tasks runnable on the box, each by its weight against a
-    /// job's.
-    pub runnable: Box<dyn Fn() -> Result<f64> + Send + Sync>,
+    /// Counts the tasks runnable on the box of so many CPUs, each by its
+    /// weight against a job's (see `sys::runnable`).
+    pub runnable: Box<dyn Fn(usize) -> Result<f64> + Send + Sync>,
     /// The hashes of files jobs sent to other boxes read.
     pub hashes: Arc<Hashes>,
     /// Where heartbeats to other boxes go to be sent.
@@ -1735,9 +1735,10 @@ impl Sched {
             Err(e) => warn!("measuring memory: {e:#}"),
         }
         if self.counted.is_none_or(|t| now.duration_since(t) >= COUNT_LOAD) {
-            match (self.setup.runnable)() {
+            let cpus = self.setup.allowed.len().max(1);
+            match (self.setup.runnable)(cpus) {
                 Ok(n) => {
-                    self.runnable.add(n * 100. / self.setup.allowed.len().max(1) as f64, now);
+                    self.runnable.add(n * 100. / cpus as f64, now);
                     self.load_c = self.runnable.value.round() as u32;
                 }
                 Err(e) => warn!("counting runnable tasks: {e:#}"),
@@ -2674,7 +2675,7 @@ mod test {
         memory: Box<dyn Fn() -> Result<BoxMemory> + Send + Sync>,
         tokens_per_cpu: f64,
         /// Counts the tasks runnable on the box, whatever runs there.
-        runnable: Box<dyn Fn() -> Result<f64> + Send + Sync>,
+        runnable: Box<dyn Fn(usize) -> Result<f64> + Send + Sync>,
         hashes: Arc<Hashes>,
         heartbeats: mpsc::UnboundedSender<Heartbeat>,
     }
@@ -2686,7 +2687,7 @@ mod test {
         Room {
             memory,
             tokens_per_cpu: 1.,
-            runnable: Box::new(|| Ok(0.)),
+            runnable: Box::new(|_| Ok(0.)),
             hashes: Arc::new(Hashes::default()),
             heartbeats: mpsc::unbounded_channel().0,
         }
@@ -2859,7 +2860,7 @@ mod test {
         // times as long.
         for runnable in [0, 16] {
             let dir = scratch(&format!("slack-{runnable}"));
-            let room = Room { runnable: Box::new(move || Ok(runnable as f64)), ..room(u64::MAX) };
+            let room = Room { runnable: Box::new(move |_| Ok(runnable as f64)), ..room(u64::MAX) };
             let classes = vec![class(1000, &[0, 1]), class(2000, &[2, 3])];
             let (mut s, _rx, _load) = sched(&dir, classes, room, &[("big", 3000, 1), ("leaf", 1000, 1)], &[])?;
             let mut rx = place(&mut s, &["big", "leaf"], false);
@@ -3097,7 +3098,7 @@ mod test {
         let dir = scratch("load-average");
         let tasks = std::sync::Arc::new(AtomicU64::new(0));
         let seen = tasks.clone();
-        let room = Room { runnable: Box::new(move || Ok(seen.load(Ordering::Relaxed) as f64)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(move |_| Ok(seen.load(Ordering::Relaxed) as f64)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         let t0 = Instant::now();
         s.measure(t0);
@@ -3123,7 +3124,7 @@ mod test {
         let dir = scratch("status-speeds");
         // 4 tasks per cpu runnable; the second class is calibrated at half
         // speed, and b at five times.
-        let room = Room { runnable: Box::new(|| Ok(16.)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|_| Ok(16.)), ..room(u64::MAX) };
         let classes = vec![class(1000, &[0, 1]), class(2000, &[2, 3])];
         let (mut s, _rx, _load) = sched(&dir, classes, room, &[("a", 3_000_000, 1)], &[])?;
         s.farm("b".into(), Some(remote_box(200, 4, 4, 1)));
@@ -3194,7 +3195,7 @@ mod test {
         let memory =
             Box::new(move || Ok(BoxMemory { capacity_kb: 1000, used_kb: used.load(Ordering::Relaxed) }));
         let costs = [("small", 10, 100), ("big", 10, 600)];
-        let room = Room { memory, runnable: Box::new(|| Ok(0.)), ..room(0) };
+        let room = Room { memory, runnable: Box::new(|_| Ok(0.)), ..room(0) };
         let h = Harness::start_with("others", vec![class(1000, &[0, 1, 2, 3])], room, &costs, &[])?;
         let small = slot(h.submit("small")).await?;
         let mut big = h.submit("big");
@@ -4005,7 +4006,7 @@ mod test {
     async fn a_wave_is_timed_as_dispatch_placed_it() -> Result<()> {
         let dir = scratch("wave-timed");
         // 2 tasks per cpu runnable; each job placed adds a quarter of one.
-        let room = Room { runnable: Box::new(|| Ok(8.)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|_| Ok(8.)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         history(&mut s, "narrow", 1_000_000, 100);
         let mut rx = place(&mut s, &["narrow"; 4], false);
@@ -4033,7 +4034,7 @@ mod test {
         // times its calibrated 1 s, and more as more run. b is as fast and
         // idle but full: a token frees in 1.5 s, and each job takes 1.2 s
         // there, moving files included.
-        let room = Room { runnable: Box::new(|| Ok(50.)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|_| Ok(50.)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         s.farm("b".into(), Some(busy_box(1000, 1, 0, 1500, 1)));
         history(&mut s, "narrow", 1_000_000, 100);
@@ -4056,7 +4057,7 @@ mod test {
     async fn a_job_with_no_history_goes_where_it_runs_fastest_now() -> Result<()> {
         let dir = scratch("unknown-load");
         // A token is free here, but tests keep 12.5 tasks per cpu runnable.
-        let room = Room { runnable: Box::new(|| Ok(50.)), ..room(u64::MAX) };
+        let room = Room { runnable: Box::new(|_| Ok(50.)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
         s.farm("b".into(), Some(remote_box(1000, 4, 4, 1)));
         // What other units take says a new one takes 5 s on a cpu.

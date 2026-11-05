@@ -273,16 +273,29 @@ pub fn children_maxrss_kb() -> u64 {
     ru.ru_maxrss as u64
 }
 
-/// Tasks runnable on the box now other than this process's, each counted
-/// by its nice level's weight against a job's, as the kernel shares a CPU
-/// between them: work at nice 19 hardly slows a job, and counts 1/68 of a
-/// task.
-pub fn runnable() -> Result<f64> {
-    runnable_in(Path::new("/proc"), std::process::id())
+/// At or below this many tasks runnable per CPU, counted alike whatever
+/// their nice level, that count is the load: weighing each task could only
+/// lower it, short of a rare task below nice 0, and finding them all costs
+/// 10 ms or more.
+const WEIGH_ABOVE: f64 = 0.5;
+
+/// Tasks runnable on a box of `cpus` now other than this process's, each
+/// counted by its nice level's weight against a job's, as the kernel shares
+/// a CPU between them: work at nice 19 hardly slows a job, and counts 1/68
+/// of a task. While few are runnable, each counts as one (see
+/// `WEIGH_ABOVE`).
+pub fn runnable(cpus: usize) -> Result<f64> {
+    runnable_in(Path::new("/proc"), std::process::id(), cpus)
 }
 
-fn runnable_in(proc: &Path, skip: u32) -> Result<f64> {
-    let mut path = proc.to_path_buf();
+fn runnable_in(proc: &Path, skip: u32, cpus: usize) -> Result<f64> {
+    let mut path = proc.join("loadavg");
+    let loadavg = fs::read_to_string(&path).with_context(|| format_compact!("reading {}", path.display()))?;
+    let running = running(&loadavg).with_context(|| format_compact!("reading {}: {loadavg}", path.display()))?;
+    if running <= cpus as f64 * WEIGH_ABOVE {
+        return Ok(running);
+    }
+    path.pop();
     let mut buf = [0u8; 1024];
     let mut total = 0.;
     for entry in fs::read_dir(proc).with_context(|| format_compact!("listing {}", proc.display()))?.flatten() {
@@ -308,6 +321,13 @@ fn runnable_in(proc: &Path, skip: u32) -> Result<f64> {
         path.pop();
     }
     Ok(total / nice_weight(JOB_NICE))
+}
+
+/// The tasks a `/proc/loadavg` line counts runnable, less the one reading
+/// it.
+fn running(loadavg: &str) -> Option<f64> {
+    let (running, _) = loadavg.split_whitespace().nth(3)?.split_once('/')?;
+    Some(running.parse::<u32>().ok()?.saturating_sub(1) as f64)
 }
 
 /// The weight a task's `stat` line adds to the box's load: its nice
@@ -448,10 +468,20 @@ mod test {
         task(20, 20, stat("exe", 'R', 19))?;
         task(30, 30, stat("rustc-dist", 'R', -11))?;
         fs::create_dir_all(proc.join("sys/task/1"))?;
-        let load = runnable_in(&proc, 30)?;
+        // Three runnable besides the reader: more than half a task per CPU
+        // on 4, so each is weighed.
+        fs::write(proc.join("loadavg"), "3.10 2.00 1.50 4/812 4242\n")?;
+        let weighed = runnable_in(&proc, 30, 4)?;
+        // On 6 they are few enough to count as one each.
+        let counted = runnable_in(&proc, 30, 6)?;
+        fs::write(proc.join("loadavg"), "3.10 2.00 1.50 4 4242\n")?;
+        let unreadable = runnable_in(&proc, 30, 4);
         fs::remove_dir_all(&proc)?;
-        assert!((load - (1. + 15. / 1024.)).abs() < 1e-9, "{load}");
-        assert!(runnable()? >= 0.);
+        assert!((weighed - (1. + 15. / 1024.)).abs() < 1e-9, "{weighed}");
+        assert_eq!(counted, 3.);
+        assert!(unreadable.is_err());
+        assert_eq!(running("0.00 0.00 0.00 1/100 7"), Some(0.));
+        assert!(runnable(1)? >= 0.);
         Ok(())
     }
 
