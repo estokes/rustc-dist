@@ -63,7 +63,8 @@ const SAMPLE: Duration = Duration::from_millis(100);
 /// kept local.
 const PIN_AFTER: u8 = 2;
 /// Sample the box's memory, the footprints of jobs running here and the
-/// load each job runs under this often. Placing a job samples again if the
+/// load each job runs under this often while jobs run here; otherwise only
+/// count the load, every `COUNT_LOAD`. Placing a job samples again if the
 /// last sample is older.
 const MEASURE: Duration = Duration::from_millis(250);
 /// Count the box's runnable tasks this often: a count reads every task's
@@ -1259,8 +1260,6 @@ impl Sched {
         recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut sample = time::interval(SAMPLE);
         sample.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut measure = time::interval(MEASURE);
-        measure.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             self.advance();
             let starved = self.starved;
@@ -1270,7 +1269,7 @@ impl Sched {
                 msg = rx.recv() => Event::Msg(msg),
                 _ = recheck.tick(), if starved => Event::Recheck,
                 _ = sample.tick(), if sampling => Event::Sample,
-                _ = measure.tick() => Event::Measure,
+                _ = time::sleep_until(self.next_measure(sampling).into()) => Event::Measure,
                 _ = time::sleep_until(gathering.unwrap_or_else(Instant::now).into()), if gathering.is_some() => {
                     Event::Recheck
                 }
@@ -1755,6 +1754,14 @@ impl Sched {
             }
         }
         self.measured = Some(now);
+    }
+
+    /// When to measure next: every `MEASURE` while jobs run here, or hold
+    /// tokens (`sampling`), else when the load is due to be counted.
+    fn next_measure(&self, sampling: bool) -> Instant {
+        let running = sampling || self.running.iter().any(|r| r.pid.is_some());
+        let last = if running { self.measured } else { self.counted };
+        last.map_or_else(Instant::now, |t| t + if running { MEASURE } else { COUNT_LOAD })
     }
 
     fn measure_if_stale(&mut self, now: Instant) {
@@ -3116,6 +3123,36 @@ mod test {
         assert!((6000..6700).contains(&s.load_c), "{}", s.load_c);
         drop(s);
         fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_box_is_sampled_often_only_while_a_job_runs_here() -> Result<()> {
+        let samples = std::sync::Arc::new(AtomicU64::new(0));
+        let seen = samples.clone();
+        let memory = Box::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Ok(BoxMemory { capacity_kb: u64::MAX, used_kb: 0 })
+        });
+        let h = Harness::start_with("sampled", vec![class(1000, &[0, 1, 2, 3])], Room { memory, ..room(u64::MAX) }, &[], &[])?;
+        let sampled_in = |d: Duration| {
+            let samples = samples.clone();
+            async move {
+                let before = samples.load(Ordering::Relaxed);
+                time::sleep(d).await;
+                samples.load(Ordering::Relaxed) - before
+            }
+        };
+        sampled_in(Duration::from_millis(100)).await;
+        let idle = sampled_in(COUNT_LOAD).await;
+        assert!(idle <= 2, "{idle} samples idle in 2 s");
+        let job = slot(h.submit("a")).await?;
+        let running = sampled_in(Duration::from_secs(1)).await;
+        assert!((3..=5).contains(&running), "{running} samples in 1 s with a job running");
+        drop(job);
+        sampled_in(Duration::from_millis(300)).await;
+        let idle = sampled_in(COUNT_LOAD).await;
+        assert!(idle <= 2, "{idle} samples in 2 s once it finished");
         Ok(())
     }
 
