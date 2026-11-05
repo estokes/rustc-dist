@@ -10,6 +10,7 @@
 use crate::{
     protocol::PROTOCOL,
     sched::Msg,
+    tick,
     toolchain::{self, Toolchain},
 };
 use anyhow::{Result, bail};
@@ -28,14 +29,14 @@ use poolshark::{global::GPooled, local::LPooled};
 use std::{collections::HashMap, pin::pin, time::Duration};
 use tokio::{
     sync::{mpsc, watch},
-    time::{self, MissedTickBehavior},
+    time,
 };
 
 /// How often a changed load is republished, so a busy build doesn't send
 /// an update per job.
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 /// How often to look for boxes joining or leaving.
-const LIST_EVERY: Duration = Duration::from_secs(1);
+const LIST_EVERY: Duration = tick::IDLE;
 
 /// The status columns a box's state is published in. A change updates the
 /// columns it touches in one batch, which subscribers get whole, so a box
@@ -248,12 +249,11 @@ impl Lister for Rows {
     }
 }
 
-/// Each listing `lister` gives that changed, asking it every `every`. An
-/// error is logged and asked again at the next look, and a slow answer
-/// delays the looks after it rather than bunching them up.
+/// Each listing `lister` gives that changed, asking it at each tick of the
+/// grid of `every`. An error is logged and asked again at the next look, and
+/// a slow answer skips the looks it overran rather than bunching them up.
 fn listings(lister: impl Lister, every: Duration) -> impl Stream<Item = GPooled<Vec<Path>>> {
-    let mut tick = time::interval(every);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let tick = tick::interval(every);
     stream::unfold((lister, tick), |(mut lister, mut tick)| async move {
         loop {
             tick.tick().await;

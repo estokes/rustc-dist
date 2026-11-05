@@ -1,3 +1,4 @@
+use crate::tick;
 use anyhow::{Context, Result, bail};
 use arcstr::ArcStr;
 use compact_str::format_compact;
@@ -13,11 +14,7 @@ use std::{
     slice,
     time::{Duration, SystemTime},
 };
-use tokio::{
-    sync::watch,
-    task,
-    time::{self, MissedTickBehavior},
-};
+use tokio::{sync::watch, task};
 use triomphe::Arc;
 
 /// A compiler as boxes match it: rustc's commit and host. Two rustc builds
@@ -210,8 +207,7 @@ fn watch_in(home: PathBuf, published: Vec<Toolchain>, every: Duration) -> watch:
     tokio::spawn(async move {
         // None at first: `published` may predate a change.
         let mut read: Option<Toolchains> = None;
-        let mut tick = time::interval_at(time::Instant::now() + every, every);
-        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut tick = tick::interval(every);
         loop {
             tokio::select! {
                 _ = tick.tick() => (),
@@ -271,6 +267,7 @@ impl Keys {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
+    use tokio::time;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]

@@ -12,6 +12,7 @@ use crate::{
     remote::{self, CrateFiles},
     stats::{self, Basis, Decay, Moving, Origin, PlaceId, Prediction, Run, Stats, Transfer},
     sys::{self, BoxMemory},
+    tick,
 };
 use anyhow::{Context, Result};
 use arcstr::ArcStr;
@@ -63,13 +64,13 @@ const SAMPLE: Duration = Duration::from_millis(100);
 /// kept local.
 const PIN_AFTER: u8 = 2;
 /// Sample the box's memory, the footprints of jobs running here and the
-/// load each job runs under this often while jobs run here; otherwise only
-/// count the load, every `COUNT_LOAD`. Placing a job samples again if the
-/// last sample is older.
+/// load each job runs under this often, on the clock grid, while jobs run
+/// here; otherwise only count the load, every `COUNT_LOAD`. Placing a job
+/// samples again if the last sample is older.
 const MEASURE: Duration = Duration::from_millis(250);
-/// Count the box's runnable tasks this often: a count reads every task's
-/// state, tens of ms on a box running thousands.
-const COUNT_LOAD: Duration = Duration::from_secs(2);
+/// Count the box's runnable tasks once per tick of this grid: a count may
+/// read every task's state, tens of ms on a box running thousands.
+const COUNT_LOAD: Duration = tick::IDLE;
 /// A job measured to hold fewer than this many hundredths of a token on
 /// average after its front end is light: it runs pinned to one class.
 /// Every other job, including one never measured, is heavy and may run on
@@ -1255,7 +1256,7 @@ impl Sched {
             Measure,
             Save,
         }
-        let mut save = time::interval(SAVE_EVERY);
+        let mut save = tick::interval(SAVE_EVERY);
         let mut recheck = time::interval(RECHECK);
         recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut sample = time::interval(SAMPLE);
@@ -1727,13 +1728,14 @@ impl Sched {
     }
 
     /// Sample the box's memory, the footprint of each job running here and
-    /// the load it runs under, counting the load again every `COUNT_LOAD`.
+    /// the load it runs under, counting the load again once a tick of
+    /// `COUNT_LOAD` passed since the last count.
     fn measure(&mut self, now: Instant) {
         match (self.setup.memory)() {
             Ok(mem) => self.mem = mem,
             Err(e) => warn!("measuring memory: {e:#}"),
         }
-        if self.counted.is_none_or(|t| now.duration_since(t) >= COUNT_LOAD) {
+        if self.counted.is_none_or(|t| tick::next(COUNT_LOAD, t) <= now) {
             let cpus = self.setup.allowed.len().max(1);
             match (self.setup.runnable)(cpus) {
                 Ok(n) => {
@@ -1756,12 +1758,13 @@ impl Sched {
         self.measured = Some(now);
     }
 
-    /// When to measure next: every `MEASURE` while jobs run here, or hold
-    /// tokens (`sampling`), else when the load is due to be counted.
+    /// When to measure next: at the next tick of `MEASURE` while jobs run
+    /// here, or hold tokens (`sampling`), else when the load is due to be
+    /// counted.
     fn next_measure(&self, sampling: bool) -> Instant {
         let running = sampling || self.running.iter().any(|r| r.pid.is_some());
-        let last = if running { self.measured } else { self.counted };
-        last.map_or_else(Instant::now, |t| t + if running { MEASURE } else { COUNT_LOAD })
+        let (last, every) = if running { (self.measured, MEASURE) } else { (self.counted, COUNT_LOAD) };
+        last.map_or_else(Instant::now, |t| tick::next(every, t))
     }
 
     fn measure_if_stale(&mut self, now: Instant) {
@@ -3107,7 +3110,8 @@ mod test {
         let seen = tasks.clone();
         let room = Room { runnable: Box::new(move |_| Ok(seen.load(Ordering::Relaxed) as f64)), ..room(u64::MAX) };
         let (mut s, _rx, _load) = sched(&dir, vec![class(1000, &[0, 1, 2, 3])], room, &[], &[])?;
-        let t0 = Instant::now();
+        // A tick of the grid the load is counted on.
+        let t0 = tick::next(COUNT_LOAD, Instant::now());
         s.measure(t0);
         assert_eq!(s.load_c, 0);
         tasks.store(400, Ordering::Relaxed);

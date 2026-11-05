@@ -17,6 +17,7 @@ mod sandbox;
 mod sched;
 mod stats;
 mod sys;
+mod tick;
 mod toolchain;
 mod wrapper;
 

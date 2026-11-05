@@ -7,6 +7,7 @@ use crate::{
     farm::Cell,
     protocol::{ClassStatus, Status, Switching, gib},
     sched::Msg,
+    tick,
 };
 use anyhow::Result;
 use arcstr::ArcStr;
@@ -17,26 +18,23 @@ use netidx::{
     publisher::{ClId, Event, Id, Publisher, UpdateBatch, Value},
 };
 use std::{collections::HashMap, time::Duration};
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::{self, Instant},
-};
+use tokio::sync::{mpsc, oneshot};
 
 /// Building the units' rows costs the scheduler tens of ms.
-const REFRESH: Duration = Duration::from_secs(2);
+const REFRESH: Duration = tick::IDLE;
 
 const UNIT_COLUMNS: [&str; 12] =
     ["rank s", "work s", "front %", "width", "now s", "wall s", "mem MB", "here", "sent", "served", "copy s", "sent MB"];
 
 /// Publish this box's figures in its status row at `row` and its units
-/// under `units`, both at the start for clients to find, then every couple
-/// of seconds each while a client subscribes to it and at once when the
-/// first does, until the scheduler stops.
+/// under `units`, both at the start for clients to find, then every
+/// `REFRESH` each while a client subscribes to it and at once when the
+/// first does, until the scheduler stops. Unwatched, it doesn't wake.
 pub async fn run(publisher: Publisher, row: Path, units: Path, tx: mpsc::UnboundedSender<Msg>) -> Result<()> {
     let (events_tx, mut events) = fmpsc::unbounded();
     publisher.events(events_tx);
     let mut board = Board::new(row, units);
-    let mut refresh = time::interval_at(Instant::now() + REFRESH, REFRESH);
+    let mut refresh = tick::interval(REFRESH);
     let mut parts = Parts { figures: true, units: true };
     loop {
         if parts.figures || parts.units {
@@ -49,8 +47,9 @@ pub async fn run(publisher: Publisher, row: Path, units: Path, tx: mpsc::Unbound
             board.show(&publisher, &mut batch, &st, parts)?;
             batch.commit(None).await;
         }
+        let watched = board.watched();
         parts = tokio::select! {
-            _ = refresh.tick() => board.watched(),
+            _ = refresh.tick(), if watched.figures || watched.units => watched,
             e = events.next() => match e {
                 Some(e) => board.watch(&publisher, e),
                 None => return Ok(()),
@@ -240,6 +239,7 @@ mod test {
     use crate::protocol::{SpreadStatus, UnitStatus};
     use anyhow::bail;
     use netidx::{InternalOnly, subscriber::Event};
+    use tokio::time;
 
     fn unit(key: &str, work_ms: u64, copy: Option<(u64, u64)>) -> UnitStatus {
         UnitStatus {

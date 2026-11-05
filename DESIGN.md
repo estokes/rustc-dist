@@ -39,6 +39,16 @@ its runtime starts threads, so placing, publishing and moving files keep up
 on a busy box. Jobs it runs for other boxes and calibration run at nice 0;
 the wrapper's own jobs run at cargo's.
 
+Idle, the daemon wakes once every 2 s (`tick::IDLE`, `src/tick.rs`). Every
+periodic timer ticks on the multiples of its period from one epoch, and the
+periods divide each other: counting the load and looking for other boxes
+every 2 s, rustup's toolchains every 10 s, saving every 60 s, and while jobs
+run, sampling them every 250 ms. So timers due together fire in one wakeup,
+which on a battery-powered box costs far less than as many spread out. The
+status board doesn't tick while no client watches it. Netidx's own
+heartbeats, once a second on each connection to or from another box, are
+outside this grid.
+
 The wrapper never runs rustc without a grant. If it cannot reach or start the
 daemon it fails the compile with a clear message. `RUSTC_DIST=off` bypasses
 it, and so does running as root: the daemon won't run as root, as it runs
@@ -905,7 +915,7 @@ run on, so no client pairs one profile's name with another's rates.
 The scheduler publishes after every event, which includes the 100 ms ticks
 that lend tokens while jobs run. A changed state is republished at most every
 100 ms. The daemon lists `BASE/vN/status` for other
-boxes and subscribes to each one's state columns, looking every second. A
+boxes and subscribes to each one's state columns, looking every 2 s. A
 resolver error is logged and the listing tried again at the next look.
 Netidx retries the resolver for up to tens of seconds first; the listing
 waits beside the farm task's other work, so meanwhile the box goes on
