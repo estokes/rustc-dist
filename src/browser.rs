@@ -1,6 +1,7 @@
 //! What `status` shows, for the netidx browser: figures about the box in
 //! its row of the farm's status table, beside the state columns other boxes
-//! read, and every unit it has run in a table of its own.
+//! read, and every unit it has run in a table of its own. Each part is kept
+//! current only while a client subscribes to it.
 
 use crate::{
     farm::Cell,
@@ -10,38 +11,65 @@ use crate::{
 use anyhow::Result;
 use arcstr::ArcStr;
 use compact_str::format_compact;
+use futures::{StreamExt, channel::mpsc as fmpsc};
 use netidx::{
     path::Path,
-    publisher::{Publisher, UpdateBatch, Value},
+    publisher::{ClId, Event, Id, Publisher, UpdateBatch, Value},
 };
 use std::{collections::HashMap, time::Duration};
 use tokio::{
     sync::{mpsc, oneshot},
-    time,
+    time::{self, Instant},
 };
 
-/// Building a status costs the scheduler a few ms.
+/// Building the units' rows costs the scheduler tens of ms.
 const REFRESH: Duration = Duration::from_secs(2);
 
 const UNIT_COLUMNS: [&str; 12] =
     ["rank s", "work s", "front %", "width", "now s", "wall s", "mem MB", "here", "sent", "served", "copy s", "sent MB"];
 
 /// Publish this box's figures in its status row at `row` and its units
-/// under `units` every couple of seconds, until the scheduler stops.
+/// under `units`, both at the start for clients to find, then every couple
+/// of seconds each while a client subscribes to it and at once when the
+/// first does, until the scheduler stops.
 pub async fn run(publisher: Publisher, row: Path, units: Path, tx: mpsc::UnboundedSender<Msg>) -> Result<()> {
+    let (events_tx, mut events) = fmpsc::unbounded();
+    publisher.events(events_tx);
     let mut board = Board::new(row, units);
-    let mut refresh = time::interval(REFRESH);
+    let mut refresh = time::interval_at(Instant::now() + REFRESH, REFRESH);
+    let mut parts = Parts { figures: true, units: true };
     loop {
-        refresh.tick().await;
-        let (reply, status) = oneshot::channel();
-        if tx.send(Msg::Status { reply }).is_err() {
-            return Ok(());
+        if parts.figures || parts.units {
+            let (reply, status) = oneshot::channel();
+            if tx.send(Msg::Status { units: parts.units, reply }).is_err() {
+                return Ok(());
+            }
+            let Ok(st) = status.await else { return Ok(()) };
+            let mut batch = publisher.start_batch();
+            board.show(&publisher, &mut batch, &st, parts)?;
+            batch.commit(None).await;
         }
-        let Ok(st) = status.await else { return Ok(()) };
-        let mut batch = publisher.start_batch();
-        board.show(&publisher, &mut batch, &st)?;
-        batch.commit(None).await;
+        parts = tokio::select! {
+            _ = refresh.tick() => board.watched(),
+            e = events.next() => match e {
+                Some(e) => board.watch(&publisher, e),
+                None => return Ok(()),
+            },
+        };
     }
+}
+
+/// Which parts of the board to show, or which clients watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Parts {
+    figures: bool,
+    units: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Figures,
+    Units,
 }
 
 /// A row per unit, each with a cell per column. A unit gone from the status
@@ -96,20 +124,70 @@ impl Units {
     }
 }
 
-/// The box's figures in its status row, each a cell of its own, and its
-/// units.
+/// The box's figures in its status row, each a cell of its own, its units,
+/// and which part each client subscription is to.
 struct Board {
     row: Path,
     figures: HashMap<&'static str, Cell>,
     units: Units,
+    watchers: HashMap<(Id, ClId), Part>,
 }
 
 impl Board {
     fn new(row: Path, units: Path) -> Self {
-        Self { row, figures: HashMap::new(), units: Units { path: units, refresh: 0, rows: HashMap::new() } }
+        Self {
+            row,
+            figures: HashMap::new(),
+            units: Units { path: units, refresh: 0, rows: HashMap::new() },
+            watchers: HashMap::new(),
+        }
     }
 
-    fn show(&mut self, publisher: &Publisher, batch: &mut UpdateBatch, st: &Status) -> Result<()> {
+    fn watched(&self) -> Parts {
+        let watched = |part| self.watchers.values().any(|&p| p == part);
+        Parts { figures: watched(Part::Figures), units: watched(Part::Units) }
+    }
+
+    /// Follow a publisher event: the parts a client now watches that none
+    /// did before.
+    fn watch(&mut self, publisher: &Publisher, e: Event) -> Parts {
+        let before = self.watched();
+        match e {
+            Event::Subscribe(id, client) => {
+                if let Some(part) = self.part(publisher, id) {
+                    self.watchers.insert((id, client), part);
+                }
+            }
+            Event::Unsubscribe(id, client) => {
+                self.watchers.remove(&(id, client));
+            }
+            Event::Destroyed(id) => self.watchers.retain(|&(i, _), _| i != id),
+        }
+        let after = self.watched();
+        Parts { figures: after.figures && !before.figures, units: after.units && !before.units }
+    }
+
+    /// The part of the board the value `id` is in, if any.
+    fn part(&self, publisher: &Publisher, id: Id) -> Option<Part> {
+        if self.figures.values().any(|c| c.id() == id) {
+            return Some(Part::Figures);
+        }
+        let path = publisher.path(id)?;
+        Path::is_parent(&self.units.path, &path).then_some(Part::Units)
+    }
+
+    /// Show the figures and units of `st` that `parts` asks for.
+    fn show(&mut self, publisher: &Publisher, batch: &mut UpdateBatch, st: &Status, parts: Parts) -> Result<()> {
+        if parts.figures {
+            self.show_figures(publisher, batch, st)?;
+        }
+        if parts.units {
+            self.units.show(publisher, batch, st)?;
+        }
+        Ok(())
+    }
+
+    fn show_figures(&mut self, publisher: &Publisher, batch: &mut UpdateBatch, st: &Status) -> Result<()> {
         let switching = match &st.switching {
             Switching::No => Value::Null,
             Switching::Draining(to) => ArcStr::from(format_compact!("to {to}, once running jobs finish").as_str()).into(),
@@ -147,7 +225,7 @@ impl Board {
                 }
             }
         }
-        self.units.show(publisher, batch, st)
+        Ok(())
     }
 }
 
@@ -214,7 +292,7 @@ mod test {
 
     async fn show(board: &mut Board, publisher: &Publisher, st: &Status) -> Result<()> {
         let mut batch = publisher.start_batch();
-        board.show(publisher, &mut batch, st)?;
+        board.show(publisher, &mut batch, st, Parts { figures: true, units: true })?;
         batch.commit(None).await;
         publisher.flushed().await;
         Ok(())
@@ -261,5 +339,56 @@ mod test {
             time::sleep(Duration::from_millis(100)).await;
         }
         bail!("syn's row is still published")
+    }
+
+    /// The parts watched once the publisher's events so far are followed,
+    /// and the parts the first of them newly watched.
+    async fn follow(board: &mut Board, publisher: &Publisher, events: &mut fmpsc::UnboundedReceiver<netidx::publisher::Event>) -> Parts {
+        publisher.flushed().await;
+        let mut newly = Parts { figures: false, units: false };
+        while let Ok(Some(e)) = time::timeout(Duration::from_millis(200), events.next()).await {
+            let n = board.watch(publisher, e);
+            newly = Parts { figures: newly.figures || n.figures, units: newly.units || n.units };
+        }
+        newly
+    }
+
+    #[tokio::test]
+    async fn each_part_is_watched_while_a_client_subscribes_to_it() -> Result<()> {
+        let net = InternalOnly::new().await?;
+        let publisher = net.publisher().clone();
+        let (tx, mut events) = fmpsc::unbounded();
+        publisher.events(tx);
+        let state = Cell::publish(&publisher, Path::from("/farm/status/a/load"), Value::Null)?;
+        let mut board = Board::new(Path::from("/farm/status/a"), Path::from("/farm/units/a"));
+        let both = vec![unit("rustc:serde:1:link", 2500, None), unit("rustc:syn:2:link", 13760, None)];
+        show(&mut board, &publisher, &status(both)).await?;
+        let none = Parts { figures: false, units: false };
+        let sub = |path: &str| {
+            net.subscriber().subscribe_nondurable_one(Path::from(ArcStr::from(path)), Some(Duration::from_secs(5)))
+        };
+        let other_boxes = sub("/farm/status/a/load").await?;
+        assert_eq!(follow(&mut board, &publisher, &mut events).await, none);
+        assert_eq!(board.watched(), none);
+        let figure = sub("/farm/status/a/waiting").await?;
+        assert_eq!(follow(&mut board, &publisher, &mut events).await, Parts { figures: true, units: false });
+        let serde = sub("/farm/units/a/rustc:serde:1:link/work s").await?;
+        assert_eq!(follow(&mut board, &publisher, &mut events).await, Parts { figures: false, units: true });
+        let syn = sub("/farm/units/a/rustc:syn:2:link/work s").await?;
+        assert_eq!(follow(&mut board, &publisher, &mut events).await, none);
+        drop(serde);
+        assert_eq!(follow(&mut board, &publisher, &mut events).await, none);
+        assert_eq!(board.watched(), Parts { figures: true, units: true });
+        // syn's row is unpublished under its subscriber.
+        let mut batch = publisher.start_batch();
+        board.show(&publisher, &mut batch, &status(Vec::new()), Parts { figures: false, units: true })?;
+        batch.commit(None).await;
+        follow(&mut board, &publisher, &mut events).await;
+        assert_eq!(board.watched(), Parts { figures: true, units: false });
+        drop(figure);
+        follow(&mut board, &publisher, &mut events).await;
+        assert_eq!(board.watched(), none);
+        drop((syn, other_boxes, state));
+        Ok(())
     }
 }

@@ -120,7 +120,8 @@ pub enum Msg {
     Mismatch { unit: Unit },
     /// Another box's state changed, or it left.
     Farm { name: ArcStr, state: Option<(NPath, BoxState)> },
-    Status { reply: oneshot::Sender<Status> },
+    /// The box's status, with every unit's row when `units`.
+    Status { units: bool, reply: oneshot::Sender<Status> },
     Profile { profile: Profile, recalibrate: bool },
     Calibrated { profile: Profile, result: Result<Vec<Class>> },
     /// A heartbeat moved `kb` to the box `name` in `us`.
@@ -1182,9 +1183,11 @@ pub struct Sched {
     published: Instant,
     stats: Stats,
     /// The pairs model's latest fit, which predicts run times, the cost
-    /// table standing in before the first, and whether a fit is under way.
+    /// table standing in before the first, whether a fit is under way, and
+    /// whether runs were recorded since the last one began.
     pairs: Option<Box<pairs::Fit>>,
     fitting: bool,
+    unfit: bool,
     graph: Graph,
     load: watch::Sender<Load>,
     tx: mpsc::UnboundedSender<Msg>,
@@ -1234,6 +1237,7 @@ impl Sched {
             stats,
             pairs: None,
             fitting: false,
+            unfit: false,
             graph,
             load,
             tx,
@@ -1288,7 +1292,9 @@ impl Sched {
                 Event::Measure => self.measure(Instant::now()),
                 Event::Save => {
                     self.save();
-                    self.refit();
+                    if self.unfit {
+                        self.refit();
+                    }
                 }
             }
             self.dispatch();
@@ -1344,8 +1350,8 @@ impl Sched {
                 }
             }
             Msg::Farm { name, state } => self.farm(name, state),
-            Msg::Status { reply } => {
-                let _ = reply.send(self.status());
+            Msg::Status { units, reply } => {
+                let _ = reply.send(self.status(units));
             }
             Msg::Profile { profile, recalibrate } => self.switch_to(profile, recalibrate)?,
             Msg::Calibrated { profile, result } => self.calibrated(profile, result)?,
@@ -1420,6 +1426,7 @@ impl Sched {
             return;
         }
         self.fitting = true;
+        self.unfit = false;
         let snapshot = self.stats.pair_snapshot(self.layout.places.classes[self.layout.by_speed()[0]]);
         let tx = self.tx.clone();
         task::spawn_blocking(move || {
@@ -1443,6 +1450,7 @@ impl Sched {
             run.load_c as f64 / 100.
         );
         self.stats.record(unit, run);
+        self.unfit = true;
     }
 
     fn take_running(&mut self, job: JobId) -> Option<Running> {
@@ -2311,49 +2319,19 @@ impl Sched {
         }
     }
 
-    fn status(&mut self) -> Status {
+    /// The box's status, with every unit's row when `units`.
+    fn status(&mut self, units: bool) -> Status {
         self.measure_if_stale(Instant::now());
-        let mut ranks: LPooled<HashMap<ArcStr, u64>> = LPooled::take();
-        let (layout, stats) = (&self.layout, &self.stats);
-        let pairs = self.pairs.as_deref();
-        for (key, rank) in self.graph.ranked(&|exact, coarse| layout.idle_us(stats, pairs, exact, coarse)) {
-            let r = ranks.entry(key).or_default();
-            *r = (*r).max(rank);
-        }
-        let layout = &self.layout;
-        let fastest = layout.by_speed()[0];
+        let fastest = self.layout.by_speed()[0];
         // This box's fastest class, idle, in instructions per µs: speeds are
         // in hundredths of it, and work in ms on it.
-        let base = layout.classes[fastest].rate as f64 / self.stats.factor(layout.places.classes[fastest], 0);
+        let base = self.layout.classes[fastest].rate as f64 / self.stats.factor(self.layout.places.classes[fastest], 0);
+        let units = if units { self.unit_rows(base) } else { Vec::new() };
+        let layout = &self.layout;
         let speed_c = |rate: u64, at: PlaceId, load_c: u32| {
             (rate as f64 / self.stats.factor(at, load_c) / base * 100.).round() as u32
         };
-        let ms = |mi: u64| (mi as f64 * 1000. / base).round() as u64;
         let id = layout.id;
-        let mut units: Vec<UnitStatus> = self
-            .stats
-            .units()
-            .map(|(key, info)| {
-                let [here, sent, served] = info.runs;
-                let (pred, spot) = layout.fastest(&self.stats, key, key, light(&info.pred));
-                UnitStatus {
-                    key: key.clone(),
-                    here,
-                    sent,
-                    served,
-                    work_ms: ms(info.pred.cost_mi()),
-                    front_ms: (info.pred.front_mi > 0).then(|| ms(info.pred.front_mi)),
-                    width_c: info.pred.width_c,
-                    now_ms: self.run_us(&pred, &spot, spot.load_under(self.load_c, false)) / 1000,
-                    wall_ms: info.wall_ms,
-                    mem_kb: info.pred.mem_kb,
-                    copy_ms: info.copy_ms,
-                    sent_kb: info.sent_kb,
-                    rank_ms: ranks.get(key).map(|&r| r / 1000),
-                }
-            })
-            .collect();
-        units.sort_unstable_by(|a, b| b.rank_ms.cmp(&a.rank_ms).then(b.work_ms.cmp(&a.work_ms)));
         let boxes = self
             .remotes
             .iter()
@@ -2443,6 +2421,44 @@ impl Sched {
             units,
             boxes,
         }
+    }
+
+    /// Every unit's row, by rank, with work in ms on a thread at `base`
+    /// instructions per µs.
+    fn unit_rows(&mut self, base: f64) -> Vec<UnitStatus> {
+        let mut ranks: LPooled<HashMap<ArcStr, u64>> = LPooled::take();
+        let (layout, stats) = (&self.layout, &self.stats);
+        let pairs = self.pairs.as_deref();
+        for (key, rank) in self.graph.ranked(&|exact, coarse| layout.idle_us(stats, pairs, exact, coarse)) {
+            let r = ranks.entry(key).or_default();
+            *r = (*r).max(rank);
+        }
+        let ms = |mi: u64| (mi as f64 * 1000. / base).round() as u64;
+        let mut units: Vec<UnitStatus> = self
+            .stats
+            .units()
+            .map(|(key, info)| {
+                let [here, sent, served] = info.runs;
+                let (pred, spot) = layout.fastest(&self.stats, key, key, light(&info.pred));
+                UnitStatus {
+                    key: key.clone(),
+                    here,
+                    sent,
+                    served,
+                    work_ms: ms(info.pred.cost_mi()),
+                    front_ms: (info.pred.front_mi > 0).then(|| ms(info.pred.front_mi)),
+                    width_c: info.pred.width_c,
+                    now_ms: self.run_us(&pred, &spot, spot.load_under(self.load_c, false)) / 1000,
+                    wall_ms: info.wall_ms,
+                    mem_kb: info.pred.mem_kb,
+                    copy_ms: info.copy_ms,
+                    sent_kb: info.sent_kb,
+                    rank_ms: ranks.get(key).map(|&r| r / 1000),
+                }
+            })
+            .collect();
+        units.sort_unstable_by(|a, b| b.rank_ms.cmp(&a.rank_ms).then(b.work_ms.cmp(&a.work_ms)));
+        units
     }
 
     /// Save the job stats and the build graph here, and the file hashes on
@@ -2763,7 +2779,7 @@ mod test {
 
         async fn status(&self) -> Status {
             let (reply, rx) = oneshot::channel();
-            self.tx.send(Msg::Status { reply }).unwrap();
+            self.tx.send(Msg::Status { units: true, reply }).unwrap();
             rx.await.unwrap()
         }
 
@@ -2867,7 +2883,7 @@ mod test {
         s.submit(unit("gate", &[]), 1, Err("the wrapper keeps it here"), reply);
         let Build { rank_us, own_us, .. } = s.queue[0].build;
         assert_eq!((rank_us, own_us), (3000, 1000));
-        let st = s.status();
+        let st = s.status(true);
         assert_eq!(st.units.iter().find(|u| u.key == "gate").and_then(|u| u.rank_ms), Some(3));
         drop(s);
         fs::remove_dir_all(&dir)?;
@@ -3111,7 +3127,7 @@ mod test {
         let classes = vec![class(1000, &[0, 1]), class(2000, &[2, 3])];
         let (mut s, _rx, _load) = sched(&dir, classes, room, &[("a", 3_000_000, 1)], &[])?;
         s.farm("b".into(), Some(remote_box(200, 4, 4, 1)));
-        let st = s.status();
+        let st = s.status(true);
         assert_eq!(st.load_c, 400);
         let speeds = |c: &ClassStatus| (c.idle_speed_c, c.speed_c);
         assert_eq!((speeds(&st.classes[0]), speeds(&st.classes[1])), ((100, 25), (50, 13)));

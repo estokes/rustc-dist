@@ -305,7 +305,7 @@ pub(crate) async fn until(secs: u64, what: &str, mut done: impl FnMut() -> bool)
 /// How many other boxes' jobs `b` serves.
 pub(crate) async fn serving(b: &ServerBox) -> Result<u32> {
     let (reply, status) = oneshot::channel();
-    b.tx.send(Msg::Status { reply })?;
+    b.tx.send(Msg::Status { units: true, reply })?;
     let st = status.await?;
     Ok(st.classes.iter().map(|c| c.serving).sum::<u32>() + st.spread.serving)
 }
@@ -931,7 +931,7 @@ async fn a_crate_builds_on_another_box() -> Result<()> {
     assert!(linker_waited_us > 0, "the linker started before the rlib came");
     // The server recorded both runs as served, with their memory.
     let (reply, status) = oneshot::channel();
-    b.tx.send(Msg::Status { reply })?;
+    b.tx.send(Msg::Status { units: true, reply })?;
     let status = status.await?;
     let served = status.units.iter().find(|u| u.key == unit.exact).context("no unit")?;
     assert_eq!((served.here, served.served), (0, 2));

@@ -593,8 +593,8 @@ learn the curve from every unit there; that is the next thing to try.
 A fit of 32,293 runs takes 42 to 50 ms (23 to 38 before), and a prediction
 less than a µs.
 
-The daemon refits on a blocking thread every minute and after a calibration
-or profile switch, and placement reads the latest fit. In Python a fit of
+The daemon refits on a blocking thread every minute when runs were recorded
+since the last fit, and after a calibration or profile switch, and placement reads the latest fit. In Python a fit of
 25,000 runs takes half a second.
 
 Width, the tokens a job holds after its front end, is still measured per
@@ -673,7 +673,7 @@ within 25%; new to the place ×1.35, ×2.37, 40%; other boxes ×1.13, ×1.58,
 
 On the evidence above it places jobs, without first shadowing the cost
 table for a day. Every candidate's run time, the 1 s threshold for sending
-a job away, and ranks come from the pairs, fitted every minute (23 ms for
+a job away, and ranks come from the pairs, fitted every minute that added runs (23 ms for
 24,726 runs) and after a profile switch; before the first fit, and at a
 place the fit doesn't know, the cost table predicts. The cost table still
 learns, and each candidate on a placement line shows what it predicts,
@@ -971,9 +971,12 @@ profile, memory
 `graph units`. So `BASE/vN/status` shows the
 whole farm at a glance. Its units go in a table of their own at
 `BASE/vN/units/NAME`, with `status`'s columns. Values are typed numbers, so the
-browser sorts them. These refresh every 2 s and send only cells that
-changed. Building a status takes the scheduler some tens of ms with
-thousands of units, which is why it isn't faster.
+browser sorts them. Both are published at start, for clients to find. After
+that, each part (the row's figures, the units table) refreshes every 2 s only
+while some client subscribes to one of its cells, and at once when the first
+does. A refresh sends only cells that changed. Building the units' rows takes
+the scheduler some tens of ms with thousands of units (13,500 on washu-chan:
+about 3% of a CPU when it ran every 2 s whether or not anyone looked).
 
 ### Inputs
 

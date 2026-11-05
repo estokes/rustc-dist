@@ -19,7 +19,7 @@ use futures::{Stream, StreamExt, channel::mpsc as fmpsc, stream};
 use log::{info, warn};
 use netidx::{
     path::Path,
-    publisher::{FromValue, Publisher, UpdateBatch, Val, Value},
+    publisher::{FromValue, Id, Publisher, UpdateBatch, Val, Value},
     resolver_client::{ChangeTracker, ResolverRead},
     subscriber::{Dval, Event, SubId, Subscriber, UpdateChan, UpdatesFlags},
 };
@@ -171,6 +171,10 @@ pub struct Cell(Val, Value);
 impl Cell {
     pub fn publish(publisher: &Publisher, path: Path, v: Value) -> Result<Self> {
         Ok(Self(publisher.publish(path, v.clone())?, v))
+    }
+
+    pub fn id(&self) -> Id {
+        self.0.id()
     }
 
     pub fn set(&mut self, batch: &mut UpdateBatch, v: Value) {

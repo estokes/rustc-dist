@@ -292,7 +292,7 @@ async fn serve(mut sock: UnixStream, ctx: &Ctx) -> Result<()> {
         Ask::Compile { unit, build, job } => compile(sock, buf, ctx, unit, build, job).await,
         Ask::Status => {
             let (reply, status) = oneshot::channel();
-            ctx.tx.send(Msg::Status { reply }).map_err(|_| anyhow!("scheduler stopped"))?;
+            ctx.tx.send(Msg::Status { units: true, reply }).map_err(|_| anyhow!("scheduler stopped"))?;
             let status = status.await?;
             protocol::send_async(&mut sock, &mut buf, &Reply::Status(status)).await
         }
