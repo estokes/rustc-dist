@@ -7,7 +7,7 @@ use crate::{
     protocol::{self, Ask, Finished, Job, PROTOCOL, Reads, Reply, STOP, Unit},
     remote::{self, Event, Links, Moved, Outcome, ToServer},
     sandbox::{self, Server},
-    sched::{Admission, Heartbeat, Msg, RemoteOutcome, RemoteSlot, Sched, SentRun, Setup, Want},
+    sched::{Admission, Heartbeat, IDLE, Msg, RemoteOutcome, RemoteSlot, Sched, SentRun, Setup, Want},
     stats::Transfer,
     sys,
     toolchain::{self, Keys},
@@ -45,6 +45,8 @@ use tokio::{
 
 /// How long a refused client may take to hang up.
 const REFUSED_READ: Duration = Duration::from_secs(5);
+/// The longest wait between tries to publish this box.
+const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(64);
 
 /// What every connection needs.
 struct Ctx {
@@ -183,7 +185,7 @@ async fn join(
     tx: mpsc::UnboundedSender<Msg>,
 ) -> Result<Farm> {
     let net = NetConfig::load_default().context("loading the netidx config")?;
-    let publisher = PublisherBuilder::new(net.clone()).bind_cfg(cfg.bind).build().await?;
+    let publisher = publish(&net, cfg).await;
     let subscriber = SubscriberBuilder::new(net).build()?;
     let base = NPath::from(ArcStr::from(base));
     let name = ArcStr::from(cfg.name.clone().unwrap_or_else(hostname));
@@ -224,6 +226,20 @@ async fn join(
         }
     });
     Ok(Farm { links, publisher })
+}
+
+/// A publisher for this box, trying until one starts: at boot the interface
+/// it binds to may not have its address yet.
+async fn publish(net: &NetConfig, cfg: &Config) -> Publisher {
+    let mut wait = IDLE;
+    loop {
+        match PublisherBuilder::new(net.clone()).bind_cfg(cfg.bind).build().await {
+            Ok(publisher) => return publisher,
+            Err(e) => warn!("could not start publishing, trying again within {} s: {e:#}", wait.as_secs()),
+        }
+        timer_grid::sleep(wait).await;
+        wait = (wait * 2).min(PUBLISH_RETRY_MAX);
+    }
 }
 
 fn hostname() -> String {
